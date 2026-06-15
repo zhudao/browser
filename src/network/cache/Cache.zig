@@ -89,6 +89,11 @@ pub const CacheControl = struct {
                 return null;
             }
             if (std.mem.eql(u8, directive, "no-cache")) {
+                if (!max_age_set) {
+                    cc.max_age = 0;
+                    max_age_set = true;
+                }
+
                 cc.must_revalidate = true;
                 continue;
             }
@@ -113,7 +118,7 @@ pub const CacheControl = struct {
         }
 
         if (!max_age_set) return null;
-        if (cc.max_age == 0) return null;
+        if (cc.max_age == 0 and !cc.must_revalidate) return null;
 
         return cc;
     }
