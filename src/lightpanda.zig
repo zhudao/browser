@@ -125,7 +125,7 @@ pub fn fetch(app: *App, browser: *Browser, url: [:0]const u8, opts: FetchOpts) !
         //     }
         // }
 
-        const encoded_url = try URL.ensureEncoded(frame.call_arena, url, "UTF-8");
+        const encoded_url = try URL.resolve(frame.call_arena, "", url, .{});
         _ = try frame.navigate(encoded_url, .{
             .reason = .address_bar,
             .kind = .{ .push = null },
