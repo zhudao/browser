@@ -427,16 +427,30 @@ pub fn isEqualNode(self: *Node, other: *Node) bool {
         .element => self.as(Element).isEqualNode(other.as(Element)),
         .attribute => self.as(Element.Attribute).isEqualNode(other.as(Element.Attribute)),
         .cdata => self.as(CData).isEqualNode(other.as(CData)),
-        .document_fragment => self.as(DocumentFragment).isEqualNode(other.as(DocumentFragment)),
         .document_type => self.as(DocumentType).isEqualNode(other.as(DocumentType)),
-        .document => {
-            // Document comparison is complex and rarely used in practice
-            log.warn(.not_implemented, "Node.isEqualNode", .{
-                .type = "document",
-            });
-            return false;
-        },
+        .document_fragment, .document => self.isEqualChildren(other),
     };
+}
+
+pub fn isEqualChildren(a: *Node, b: *Node) bool {
+    var a_count: usize = 0;
+    var a_iter = a.childrenIterator();
+
+    var b_count: usize = 0;
+    var b_iter = b.childrenIterator();
+
+    while (a_iter.next()) |a_node| : (a_count += 1) {
+        const b_node = b_iter.next() orelse return false;
+        b_count += 1;
+        if (a_node.isEqualNode(b_node)) {
+            continue;
+        }
+
+        return false;
+    }
+
+    // Make sure both have equal number of children.
+    return a_count == b_count;
 }
 
 pub fn isInShadowTree(self: *Node) bool {
@@ -470,9 +484,7 @@ pub fn isConnected(self: *const Node) bool {
 const GetRootNodeOpts = struct {
     composed: bool = false,
 };
-pub fn getRootNode(self: *Node, opts_: ?GetRootNodeOpts) *Node {
-    const opts = opts_ orelse GetRootNodeOpts{};
-
+pub fn getRootNode(self: *Node, opts: GetRootNodeOpts) *Node {
     var root = self;
     while (root._parent) |parent| {
         root = parent;
@@ -1229,16 +1241,29 @@ pub const JsApi = struct {
     pub const normalize = bridge.function(Node.normalize, .{ .ce_reactions = true });
     pub const cloneNode = bridge.function(Node.cloneNode, .{ .dom_exception = true, .ce_reactions = true });
     pub const compareDocumentPosition = bridge.function(Node.compareDocumentPosition, .{});
-    pub const getRootNode = bridge.function(Node.getRootNode, .{});
+    pub const getRootNode = bridge.function(_getRootNode, .{});
+    // The `options` argument is optional in JS; default it before calling the
+    // (non-optional) Node.getRootNode.
+    fn _getRootNode(self: *Node, opts: ?GetRootNodeOpts) *Node {
+        return self.getRootNode(opts orelse .{});
+    }
     pub const isEqualNode = bridge.function(Node.isEqualNode, .{});
     pub const lookupNamespaceURI = bridge.function(Node.lookupNamespaceURI, .{});
     pub const lookupPrefix = bridge.function(Node.lookupPrefix, .{});
     pub const isDefaultNamespace = bridge.function(Node.isDefaultNamespace, .{});
 
-    fn _baseURI(_: *Node, frame: *const Frame) []const u8 {
-        return frame.base();
-    }
     pub const baseURI = bridge.accessor(_baseURI, null, .{});
+    fn _baseURI(self: *Node, frame: *const Frame) []const u8 {
+        const doc = if (self._type == .document)
+            self._type.document
+        else
+            self.ownerDocument(frame) orelse return frame.base();
+
+        if (doc._frame) |doc_frame| {
+            return doc_frame.base();
+        }
+        return doc.getURL(frame);
+    }
 };
 
 pub const Build = struct {

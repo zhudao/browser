@@ -174,23 +174,7 @@ pub fn isEqualNode(self: *Element, other: *Element) bool {
         return false;
     }
 
-    // Compare children.
-    var self_iter = self.asNode().childrenIterator();
-    var other_iter = other.asNode().childrenIterator();
-    var self_count: usize = 0;
-    var other_count: usize = 0;
-    while (self_iter.next()) |self_node| : (self_count += 1) {
-        const other_node = other_iter.next() orelse return false;
-        other_count += 1;
-        if (self_node.isEqualNode(other_node)) {
-            continue;
-        }
-
-        return false;
-    }
-
-    // Make sure both have equal number of children.
-    return self_count == other_count;
+    return self.asNode().isEqualChildren(other.asNode());
 }
 
 pub fn getTagNameLower(self: *const Element) []const u8 {
@@ -990,8 +974,9 @@ pub fn focus(self: *Element, frame: *Frame) !void {
     const FocusEvent = @import("event/FocusEvent.zig");
 
     const new_target = self.asEventTarget();
-    const old_active = frame.document._active_element;
-    frame.document._active_element = self;
+    const doc = self.asNode().ownerDocument(frame) orelse frame.document;
+    const old_active = doc._active_element;
+    doc._active_element = self;
 
     if (old_active) |old| {
         if (old == self) {
@@ -1021,9 +1006,10 @@ pub fn focus(self: *Element, frame: *Frame) !void {
 }
 
 pub fn blur(self: *Element, frame: *Frame) !void {
-    if (frame.document._active_element != self) return;
+    const doc = self.asNode().ownerDocument(frame) orelse frame.document;
+    if (doc._active_element != self) return;
 
-    frame.document._active_element = null;
+    doc._active_element = null;
 
     const FocusEvent = @import("event/FocusEvent.zig");
     const old_target = self.asEventTarget();
@@ -1933,18 +1919,26 @@ pub const JsApi = struct {
         return buf.written();
     }
 
-    pub const outerHTML = bridge.accessor(_outerHTML, Element.setOuterHTML, .{ .ce_reactions = true });
-    fn _outerHTML(self: *Element, frame: *Frame) ![]const u8 {
+    pub const outerHTML = bridge.accessor(_getOuterHTML, _setOuterHTML, .{ .ce_reactions = true });
+    fn _getOuterHTML(self: *Element, frame: *Frame) ![]const u8 {
         var buf = std.Io.Writer.Allocating.init(frame.call_arena);
         try self.getOuterHTML(&buf.writer, frame);
         return buf.written();
     }
+    fn _setOuterHTML(self: *Element, value: js.Value, frame: *Frame) !void {
+        // `[LegacyNullToEmptyString] DOMString`: a JS null becomes "", not "null".
+        return self.setOuterHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
+    }
 
-    pub const innerHTML = bridge.accessor(_innerHTML, Element.setInnerHTML, .{ .ce_reactions = true });
-    fn _innerHTML(self: *Element, frame: *Frame) ![]const u8 {
+    pub const innerHTML = bridge.accessor(_getInnerHTML, _setInnerHTML, .{ .ce_reactions = true });
+    fn _getInnerHTML(self: *Element, frame: *Frame) ![]const u8 {
         var buf = std.Io.Writer.Allocating.init(frame.call_arena);
         try self.getInnerHTML(&buf.writer, frame);
         return buf.written();
+    }
+    fn _setInnerHTML(self: *Element, value: js.Value, frame: *Frame) !void {
+        // `[LegacyNullToEmptyString] DOMString`: a JS null becomes "", not "null".
+        return self.setInnerHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
     }
 
     pub const prefix = bridge.accessor(Element._prefix, null, .{});
