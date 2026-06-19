@@ -37,6 +37,7 @@ const Event = @import("Event.zig");
 const Worker = @import("Worker.zig");
 const Crypto = @import("Crypto.zig");
 const Console = @import("Console.zig");
+const Navigator = @import("Navigator.zig");
 const Timers = @import("Timers.zig");
 const EventTarget = @import("EventTarget.zig");
 const Performance = @import("Performance.zig");
@@ -92,11 +93,16 @@ _event_manager: EventManagerBase,
 // workers don't have <script> tags.
 _script_manager: ScriptManagerBase,
 
+// List of open BroadcastChannels, used to route postMessage between same-named
+// channels in this worker's origin
+_broadcast_channels: std.DoublyLinkedList = .{},
+
 // These fields represent the "Window"-like component of the WGS
 _closed: bool = false,
 _proto: *EventTarget,
 _console: Console = .init,
 _crypto: Crypto = .init,
+_navigator: Navigator = .init,
 _performance: Performance,
 _on_error: ?JS.Function.Global = null,
 _on_rejection_handled: ?JS.Function.Global = null,
@@ -159,6 +165,12 @@ pub fn init(worker: *Worker, url: [:0]const u8) !*WorkerGlobalScope {
         .identity_arena = arena,
         .identity = &self._identity,
     });
+
+    // A dedicated worker is in the same agent cluster and inherits its creator's
+    // origin. Adopt the parent frame's origin (shared *Origin + v8 security
+    // token) in place of the context's initial opaque one, so same-origin
+    // features like BroadcastChannel can reach across the page/worker boundary.
+    try self.js.setOrigin(self.origin);
 
     return self;
 }
@@ -257,6 +269,10 @@ pub fn setSelf(_: *WorkerGlobalScope, value: JS.Value) void {
 
 pub fn getCrypto(self: *WorkerGlobalScope) *Crypto {
     return &self._crypto;
+}
+
+pub fn getNavigator(self: *WorkerGlobalScope) *Navigator {
+    return &self._navigator;
 }
 
 pub fn performance(self: *WorkerGlobalScope) *Performance {
@@ -667,6 +683,7 @@ pub const JsApi = struct {
     pub const self = bridge.accessor(WorkerGlobalScope.getSelf, WorkerGlobalScope.setSelf, .{});
     pub const console = bridge.accessor(WorkerGlobalScope.getConsole, WorkerGlobalScope.setConsole, .{});
     pub const crypto = bridge.accessor(WorkerGlobalScope.getCrypto, null, .{});
+    pub const navigator = bridge.accessor(WorkerGlobalScope.getNavigator, null, .{});
     pub const performance = bridge.accessor(struct {
         // Unnecessary, But, our WebAPI getters are ALWAYS `fn getPerformance()...`.
         // But for performance, we _need_ to have fn performance() *Performance to
