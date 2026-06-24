@@ -116,24 +116,22 @@ popups: std.ArrayList(*Frame) = .empty,
 // ideal from a memory point of view).
 closed_frames: std.ArrayList(*Frame) = .empty,
 
-// Lifecycle state. A Page is `.pending` while we hold it as the in-flight
-// destination of a root navigation — its V8 context exists but is not yet the
-// session's active context. Flipped to `.active` by Session.commitPendingPage
-// when response headers arrive. Frame.navigate / frameHeaderDoneCallback
-// branch on this to stamp `is_pending_root` on the frame_navigate
-// notification (so CDP doesn't reset its node registry yet) and
-_state: enum { active, pending } = .active,
+// In-flight navigation for a root page. When not null, this page will "replace"
+// the referenced page once the response header arrives. This is necessary
+// because, during navigation, both the "old" and "new" pages remain addressable
+// in CDP
+replaces: ?*Page = null,
 
-// Runtime viewport override set via Emulation.setDeviceMetricsOverride and
-// cleared via Emulation.clearDeviceMetricsOverride. Null means use the
-// compile-time Viewport.default. Read every viewport consumer through
-// getViewport so they all observe the same (possibly overridden) value.
-viewport_override: ?Viewport = null,
+// Inverse of `replaces`. While we don't strictly need both, it does streamline
+// code. The two are kept in sync.
+replacement: ?*Page = null,
 
-// The viewport every consumer should read: the runtime override if set,
-// otherwise the compile-time default.
+// The viewport every consumer should read. The runtime override (set via
+// Emulation.setDeviceMetricsOverride) is stored on the Browser so it persists
+// across page navigations; delegate to it here, keeping a single read path for
+// every viewport consumer.
 pub fn getViewport(self: *const Page) Viewport {
-    return self.viewport_override orelse Viewport.default;
+    return self.session.browser.getViewport();
 }
 
 // Initialize a Page and its root Frame.

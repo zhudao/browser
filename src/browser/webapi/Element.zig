@@ -453,9 +453,9 @@ pub fn getLocalName(self: *Element) []const u8 {
 }
 
 // Wrapper methods that delegate to Html implementations
-pub fn getInnerText(self: *Element, writer: *std.Io.Writer) !void {
+pub fn getInnerText(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
     const he = self.is(Html) orelse return error.NotHtmlElement;
-    return he.getInnerText(writer);
+    return he.getInnerText(writer, frame);
 }
 
 pub fn setInnerText(self: *Element, text: []const u8, frame: *Frame) !void {
@@ -1043,6 +1043,10 @@ pub fn prepend(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !v
         const child = try nodes[i].toNode(frame);
         _ = try parent.insertBefore(child, parent.firstChild(), frame);
     }
+}
+
+pub fn moveBefore(self: *Element, node: js.Value, child: js.Value, frame: *Frame) !void {
+    return self.asNode().moveBefore(node, child, frame);
 }
 
 pub fn before(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
@@ -1913,9 +1917,9 @@ pub const JsApi = struct {
     pub const namespaceURI = bridge.accessor(Element.getNamespaceURI, null, .{});
 
     pub const innerText = bridge.accessor(_innerText, Element.setInnerText, .{ .ce_reactions = true });
-    fn _innerText(self: *Element, frame: *const Frame) ![]const u8 {
+    fn _innerText(self: *Element, frame: *Frame) ![]const u8 {
         var buf = std.Io.Writer.Allocating.init(frame.call_arena);
-        try self.getInnerText(&buf.writer);
+        try self.getInnerText(&buf.writer, frame);
         return buf.written();
     }
 
@@ -2014,6 +2018,7 @@ pub const JsApi = struct {
     pub const remove = bridge.function(Element.remove, .{ .ce_reactions = true });
     pub const append = bridge.function(Element.append, .{ .dom_exception = true, .ce_reactions = true });
     pub const prepend = bridge.function(Element.prepend, .{ .dom_exception = true, .ce_reactions = true });
+    pub const moveBefore = bridge.function(Element.moveBefore, .{ .dom_exception = true, .ce_reactions = true });
     pub const before = bridge.function(Element.before, .{ .dom_exception = true, .ce_reactions = true });
     pub const after = bridge.function(Element.after, .{ .dom_exception = true, .ce_reactions = true });
     pub const firstElementChild = bridge.accessor(Element.firstElementChild, null, .{});
