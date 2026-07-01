@@ -864,11 +864,24 @@ const CheckVisibilityOptions = struct {
 const INLINE_PRIORITY: u64 = std.math.maxInt(u64);
 
 fn getInlineStyleProperty(el: *Element, property_name: String, frame: *Frame) ?*CSSStyleProperty {
-    const style = el.getOrCreateStyle(frame) catch |err| {
-        log.err(.browser, "StyleManager getOrCreateStyle", .{ .err = err });
-        return null;
+    const style = frame._element_styles.get(el) orelse blk: {
+        // No JS-set style object and no style attribute -> nothing inline to read.
+        if (el.getAttributeSafe(comptime .wrap("style")) == null) return null;
+        break :blk el.getOrCreateStyle(frame) catch |err| {
+            log.err(.browser, "StyleManager getOrCreateStyle", .{ .err = err });
+            return null;
+        };
     };
     return style.asCSSStyleDeclaration().findProperty(property_name);
+}
+
+/// Resolved value of an element's inline `style=` declaration for `property_name`,
+/// or null when the element has no such declaration. Reads the element's parsed
+/// inline style (the same source `el.style` exposes), so `getComputedStyle` and
+/// `el.style` agree on inline values instead of resolving them independently.
+pub fn inlineStyleValue(self: *StyleManager, el: *Element, property_name: String) ?[]const u8 {
+    const property = getInlineStyleProperty(el, property_name, self.frame) orelse return null;
+    return property._value.str();
 }
 
 const testing = @import("../testing.zig");
