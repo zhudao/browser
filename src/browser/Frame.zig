@@ -652,13 +652,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
             .timestamp = timestamp(.monotonic),
         });
 
-        // Record telemetry for navigation
-        session.browser.app.telemetry.record(.{
-            .navigate = .{
-                .tls = false, // about:blank and blob: are not TLS
-                .proxy = session.browser.app.config.httpProxy() != null,
-            },
-        });
+        self.recordNavigateTelemetry(false);
 
         session.notification.dispatch(.frame_navigated, &.{
             .req_id = req_id,
@@ -738,10 +732,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
     });
 
     // Record telemetry for navigation
-    session.browser.app.telemetry.record(.{ .navigate = .{
-        .tls = std.ascii.startsWithIgnoreCase(self.url, "https://"),
-        .proxy = session.browser.app.config.httpProxy() != null,
-    } });
+    self.recordNavigateTelemetry(std.ascii.startsWithIgnoreCase(self.url, "https://"));
 
     session.navigation._current_navigation_kind = opts.kind;
 
@@ -765,6 +756,18 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         log.err(.frame, "navigate request", .{ .url = self.url, .err = err, .type = self._type });
         return err;
     };
+}
+
+fn recordNavigateTelemetry(self: *Frame, tls: bool) void {
+    self._session.browser.app.telemetry.record(.{ .navigate = .{
+        .tls = tls,
+        .context = if (self.parent != null)
+            .iframe
+        else if (self.window._opener != null)
+            .popup
+        else
+            .page,
+    } });
 }
 
 // Navigation can happen in many places, such as executing a <script> tag or
@@ -2048,6 +2051,20 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     };
 
     const http_client = &session.browser.http_client;
+
+    // `syncRequest` below registers a blocking request for this frame, which
+    // makes the DeferringLayer hold back the completion callbacks of every
+    // OTHER in-flight transfer for the frame (e.g. a `<script defer>` still
+    // loading) so they don't run JS while we're on the parser stack. Those
+    // deferred completions must be flushed once the sync fetch returns —
+    // otherwise a `<script defer>` whose fetch finishes during this window is
+    // left at `complete == false` forever, the deferred-script queue never
+    // drains, and `documentIsLoaded` (readyState -> "interactive",
+    // DOMContentLoaded, the load event) never fires. The blocking-`<script>`
+    // path (ScriptManager.addFromElement) and the worker path already flush;
+    // the external-stylesheet path must too.
+    defer http_client.deferring_layer.flushFrame(self._frame_id);
+
     var headers = try http_client.newHeaders();
     try headers.add("Accept: text/css,*/*;q=0.1");
     try self.headersForRequest(&headers);
