@@ -192,7 +192,6 @@ pub const JsApi = struct {
         pub const name = "DocumentFragment";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const enumerable = false;
     };
 
     pub const constructor = bridge.constructor(DocumentFragment.init, .{});
@@ -222,7 +221,7 @@ pub const JsApi = struct {
 
     pub const innerHTML = bridge.accessor(_getInnerHTML, _setInnerHTML, .{ .ce_reactions = true });
     fn _getInnerHTML(self: *DocumentFragment, frame: *Frame) ![]const u8 {
-        var buf = std.Io.Writer.Allocating.init(frame.call_arena);
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
         try self.getInnerHTML(&buf.writer, frame);
         return buf.written();
     }
