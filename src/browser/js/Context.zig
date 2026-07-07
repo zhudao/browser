@@ -316,6 +316,18 @@ pub fn toLocal(self: *Context, global: anytype) js.Local.ToLocalReturnType(@Type
     return l.toLocal(global);
 }
 
+// This context's global (proxy) object, bound to an already-active local.
+// Lets a caller running in a different context — e.g. a [Replaceable] setter
+// invoked on another same-origin window — target this context's global rather
+// than its own.
+pub fn globalObject(self: *Context, local: *const js.Local) js.Object {
+    const local_v8_context: *const v8.Context = @ptrCast(v8.v8__Global__Get(&self.handle, self.isolate.handle));
+    return .{
+        .local = local,
+        .handle = v8.v8__Context__Global(local_v8_context).?,
+    };
+}
+
 pub fn getIncumbent(self: *Context) *Frame {
     const ctx = fromC(v8.v8__Isolate__GetIncumbentContext(self.env.isolate.handle).?).?;
     return switch (ctx.global) {
@@ -746,8 +758,7 @@ fn _resolveModuleCallback(self: *Context, referrer: js.Module, specifier: [:0]co
         specifier,
     );
 
-    const entry = self.module_cache.getPtr(normalized_specifier).?;
-    if (entry.module) |m| {
+    if (self.module_cache.getPtr(normalized_specifier).?.module) |m| {
         // This import registered a waiter via preloadImport when it was discovered
         // but the compiled module is already cached so we don't have to call
         // waitForImport. Release our waiter so we no longer hold on waiter on
@@ -773,6 +784,9 @@ fn _resolveModuleCallback(self: *Context, referrer: js.Module, specifier: [:0]co
 
     const mod = try compileModule(local, source.src(), normalized_specifier);
     try self.postCompileModule(mod, normalized_specifier, local);
+    // waitForImport can cause module_cache to be mutated (via HttpClient.tick),
+    // so we need to refetch this incase the hashmap changed
+    const entry = self.module_cache.getPtr(normalized_specifier).?;
     entry.module = try mod.persist();
     // Note: We don't instantiate/evaluate here - V8 will handle instantiation
     // as part of the parent module's dependency chain. If there's a resolver

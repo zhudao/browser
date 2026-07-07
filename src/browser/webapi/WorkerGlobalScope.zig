@@ -254,16 +254,16 @@ pub fn getSelf(self: *WorkerGlobalScope) *WorkerGlobalScope {
     return self;
 }
 
-pub fn setSelf(_: *WorkerGlobalScope, value: JS.Value) void {
-    replaceGlobalProperty(value, "self");
+pub fn setSelf(self: *WorkerGlobalScope, value: JS.Value) void {
+    self.replaceGlobalProperty(value, "self");
 }
 
 pub fn getConsole(self: *WorkerGlobalScope) *Console {
     return &self._console;
 }
 
-pub fn setConsole(_: *WorkerGlobalScope, value: JS.Value) void {
-    replaceGlobalProperty(value, "console");
+pub fn setConsole(self: *WorkerGlobalScope, value: JS.Value) void {
+    self.replaceGlobalProperty(value, "console");
 }
 
 pub fn getCrypto(self: *WorkerGlobalScope) *Crypto {
@@ -503,11 +503,11 @@ pub fn clearInterval(self: *WorkerGlobalScope, id: u32) void {
     self._timers.clear(id);
 }
 
-// `console` and `self` are [Replaceable]: assignment redefines them as own data
-// properties on the global rather than throwing through the getter-only accessor
-// in strict mode. Used here (console) and by DedicatedWorkerGlobalScope (self).
-pub fn replaceGlobalProperty(value: JS.Value, comptime name: []const u8) void {
-    const global = value.local.getGlobal();
+// Some properties are readonly but [Replaceable]. They get assigned as own
+// data properties on the underlying v8::object that represents the global (the
+// WorkerGlobalScope)
+fn replaceGlobalProperty(self: *WorkerGlobalScope, value: JS.Value, comptime name: []const u8) void {
+    const global = self.js.globalObject(value.local);
     _ = global.defineOwnProperty(name, value, 0);
 }
 
@@ -553,12 +553,12 @@ pub const JsApi = struct {
     pub const onrejectionhandled = bridge.accessor(WorkerGlobalScope.getOnRejectionHandled, WorkerGlobalScope.setOnRejectionHandled, .{});
     pub const onunhandledrejection = bridge.accessor(WorkerGlobalScope.getOnUnhandledRejection, WorkerGlobalScope.setOnUnhandledRejection, .{});
 
-    pub const btoa = bridge.function(WorkerGlobalScope.btoa, .{ .dom_exception = true });
-    pub const atob = bridge.function(WorkerGlobalScope.atob, .{ .dom_exception = true });
+    pub const btoa = bridge.function(WorkerGlobalScope.btoa, .{});
+    pub const atob = bridge.function(WorkerGlobalScope.atob, .{});
     pub const structuredClone = bridge.function(WorkerGlobalScope.structuredClone, .{});
     pub const reportError = bridge.function(WorkerGlobalScope.reportError, .{});
     pub const fetch = bridge.function(WorkerGlobalScope.fetch, .{});
-    pub const importScripts = bridge.function(WorkerGlobalScope.importScripts, .{ .dom_exception = true });
+    pub const importScripts = bridge.function(WorkerGlobalScope.importScripts, .{});
     pub const queueMicrotask = bridge.function(WorkerGlobalScope.queueMicrotask, .{});
     pub const setTimeout = bridge.function(WorkerGlobalScope.setTimeout, .{});
     pub const clearTimeout = bridge.function(WorkerGlobalScope.clearTimeout, .{});
