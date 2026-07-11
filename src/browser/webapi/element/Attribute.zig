@@ -195,11 +195,13 @@ pub const List = struct {
     }
 
     // Identity map access: a given (list, name) always yields the same
-    // *Attribute until the attribute is removed.
+    // *Attribute until the attribute is removed. The map must be the
+    // element's frame's, not the caller's frame.
     pub fn getOrCreateAttribute(self: *const List, entry: *const Entry, element: ?*Element, frame: *Frame) !*Attribute {
-        const gop = try frame._attribute_lookup.getOrPut(frame.arena, .{ .list = self, .name = entry._name_ptr });
+        const owner = if (element) |el| el.ownerFrame(frame) else frame;
+        const gop = try owner._attribute_lookup.getOrPut(owner.arena, .{ .list = self, .name = entry._name_ptr });
         if (!gop.found_existing) {
-            gop.value_ptr.* = try entry.toAttribute(element, frame);
+            gop.value_ptr.* = try entry.toAttribute(element, owner);
         }
         return gop.value_ptr.*;
     }
@@ -216,6 +218,7 @@ pub const List = struct {
 
     // The returned *Entry is only valid until the next mutation of the list.
     fn _put(self: *List, result: NormalizeAndEntry, value: String, element: *Element, frame: *Frame) !*Entry {
+        const owner = element.ownerFrame(frame);
         const is_id = shouldAddToIdMap(result.normalized, element);
 
         var entry: *Entry = undefined;
@@ -224,16 +227,16 @@ pub const List = struct {
             // the old bytes are arena-owned or static; they outlive this update
             old_value = String.wrap(e.value());
             if (is_id) {
-                frame.removeElementId(element, e.value());
+                owner.removeElementId(element, e.value());
             }
-            e.setValue(try frame.dupeString(value.str()));
+            e.setValue(try owner.dupeString(value.str()));
             entry = e;
         } else {
-            try self.ensureUnusedCapacity(1, frame);
+            try self.ensureUnusedCapacity(1, owner);
             entry = &self._entries[self._len];
             entry.* = .init(
-                try canonicalizeName(result.normalized.str(), frame),
-                try frame.dupeString(value.str()),
+                try canonicalizeName(result.normalized.str(), owner),
+                try owner.dupeString(value.str()),
             );
             self._len += 1;
         }
@@ -242,10 +245,10 @@ pub const List = struct {
             const parent = element.asNode()._parent orelse {
                 return entry;
             };
-            try frame.addElementId(parent, element, entry.value());
+            try owner.addElementId(parent, element, entry.value());
         }
-        frame.domChanged();
-        frame.attributeChange(element, result.normalized, .wrap(entry.value()), old_value);
+        owner.domChanged();
+        owner.attributeChange(element, result.normalized, .wrap(entry.value()), old_value);
         return entry;
     }
 
@@ -283,7 +286,8 @@ pub const List = struct {
 
         const entry = try self.put(attribute._name, attribute._value, element, frame);
         attribute._element = element;
-        try frame._attribute_lookup.put(frame.arena, .{ .list = self, .name = entry._name_ptr }, attribute);
+        const owner = element.ownerFrame(frame);
+        try owner._attribute_lookup.put(owner.arena, .{ .list = self, .name = entry._name_ptr }, attribute);
         return existing_attribute;
     }
 
@@ -312,23 +316,24 @@ pub const List = struct {
         const result = try self.getEntryAndNormalizedName(name, frame);
         const entry = result.entry orelse return;
 
+        const owner = element.ownerFrame(frame);
         const is_id = shouldAddToIdMap(result.normalized, element);
         const old_value = entry.value();
 
         if (is_id) {
-            frame.removeElementId(element, old_value);
+            owner.removeElementId(element, old_value);
         }
 
         // remove this BEFORE triggering anything, incase that re-enters delete
         // or some other callback.
-        _ = frame._attribute_lookup.remove(.{ .list = self, .name = entry._name_ptr });
+        _ = owner._attribute_lookup.remove(.{ .list = self, .name = entry._name_ptr });
         const index = (@intFromPtr(entry) - @intFromPtr(self._entries)) / @sizeOf(Entry);
         const list_entries = self._entries[0..self._len];
         std.mem.copyForwards(Entry, list_entries[index .. list_entries.len - 1], list_entries[index + 1 ..]);
         self._len -= 1;
 
-        frame.domChanged();
-        frame.attributeRemove(element, result.normalized, .wrap(old_value));
+        owner.domChanged();
+        owner.attributeRemove(element, result.normalized, .wrap(old_value));
     }
 
     pub fn getNames(self: *const List, allocator: Allocator) ![][]const u8 {
@@ -385,27 +390,10 @@ pub const List = struct {
         const normalized =
             if (self.normalize) try normalizeNameForLookup(name, frame) else name;
 
-        // A name that was never canonicalized can't be in any list.
-        const canonical = lookupCanonicalName(normalized.str(), frame) orelse {
-            return .{ .normalized = normalized, .entry = null };
-        };
         return .{
             .normalized = normalized,
-            .entry = self.getEntryWithCanonicalName(canonical.ptr),
+            .entry = self.getEntryWithNormalizedName(normalized),
         };
-    }
-
-    // This is one of the wins of the canonical names...we can compare strings
-    // as a single pointer comparison. By applying the same canonicalization to
-    // the lists attributes name and to an input, we get the same pointer for
-    // a given string.
-    fn getEntryWithCanonicalName(self: *const List, name_ptr: [*]const u8) ?*Entry {
-        for (self._entries[0..self._len]) |*e| {
-            if (e._name_ptr == name_ptr) {
-                return e;
-            }
-        }
-        return null;
     }
 
     fn getEntryWithNormalizedName(self: *const List, name: String) ?*Entry {
@@ -514,10 +502,10 @@ pub fn validateAttributeName(name: String) !void {
 }
 
 // Every stored entry name either comes from the static String.intern or from
-// the frame._attribute_names. This doesn't just avoid extra dupes/allocations,
-// it gives us comparable pointer.
-// For the lifetime of a frame:
-//    canonicalizeName("attrx").ptr == canonicalizeName("attrx").ptr
+// the frame._attribute_names. Beyond avoiding extra dupes/allocations, this
+// gives a stable pointer for the frame's lifetime, which List.LookupKey
+// relies on for identity. The pointer is NOT comparable across frames (each
+// frame has its own pool), which is why lookups byte-compare.
 fn canonicalizeName(name: []const u8, frame: *Frame) ![]const u8 {
     if (String.intern(name)) |static| {
         return static;
@@ -527,19 +515,6 @@ fn canonicalizeName(name: []const u8, frame: *Frame) ![]const u8 {
         gop.key_ptr.* = try frame.arena.dupe(u8, name);
     }
     return gop.key_ptr.*;
-}
-
-// Let's say you want to find an attribute name "attrx". We could iterate an
-// attribute list to do the string comparison. OR, we could run "attrx" through
-// the same canonicalization as we applied to the attribute's names. If we don't
-// find a canonical value, then it's then this attribute was never canonicalized
-// before (and thus, we can shortcircuit a search). If we DO canonicalize it
-// the we get do a pointer comparison rather than a full string comparison.
-fn lookupCanonicalName(name: []const u8, frame: *const Frame) ?[]const u8 {
-    if (String.intern(name)) |static| {
-        return static;
-    }
-    return frame._attribute_names.getKey(name);
 }
 
 fn normalizeNameForLookup(name: String, frame: *Frame) !String {

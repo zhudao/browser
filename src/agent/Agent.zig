@@ -171,6 +171,19 @@ const script_skill =
     \\6. **Let failures fail.** Primitives throw on error and stop the script — only `try/catch` where you have a real fallback (e.g. optional cookie banner: `try { page.click("#accept") } catch {}`).
     \\7. **End with `return <result>`.** `console.log` is for debug output only and doesn't JSON-format objects.
     \\8. Modern, readable JS: `const`/`let`, `for (const x of xs)`, template literals, destructuring, 2-space indent.
+    \\9. **Comment the intent of each block.** Put a one-line `//` comment above each logical step describing what it accomplishes toward the goal (not restating the call). One comment per block, not per line — skip self-evident lines:
+    \\   ```js
+    \\   // Load the Hacker News front page
+    \\   const page = new Page();
+    \\   await page.goto("https://news.ycombinator.com");
+    \\
+    \\   // Pull the top 5 stories (title + link)
+    \\   const { stories } = page.extract({ stories: [{ selector: "tr.athing", limit: 5, fields: { title: ".titleline > a", url: { selector: ".titleline > a", attr: "href" } } }] });
+    \\
+    \\   // Open each story page in parallel and read its text
+    \\   const pages = stories.map(() => new Page());
+    \\   await Promise.all(pages.map((p, i) => p.goto(stories[i].url)));
+    \\   ```
     \\
     \\## Common errors
     \\
@@ -692,7 +705,15 @@ fn runRepl(self: *Agent) void {
             continue :repl;
         }
 
-        const slash_split: ?Schema.Split = Schema.parseSlashCommand(trimmed);
+        // A slash command whose `'''…'''` body is still open continues on the
+        // following lines until the block closes (the multi-line /extract
+        // form). Ctrl-D on the continuation prompt abandons the command.
+        const command_text: []const u8 = if (trimmed[0] == '/' and Schema.hasUnclosedTripleQuote(trimmed))
+            Terminal.readContinuation(aa, trimmed) orelse continue :repl
+        else
+            trimmed;
+
+        const slash_split: ?Schema.Split = Schema.parseSlashCommand(command_text);
         if (slash_split) |split| {
             if (SlashCommand.findMeta(split.name)) |meta| {
                 if (self.handleMeta(aa, meta, split.rest)) break :repl;
@@ -701,7 +722,7 @@ fn runRepl(self: *Agent) void {
         }
 
         var diag: Schema.Diag = .{};
-        const cmd = Command.parseDiag(aa, line, &diag) catch |err| switch (err) {
+        const cmd = Command.parseDiag(aa, command_text, &diag) catch |err| switch (err) {
             error.NotASlashCommand => {
                 if (self.ai_client == null) {
                     self.terminal.printError("Basic REPL (LLM disabled) accepts only commands. Try /help, or " ++ llm_setup_hint ++ " to enable natural-language prompts.", .{});
@@ -733,7 +754,7 @@ fn runRepl(self: *Agent) void {
                 if (!result.is_error) {
                     self.recordSaveCommand(navigationGoto(aa, tc.tool, tc.args) orelse cmd);
                 }
-                self.recordSlashToolCall(trimmed, tc.name(), tc.args, result) catch |err| {
+                self.recordSlashToolCall(command_text, tc.name(), tc.args, result) catch |err| {
                     self.terminal.printWarning("LLM conversation out of sync (/{s}: {s}); next prompt may not see this action", .{ tc.name(), @errorName(err) });
                 };
             },
@@ -1165,7 +1186,8 @@ fn synthesizeSave(self: *Agent, arena: std.mem.Allocator, filename: ?[]const u8,
 fn saveOneShot(self: *Agent) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
-    self.synthesizeSaveTo(arena.allocator(), self.one_shot_save.?, .replace, self.one_shot_task.?);
+    const path = save.ensureJsExtension(arena.allocator(), self.one_shot_save.?) catch self.one_shot_save.?;
+    self.synthesizeSaveTo(arena.allocator(), path, .replace, self.one_shot_task.?);
 }
 
 /// LLM synthesis + write for an already-resolved destination. Shared by the
