@@ -23,6 +23,7 @@ const Page = @import("../Page.zig");
 const EventManager = @import("../EventManager.zig");
 
 const Event = @import("Event.zig");
+const AbortSignal = @import("AbortSignal.zig");
 
 const RegisterOptions = EventManager.RegisterOptions;
 
@@ -50,6 +51,7 @@ pub const Type = union(enum) {
     file_reader: *@import("FileReader.zig"),
     font_face_set: *@import("css/FontFaceSet.zig"),
     websocket: *@import("net/WebSocket.zig"),
+    event_source: *@import("net/EventSource.zig"),
     cookie_store: *@import("storage/CookieStore.zig"),
     idb_request: *@import("storage/idb/IDBRequest.zig"),
     idb_database: *@import("storage/idb/IDBDatabase.zig"),
@@ -82,7 +84,17 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
 
 const AddEventListenerOptions = union(enum) {
     capture: bool,
-    options: RegisterOptions,
+    options: Options,
+
+    // The signal is kept as a raw js.Value so that an explicit null (or any
+    // non-AbortSignal value) can be told apart from an absent or undefined
+    // member, and rejected with a TypeError per the dictionary conversion.
+    const Options = struct {
+        once: bool = false,
+        capture: bool = false,
+        passive: bool = false,
+        signal: ?js.Value = null,
+    };
 };
 
 pub const EventListenerCallback = union(enum) {
@@ -90,19 +102,32 @@ pub const EventListenerCallback = union(enum) {
     object: js.Object,
 };
 pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?AddEventListenerOptions, exec: *js.Execution) !void {
+    // Convert the options before the null-callback early return: per spec,
+    // the dictionary conversion throws even when the callback is null.
+    const options = blk: {
+        const o = opts_ orelse break :blk RegisterOptions{};
+        break :blk switch (o) {
+            .options => |opts| RegisterOptions{
+                .once = opts.once,
+                .capture = opts.capture,
+                .passive = opts.passive,
+                .signal = signal: {
+                    const signal = opts.signal orelse break :signal null;
+                    if (signal.isUndefined()) {
+                        break :signal null;
+                    }
+                    break :signal try signal.toZig(*AbortSignal);
+                },
+            },
+            .capture => |capture| RegisterOptions{ .capture = capture },
+        };
+    };
+
     const callback = callback_ orelse return;
 
     const em_callback: EventManager.Callback = switch (callback) {
         .object => |obj| .{ .object = obj },
         .function => |func| .{ .function = func },
-    };
-
-    const options = blk: {
-        const o = opts_ orelse break :blk RegisterOptions{};
-        break :blk switch (o) {
-            .options => |opts| opts,
-            .capture => |capture| RegisterOptions{ .capture = capture },
-        };
     };
 
     switch (exec.js.global) {
@@ -166,6 +191,7 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
         .file_reader => writer.writeAll("<FileReader>"),
         .font_face_set => writer.writeAll("<FontFaceSet>"),
         .websocket => writer.writeAll("<WebSocket>"),
+        .event_source => writer.writeAll("<EventSource>"),
         .cookie_store => writer.writeAll("<CookieStore>"),
         .idb_request => writer.writeAll("<IDBRequest>"),
         .idb_database => writer.writeAll("<IDBDatabase>"),
@@ -194,6 +220,7 @@ pub fn toString(self: *EventTarget) []const u8 {
         .file_reader => return "[object FileReader]",
         .font_face_set => return "[object FontFaceSet]",
         .websocket => return "[object WebSocket]",
+        .event_source => return "[object EventSource]",
         .cookie_store => return "[object CookieStore]",
         .idb_request => return "[object IDBRequest]",
         .idb_database => return "[object IDBDatabase]",
