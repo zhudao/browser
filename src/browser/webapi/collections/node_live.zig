@@ -39,6 +39,7 @@ const Mode = enum {
     all_elements,
     child_elements,
     child_tag,
+    cells,
     selected_options,
     links,
     anchors,
@@ -59,6 +60,7 @@ const Filters = union(Mode) {
     all_elements,
     child_elements,
     child_tag: Element.Tag,
+    cells,
     selected_options,
     links,
     anchors,
@@ -91,7 +93,7 @@ pub fn NodeLive(comptime mode: Mode) type {
     const Filter = Filters.TypeOf(mode);
     const TW = switch (mode) {
         .tag, .tag_name, .tag_name_ns, .class_name, .name, .all_elements, .links, .anchors, .form => TreeWalker.FullExcludeSelf,
-        .child_elements, .child_tag, .selected_options => TreeWalker.Children,
+        .child_elements, .child_tag, .cells, .selected_options => TreeWalker.Children,
     };
     return struct {
         _tw: TW,
@@ -194,6 +196,11 @@ pub fn NodeLive(comptime mode: Mode) type {
             // (like length or getAtIndex)
             var tw = self._tw.clone();
             while (self.nextTw(&tw)) |element| {
+                // Per spec, only HTML-namespace elements are exposed via
+                // their name attribute (ids expose any element).
+                if (element._namespace != .html) {
+                    continue;
+                }
                 const element_name = element.getAttributeSafe(comptime .wrap("name")) orelse continue;
                 if (std.mem.eql(u8, element_name, name)) {
                     return element;
@@ -277,6 +284,12 @@ pub fn NodeLive(comptime mode: Mode) type {
                 .child_tag => {
                     const el = node.is(Element) orelse return false;
                     return el.getTag() == self._filter;
+                },
+                .cells => {
+                    // HTMLTableRowElement.cells: td and th children.
+                    const el = node.is(Element) orelse return false;
+                    const tag = el.getTag();
+                    return tag == .td or tag == .th;
                 },
                 .selected_options => {
                     const el = node.is(Element) orelse return false;
@@ -368,6 +381,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                 .all_elements => HTMLCollection{ ._data = .{ .all_elements = self } },
                 .child_elements => HTMLCollection{ ._data = .{ .child_elements = self } },
                 .child_tag => HTMLCollection{ ._data = .{ .child_tag = self } },
+                .cells => HTMLCollection{ ._data = .{ .cells = self } },
                 .selected_options => HTMLCollection{ ._data = .{ .selected_options = self } },
                 .links => HTMLCollection{ ._data = .{ .links = self } },
                 .anchors => HTMLCollection{ ._data = .{ .anchors = self } },

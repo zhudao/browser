@@ -472,13 +472,54 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
     }
 
     frame.domChanged();
+
+    // Observers of the parent must see a single mutation record replacing
+    // this node with the parsed nodes.
+    const notify = Frame.observers.hasMutationObservers(frame);
+    var added: std.ArrayList(*Node) = .empty;
+
+    var fragment: ?*Node = null;
     if (html.len > 0) {
-        const fragment = (try Node.DocumentFragment.init(frame)).asNode();
-        try frame.parseHtmlAsChildren(fragment, html);
-        try frame.insertAllChildrenBefore(fragment, parent, node);
+        const frag = (try Node.DocumentFragment.init(frame)).asNode();
+        try frame.parseHtmlAsChildren(frag, html);
+        fragment = frag;
     }
 
-    frame.removeNode(parent, node, .{ .will_be_reconnected = false });
+    // Parsing (and each insertion below) can synchronously run a custom
+    // element constructor that mutates the live tree; per the spec's replace
+    // step, a node that is no longer our parent's child cannot be replaced.
+    if (node._parent != parent) {
+        return error.NotFound;
+    }
+
+    // Captured after the parse: a constructor may have reshuffled siblings.
+    const previous_sibling = node.previousSibling();
+    const next_sibling = node.nextSibling();
+
+    if (fragment) |frag| {
+        const dest_connected = parent.isConnected();
+        var it = frag.childrenIterator();
+        while (it.next()) |child| {
+            if (node._parent != parent) {
+                return error.NotFound;
+            }
+            if (notify) {
+                try added.append(frame.call_arena, child);
+            }
+            frame.removeNode(frag, child, .{ .will_be_reconnected = dest_connected, .notify_observers = false });
+            try frame.insertNodeRelative(parent, child, .{ .before = node }, .{ .notify_observers = false });
+        }
+    }
+
+    if (node._parent != parent) {
+        return error.NotFound;
+    }
+    frame.removeNode(parent, node, .{ .will_be_reconnected = false, .notify_observers = false });
+
+    if (notify) {
+        const removed = [_]*Node{node};
+        Frame.observers.notifyChildListChange(frame, parent, added.items, &removed, previous_sibling, next_sibling);
+    }
 }
 
 pub fn getInnerHTML(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
@@ -771,9 +812,14 @@ pub fn insertAdjacentElement(
     position: []const u8,
     element: *Element,
     frame: *Frame,
-) !void {
-    const target_node, const prev_node = try self.asNode().findAdjacentNodes(position);
+) !?*Element {
+    const target_node, const prev_node = self.asNode().findAdjacentNodes(position, .node) catch |err| switch (err) {
+        // beforebegin/afterend with no parent is a no-op returning null.
+        error.AdjacentNoParent => return null,
+        else => return err,
+    };
     _ = try target_node.insertBefore(element.asNode(), prev_node, frame);
+    return element;
 }
 
 pub fn insertAdjacentText(
@@ -782,8 +828,12 @@ pub fn insertAdjacentText(
     data: []const u8,
     frame: *Frame,
 ) !void {
+    const target_node, const prev_node = self.asNode().findAdjacentNodes(where, .node) catch |err| switch (err) {
+        // beforebegin/afterend with no parent is a no-op.
+        error.AdjacentNoParent => return,
+        else => return err,
+    };
     const text_node = try Frame.node_factory.createTextNode(frame, data);
-    const target_node, const prev_node = try self.asNode().findAdjacentNodes(where);
     _ = try target_node.insertBefore(text_node, prev_node, frame);
 }
 
@@ -880,6 +930,23 @@ pub fn getRelList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
         gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
             ._element = self,
             ._attribute_name = comptime .wrap("rel"),
+        });
+    }
+    return gop.value_ptr.*;
+}
+
+// The other DOMTokenList-reflected attributes (class and rel have dedicated
+// lookups above).
+pub const TokenListAttribute = enum { sizes, sandbox, @"for" };
+pub const TokenListKey = struct { element: *Element, attribute: TokenListAttribute };
+pub const TokenListLookup = std.AutoHashMapUnmanaged(TokenListKey, *collections.DOMTokenList);
+
+pub fn getTokenList(self: *Element, comptime attribute: TokenListAttribute, frame: *Frame) !*collections.DOMTokenList {
+    const gop = try frame._element_token_lists.getOrPut(frame.arena, .{ .element = self, .attribute = attribute });
+    if (!gop.found_existing) {
+        gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
+            ._element = self,
+            ._attribute_name = comptime .wrap(@tagName(attribute)),
         });
     }
     return gop.value_ptr.*;
@@ -1488,6 +1555,14 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
     const tag_name = self.getTagNameDump();
     const node = try Frame.node_factory.createElementNS(frame, self._namespace, tag_name, &self._attributes);
 
+    // A namespace outside the built-in set lives in a side table; the clone
+    // must report the same namespaceURI.
+    if (self._namespace == .unknown) {
+        if (frame._element_namespace_uris.get(self)) |uri| {
+            try frame._element_namespace_uris.put(frame.arena, node.as(Element), uri);
+        }
+    }
+
     // Allow element-specific types to copy their runtime state
     _ = Element.Build.call(node.as(Element), "cloned", .{ self, node.as(Element), deep, frame }) catch |err| {
         log.err(.dom, "element.clone.failed", .{ .err = err });
@@ -1899,7 +1974,9 @@ pub const JsApi = struct {
     fn _tagName(self: *Element, frame: *Frame) []const u8 {
         return self.getTagNameSpec(&frame.buf);
     }
-    pub const namespaceURI = bridge.accessor(Element.getNamespaceURI, null, .{});
+    // the frame-aware variant returns the original URI for namespaces
+    // outside the built-in set instead of the placeholder
+    pub const namespaceURI = bridge.accessor(Element.getNamespaceUri, null, .{});
 
     pub const innerText = bridge.accessor(_innerText, Element.setInnerText, .{ .ce_reactions = true });
     fn _innerText(self: *Element, frame: *Frame) ![]const u8 {

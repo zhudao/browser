@@ -123,11 +123,17 @@ pub fn is(self: *Node, comptime T: type) ?*T {
     return null;
 }
 
+/// Which "insert adjacent" flavor is asking. insertAdjacentHTML throws
+/// NoModificationAllowedError for a null or document parent, while
+/// insertAdjacentElement/Text return null for a null parent and otherwise
+/// rely on the pre-insert validity checks (HierarchyRequestError).
+const AdjacentVariant = enum { html, node };
+
 /// Given a position, returns target and previous nodes required for
 /// insertAdjacentHTML, insertAdjacentElement and insertAdjacentText.
 /// * `target_node` is `*Node` (where we actually insert),
 /// * `previous_node` is `?*Node`.
-pub fn findAdjacentNodes(self: *Node, position: []const u8) !struct { *Node, ?*Node } {
+pub fn findAdjacentNodes(self: *Node, position: []const u8, variant: AdjacentVariant) !struct { *Node, ?*Node } {
     // Case-insensitive match per HTML spec.
     // "beforeend" was the most common case in my tests; we might adjust the order
     // depending on which ones websites prefer most.
@@ -141,34 +147,34 @@ pub fn findAdjacentNodes(self: *Node, position: []const u8) !struct { *Node, ?*N
     }
 
     if (std.ascii.eqlIgnoreCase(position, "beforebegin")) {
-        // The node must have a parent node in order to use this variant.
-        const parent_node = self.parentNode() orelse return error.NoModificationAllowed;
-        // Parent cannot be Document.
-        switch (parent_node._type) {
-            .document, .document_fragment => return error.NoModificationAllowed,
-            else => {},
-        }
-
-        return .{ parent_node, self };
+        return .{ try self.adjacentParent(variant), self };
     }
 
     if (std.ascii.eqlIgnoreCase(position, "afterend")) {
-        // The node must have a parent node in order to use this variant.
-        const parent_node = self.parentNode() orelse return error.NoModificationAllowed;
-        // Parent cannot be Document.
-        switch (parent_node._type) {
-            .document, .document_fragment => return error.NoModificationAllowed,
-            else => {},
-        }
-
         // Get the next sibling or null; null indicates our node is the only one.
-        return .{ parent_node, self.nextSibling() };
+        return .{ try self.adjacentParent(variant), self.nextSibling() };
     }
 
     // Returned if:
     // * position is not one of the four listed values.
     // * The input is XML that is not well-formed.
     return error.SyntaxError;
+}
+
+// beforebegin/afterend insert into the parent, which must exist and, for the
+// html variant, cannot be a document or fragment.
+fn adjacentParent(self: *Node, variant: AdjacentVariant) !*Node {
+    const parent_node = self.parentNode() orelse switch (variant) {
+        .html => return error.NoModificationAllowed,
+        .node => return error.AdjacentNoParent,
+    };
+    if (variant == .html) {
+        switch (parent_node._type) {
+            .document, .document_fragment => return error.NoModificationAllowed,
+            else => {},
+        }
+    }
+    return parent_node;
 }
 
 pub fn firstChild(self: *const Node) ?*Node {
@@ -220,6 +226,46 @@ fn validateNodeInsertion(parent: *Node, node: *Node) !void {
     }
 }
 
+// DOM "ensure pre-insert validity" rules specific to document parents: a
+// document can't contain text nodes and has at most one element child.
+// `replaced_child` is the node about to be replaced (replaceChild), which
+// doesn't count against the single-element rule. Not part of
+// validateNodeInsertion because replaceChildren replaces every existing
+// child and must skip the single-element rule entirely.
+fn validateDocumentInsertion(parent: *Node, node: *const Node, replaced_child: ?*const Node) !void {
+    if (parent._type != .document) {
+        return;
+    }
+    switch (node._type) {
+        .cdata => |cd| {
+            if (cd._type == .text or cd._type == .cdata_section) {
+                // A Text node (CDATASection included) cannot be a child of a
+                // document.
+                return error.HierarchyError;
+            }
+        },
+        .element => {
+            var it = parent.childrenIterator();
+            while (it.next()) |existing| {
+                if (existing._type == .element and existing != node and existing != replaced_child) {
+                    // A document can have at most one element child.
+                    return error.HierarchyError;
+                }
+            }
+        },
+        .document_type => {
+            var it = parent.childrenIterator();
+            while (it.next()) |existing| {
+                if (existing._type == .document_type and existing != node and existing != replaced_child) {
+                    // A document can have at most one doctype child.
+                    return error.HierarchyError;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 pub fn appendChild(self: *Node, child: *Node, frame: *Frame) !*Node {
     if (child.is(DocumentFragment)) |_| {
         try frame.appendAllChildren(child, self);
@@ -227,6 +273,7 @@ pub fn appendChild(self: *Node, child: *Node, frame: *Frame) !*Node {
     }
 
     try validateNodeInsertion(self, child);
+    try validateDocumentInsertion(self, child, null);
 
     frame.domChanged();
 
@@ -558,6 +605,13 @@ pub fn ownerDocument(self: *const Node, frame: *const Frame) ?*Document {
     return frame.document;
 }
 
+fn ownerDocumentIncludingSelf(self: *const Node, frame: *const Frame) ?*Document {
+    if (self._type == .document) {
+        return self._type.document;
+    }
+    return self.ownerDocument(frame);
+}
+
 // Returns the Frame that owns this node's tree. Used to tie cached state of
 // "live" collections (NodeList, HTMLCollection, etc.) to the right frame's DOM
 // version: cross-realm callers must invalidate based on mutations through the
@@ -566,10 +620,7 @@ pub fn ownerDocument(self: *const Node, frame: *const Frame) ?*Document {
 // Falls back to `default` when the node has no associated document yet (e.g.,
 // freshly created and detached) or its document has no frame.
 pub fn ownerFrame(self: *const Node, default: *Frame) *Frame {
-    if (self._type == .document) {
-        return self._type.document._frame orelse default;
-    }
-    const doc = self.ownerDocument(default) orelse return default;
+    const doc = self.ownerDocumentIncludingSelf(default) orelse return default;
     return doc._frame orelse default;
 }
 
@@ -582,7 +633,9 @@ pub const ResolveURLOpts = struct {
 pub fn resolveURL(self: *const Node, url: anytype, frame: *Frame, opts: ResolveURLOpts) ![:0]const u8 {
     const owner_frame = self.ownerFrame(frame);
     const allocator = opts.allocator orelse frame.call_arena;
-    return URL.resolve(allocator, owner_frame.base(), url, .{ .encoding = owner_frame.charset });
+    const doc: ?*const Document = self.ownerDocumentIncludingSelf(frame);
+    const encoding = if (doc) |d| d.getCharset() else owner_frame.charset;
+    return URL.resolve(allocator, owner_frame.base(), url, .{ .encoding = encoding });
 }
 
 // Same as `resolveURL` but can't return `TypeError`, this is needed for multiple
@@ -596,8 +649,8 @@ pub fn resolveURLReflect(self: *const Node, url: []const u8, frame: *Frame, opts
 
 pub fn isSameDocumentAs(self: *const Node, other: *const Node, frame: *const Frame) bool {
     // Get the root document for each node
-    const self_doc = if (self._type == .document) self._type.document else self.ownerDocument(frame);
-    const other_doc = if (other._type == .document) other._type.document else other.ownerDocument(frame);
+    const self_doc = self.ownerDocumentIncludingSelf(frame);
+    const other_doc = other.ownerDocumentIncludingSelf(frame);
     return self_doc == other_doc;
 }
 
@@ -622,6 +675,12 @@ pub fn removeChild(self: *Node, child: *Node, frame: *Frame) !*Node {
 }
 
 pub fn insertBefore(self: *Node, new_node: *Node, ref_node_: ?*Node, frame: *Frame) !*Node {
+    return self.insertBeforeReplacing(new_node, ref_node_, null, frame);
+}
+
+// `replacing` is the child replaceChild is about to remove; it doesn't count
+// against the document single-element rule.
+fn insertBeforeReplacing(self: *Node, new_node: *Node, ref_node_: ?*Node, replacing: ?*const Node, frame: *Frame) !*Node {
     const ref_node = ref_node_ orelse {
         return self.appendChild(new_node, frame);
     };
@@ -651,6 +710,7 @@ pub fn insertBefore(self: *Node, new_node: *Node, ref_node_: ?*Node, frame: *Fra
     }
 
     try validateNodeInsertion(self, new_node);
+    try validateDocumentInsertion(self, new_node, replacing);
 
     const child_already_connected = new_node.isConnected();
 
@@ -689,8 +749,9 @@ pub fn replaceChild(self: *Node, new_child: *Node, old_child: *Node, frame: *Fra
     }
 
     try validateNodeInsertion(self, new_child);
+    try validateDocumentInsertion(self, new_child, old_child);
 
-    _ = try self.insertBefore(new_child, old_child, frame);
+    _ = try self.insertBeforeReplacing(new_child, old_child, old_child, frame);
 
     // Special case: if we replace a node by itself, insertBefore was a noop.
     if (new_child != old_child) {
@@ -854,7 +915,8 @@ pub fn getChildrenCount(self: *Node) usize {
 pub fn getLength(self: *Node) u32 {
     switch (self._type) {
         .cdata => |cdata| {
-            return @intCast(cdata.getData().len);
+            // The node length of CharacterData is in UTF-16 code units.
+            return @intCast(cdata.getLength());
         },
         .element, .document, .document_fragment => {
             var count: u32 = 0;
@@ -1116,11 +1178,11 @@ fn _normalize(self: *Node, allocator: Allocator, buffer: *std.ArrayList(u8), fra
 
         if (next_node) |next| {
             if (next.is(CData.Text)) |_| {
-                try buffer.appendSlice(allocator, text_node.getWholeText());
+                try buffer.appendSlice(allocator, text_node.ownData());
 
                 while (next_node) |node_to_merge| {
                     const next_text_node = node_to_merge.is(CData.Text) orelse break;
-                    try buffer.appendSlice(allocator, next_text_node.getWholeText());
+                    try buffer.appendSlice(allocator, next_text_node.ownData());
 
                     const to_remove = node_to_merge;
                     next_node = node_to_merge.nextSibling();
@@ -1223,11 +1285,11 @@ pub fn replaceChildren(self: *Node, nodes: []const NodeOrText, frame: *Frame) !v
 
     frame.domChanged();
 
-    // Remove all existing children
-    var it = self.childrenIterator();
-    while (it.next()) |child| {
-        frame.removeNode(self, child, .{ .will_be_reconnected = false });
-    }
+    // Per the "replace all" algorithm, observers get one combined mutation
+    // record with all removed and added nodes, so per-node notification is
+    // suppressed here.
+    const notify = Frame.observers.hasMutationObservers(frame);
+    const removed = try self.removeAllChildrenCollecting(notify, frame);
 
     // Append new children
     const parent_is_connected = self.isConnected();
@@ -1237,26 +1299,56 @@ pub fn replaceChildren(self: *Node, nodes: []const NodeOrText, frame: *Frame) !v
             child_connected = child.isConnected();
             frame.removeNode(previous_parent, child, .{ .will_be_reconnected = parent_is_connected });
         }
-        try frame.appendNode(self, child, .{ .child_already_connected = child_connected });
+        try frame.appendNode(self, child, .{ .child_already_connected = child_connected, .notify_observers = false });
     }
+
+    if (notify and (removed.items.len > 0 or children_to_add.items.len > 0)) {
+        Frame.observers.notifyChildListChange(frame, self, children_to_add.items, removed.items, null, null);
+    }
+}
+
+// Removes every child with per-node notification suppressed, returning the
+// removed nodes when `notify` is set so the caller can queue one combined
+// "replace all" mutation record.
+fn removeAllChildrenCollecting(self: *Node, notify: bool, frame: *Frame) !std.ArrayList(*Node) {
+    var removed: std.ArrayList(*Node) = .empty;
+    var it = self.childrenIterator();
+    while (it.next()) |child| {
+        if (notify) {
+            try removed.append(frame.call_arena, child);
+        }
+        frame.removeNode(self, child, .{ .will_be_reconnected = false, .notify_observers = false });
+    }
+    return removed;
 }
 
 /// Shared implementation in Element and DocumentFragment
 pub fn setHTML(self: *Node, html: []const u8, allow_declarative_shadow: bool, frame: *Frame) !void {
     frame.domChanged();
-    var it = self.childrenIterator();
-    while (it.next()) |child| {
-        frame.removeNode(self, child, .{ .will_be_reconnected = false });
+
+    // Observers of this subtree get one combined "replace all" mutation
+    // record; per-node notification is suppressed for the removals here and
+    // for the parser insertions (fragment parsing never notifies).
+    const notify = Frame.observers.hasMutationObservers(frame);
+    const removed = try self.removeAllChildrenCollecting(notify, frame);
+
+    if (html.len > 0) {
+        if (allow_declarative_shadow) {
+            try frame.parseHtmlUnsafeAsChildren(self, html);
+        } else {
+            try frame.parseHtmlAsChildren(self, html);
+        }
     }
 
-    if (html.len == 0) {
-        return;
-    }
-
-    if (allow_declarative_shadow) {
-        try frame.parseHtmlUnsafeAsChildren(self, html);
-    } else {
-        try frame.parseHtmlAsChildren(self, html);
+    if (notify) {
+        var added: std.ArrayList(*Node) = .empty;
+        var child_it = self.childrenIterator();
+        while (child_it.next()) |child| {
+            try added.append(frame.local_arena, child);
+        }
+        if (removed.items.len > 0 or added.items.len > 0) {
+            Frame.observers.notifyChildListChange(frame, self, added.items, removed.items, null, null);
+        }
     }
 }
 
@@ -1373,11 +1465,7 @@ pub const JsApi = struct {
 
     pub const baseURI = bridge.accessor(_baseURI, null, .{});
     fn _baseURI(self: *Node, frame: *const Frame) []const u8 {
-        const doc = if (self._type == .document)
-            self._type.document
-        else
-            self.ownerDocument(frame) orelse return frame.base();
-
+        const doc = self.ownerDocumentIncludingSelf(frame) orelse return frame.base();
         if (doc._frame) |doc_frame| {
             return doc_frame.base();
         }

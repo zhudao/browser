@@ -17,7 +17,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../js/js.zig");
+const Page = @import("../../Page.zig");
 const Frame = @import("../../Frame.zig");
 const Element = @import("../Element.zig");
 const TreeWalker = @import("../TreeWalker.zig");
@@ -32,6 +35,7 @@ const Mode = enum {
     all_elements,
     child_elements,
     child_tag,
+    cells,
     selected_options,
     links,
     anchors,
@@ -49,12 +53,26 @@ _data: union(Mode) {
     all_elements: NodeLive(.all_elements),
     child_elements: NodeLive(.child_elements),
     child_tag: NodeLive(.child_tag),
+    cells: NodeLive(.cells),
     selected_options: NodeLive(.selected_options),
     links: NodeLive(.links),
     anchors: NodeLive(.anchors),
     form: NodeLive(.form),
     empty: void,
 },
+_rc: lp.RC(u32) = .{},
+
+pub fn deinit(self: *HTMLCollection, page: *Page) void {
+    page.factory.destroy(self);
+}
+
+pub fn releaseRef(self: *HTMLCollection, page: *Page) void {
+    self._rc.release(self, page);
+}
+
+pub fn acquireRef(self: *HTMLCollection) void {
+    self._rc.acquire();
+}
 
 pub fn length(self: *HTMLCollection, frame: *const Frame) u32 {
     return switch (self._data) {
@@ -92,6 +110,7 @@ pub fn iterator(self: *HTMLCollection, exec: *const Execution) !*Iterator {
             .all_elements => |*impl| .{ .all_elements = impl._tw.clone() },
             .child_elements => |*impl| .{ .child_elements = impl._tw.clone() },
             .child_tag => |*impl| .{ .child_tag = impl._tw.clone() },
+            .cells => |*impl| .{ .cells = impl._tw.clone() },
             .selected_options => |*impl| .{ .selected_options = impl._tw.clone() },
             .links => |*impl| .{ .links = impl._tw.clone() },
             .anchors => |*impl| .{ .anchors = impl._tw.clone() },
@@ -112,12 +131,21 @@ pub const Iterator = GenericIterator(struct {
         all_elements: TreeWalker.FullExcludeSelf,
         child_elements: TreeWalker.Children,
         child_tag: TreeWalker.Children,
+        cells: TreeWalker.Children,
         selected_options: TreeWalker.Children,
         links: TreeWalker.FullExcludeSelf,
         anchors: TreeWalker.FullExcludeSelf,
         form: TreeWalker.FullExcludeSelf,
         empty: void,
     },
+
+    pub fn acquireRef(self: *@This()) void {
+        self.list.acquireRef();
+    }
+
+    pub fn releaseRef(self: *@This(), page: *Page) void {
+        self.list.releaseRef(page);
+    }
 
     pub fn next(self: *@This(), _: *const Execution) ?*Element {
         return switch (self.list._data) {
@@ -128,6 +156,7 @@ pub const Iterator = GenericIterator(struct {
             .all_elements => |*impl| impl.nextTw(&self.tw.all_elements),
             .child_elements => |*impl| impl.nextTw(&self.tw.child_elements),
             .child_tag => |*impl| impl.nextTw(&self.tw.child_tag),
+            .cells => |*impl| impl.nextTw(&self.tw.cells),
             .selected_options => |*impl| impl.nextTw(&self.tw.selected_options),
             .links => |*impl| impl.nextTw(&self.tw.links),
             .anchors => |*impl| impl.nextTw(&self.tw.anchors),
@@ -156,7 +185,17 @@ pub const JsApi = struct {
 
             return self.getByName(name, frame) orelse error.NotHandled;
         }
-    }.wrap, null, deleteByName, getNames, null, defineByName, describeByName, .{ .null_as_undefined = true });
+    }.wrap, null, deleteByName, getNames, queryByName, defineByName, describeByName, .{ .null_as_undefined = true });
+
+    // Named properties are [LegacyUnenumerableNamedProperties]: the query
+    // reports them non-enumerable, so for-in skips them while
+    // Object.getOwnPropertyNames still lists them via the enumerator.
+    fn queryByName(self: *HTMLCollection, name: []const u8, frame: *Frame) !u32 {
+        if (name.len > 0 and self.getByName(name, frame) != null) {
+            return js.v8.DontEnum;
+        }
+        return error.NotHandled;
+    }
 
     // HTMLCollection has no indexed setter: per Web IDL, assigning to or
     // defining any array index property fails (TypeError in strict mode).

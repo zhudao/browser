@@ -134,6 +134,7 @@ _element_computed_styles: Element.StyleLookup = .empty,
 _element_datasets: Element.DatasetLookup = .empty,
 _element_class_lists: Element.ClassListLookup = .empty,
 _element_rel_lists: Element.RelListLookup = .empty,
+_element_token_lists: Element.TokenListLookup = .empty,
 _element_shadow_roots: Element.ShadowRootLookup = .empty,
 _node_owner_documents: Node.OwnerDocumentLookup = .empty,
 _element_scroll_positions: Element.ScrollPositionLookup = .empty,
@@ -669,8 +670,11 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
             };
             const parse_arena = try self.getArena(.medium, "Frame.parseBlob");
             defer self.releaseArena(parse_arena);
+            // A script executed mid-parse can revoke the blob URL, letting GC
+            // free the buffer under the parser; parse a copy.
+            const html = try parse_arena.dupe(u8, blob._slice);
             var parser = Parser.init(parse_arena, self.document.asNode(), self, .{ .allow_declarative_shadow = true });
-            parser.parse(blob._slice);
+            parser.parse(html);
         } else {
             self.document.injectBlank(self) catch |err| {
                 log.err(.browser, "inject blank", .{ .err = err });
@@ -2371,6 +2375,8 @@ pub fn dupeSSO(self: *Frame, value: []const u8) !String {
 
 const RemoveNodeOpts = struct {
     will_be_reconnected: bool,
+    // Set to false when the caller queues its own combined mutation record
+    notify_observers: bool = true,
 };
 pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpts) void {
     // Capture siblings before removing
@@ -2405,7 +2411,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 
     slotting.removalSteps(parent, child, self);
 
-    if (observers.hasMutationObservers(self)) {
+    if (opts.notify_observers and observers.hasMutationObservers(self)) {
         const removed = [_]*Node{child};
         observers.notifyChildListChange(self, parent, &.{}, &removed, previous_sibling, next_sibling);
     }
@@ -2504,6 +2510,8 @@ const InsertNodeRelative = union(enum) {
 const InsertNodeOpts = struct {
     child_already_connected: bool = false,
     adopting_to_new_document: bool = false,
+    // Set to false when the caller queues its own combined mutation record
+    notify_observers: bool = true,
 };
 pub fn insertNodeRelative(self: *Frame, parent: *Node, child: *Node, relative: InsertNodeRelative, opts: InsertNodeOpts) !void {
     return self._insertNodeRelative(false, parent, child, relative, opts);
@@ -2559,14 +2567,13 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         }
     }
 
-    // The parser path does its own (limited) notification and connected-callback
-    // work, then returns.
+    // The parser path does its own (limited) connected-callback work, then
+    // returns.
     if (comptime from_parser) {
-        // Of the parser insertions, only fragment parses (innerHTML) mutate a
-        // live tree; the initial document parse suppresses notifications.
-        if (self._parse_mode == .fragment) {
-            self.notifyChildInserted(parent, child);
-        }
+        // No mutation records from parser insertions: the initial document
+        // parse never notifies, and fragment parses (innerHTML et al.) queue
+        // one combined "replace all" record at the call site (Node.setHTML)
+        // instead of one per inserted child.
 
         if (child.is(Element)) |el| {
             // Invoke connectedCallback for custom elements during parsing.
@@ -2597,7 +2604,9 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         }
     }
 
-    self.notifyChildInserted(parent, child);
+    if (opts.notify_observers) {
+        self.notifyChildInserted(parent, child);
+    }
 
     if (opts.child_already_connected and !opts.adopting_to_new_document) {
         // The child is already connected in the same document, we don't have to reconnect it.
@@ -2820,21 +2829,11 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: F
     }
     node._children = first._children;
 
-    if (observers.hasMutationObservers(self)) {
-        var it = node.childrenIterator();
-        while (it.next()) |child| {
-            child._parent = node;
-            // Notify mutation observers for each unwrapped child
-            const previous_sibling = child.previousSibling();
-            const next_sibling = child.nextSibling();
-            const added = [_]*Node{child};
-            observers.notifyChildListChange(self, node, &added, &.{}, previous_sibling, next_sibling);
-        }
-    } else {
-        var it = node.childrenIterator();
-        while (it.next()) |child| {
-            child._parent = node;
-        }
+    // No mutation records for the unwrapped children either; see the comment
+    // about fragment parses in _insertNodeRelative.
+    var it = node.childrenIterator();
+    while (it.next()) |child| {
+        child._parent = node;
     }
 }
 
@@ -3150,6 +3149,11 @@ const SubmitFormOpts = struct {
 };
 pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.Form, submit_opts: SubmitFormOpts) !void {
     const form = form_ orelse return;
+
+    if (submit_opts.fire_event and form.asNode().isConnected() == false) {
+        // interactive submission (e.g. submit button) noop if the form is disconnected
+        return;
+    }
 
     // see the `_constructing_entry_list` field documentation
     if (form._constructing_entry_list) {

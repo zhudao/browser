@@ -69,6 +69,10 @@ pub fn dispatchEvent(self: *EventTarget, event: *Event, exec: *js.Execution) !bo
     if (event._event_phase != .none) {
         return error.InvalidStateError;
     }
+
+    if (!event._initialized) {
+        return error.InvalidStateError;
+    }
     event._is_trusted = false;
 
     switch (exec.js.global) {
@@ -89,28 +93,61 @@ const AddEventListenerOptions = union(enum) {
     // The signal is kept as a raw js.Value so that an explicit null (or any
     // non-AbortSignal value) can be told apart from an absent or undefined
     // member, and rejected with a TypeError per the dictionary conversion.
+    // passive is optional so that an absent (or undefined) member falls back
+    // to the type- and target-dependent default passive value.
     const Options = struct {
         once: bool = false,
         capture: bool = false,
-        passive: bool = false,
+        passive: ?bool = null,
         signal: ?js.Value = null,
     };
 };
+
+// The DOM spec's "default passive value": listeners for the scroll-blocking
+// event types are passive by default on the window, the document, and the
+// html and body elements.
+fn defaultPassiveValue(self: *EventTarget, typ: []const u8) bool {
+    const scroll_blocking_event_types = std.StaticStringMap(void).initComptime(.{
+        .{ "touchstart", {} },
+        .{ "touchmove", {} },
+        .{ "wheel", {} },
+        .{ "mousewheel", {} },
+    });
+    if (scroll_blocking_event_types.has(typ) == false) {
+        return false;
+    }
+
+    switch (self._type) {
+        .window => return true,
+        .node => |n| {
+            const Element = @import("Element.zig");
+            if (n._type == .document) {
+                return true;
+            }
+            const element = n.is(Element) orelse return false;
+            return switch (element.getTag()) {
+                .html, .body => true,
+                else => false,
+            };
+        },
+        else => return false,
+    }
+}
 
 pub const EventListenerCallback = union(enum) {
     function: js.Function,
     object: js.Object,
 };
-pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?AddEventListenerOptions, exec: *js.Execution) !void {
+pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nullable(EventListenerCallback), opts_: ?AddEventListenerOptions, exec: *js.Execution) !void {
     // Convert the options before the null-callback early return: per spec,
     // the dictionary conversion throws even when the callback is null.
     const options = blk: {
-        const o = opts_ orelse break :blk RegisterOptions{};
+        const o = opts_ orelse break :blk RegisterOptions{ .passive = self.defaultPassiveValue(typ) };
         break :blk switch (o) {
             .options => |opts| RegisterOptions{
                 .once = opts.once,
                 .capture = opts.capture,
-                .passive = opts.passive,
+                .passive = opts.passive orelse self.defaultPassiveValue(typ),
                 .signal = signal: {
                     const signal = opts.signal orelse break :signal null;
                     if (signal.isUndefined()) {
@@ -119,11 +156,11 @@ pub fn addEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventLi
                     break :signal try signal.toZig(*AbortSignal);
                 },
             },
-            .capture => |capture| RegisterOptions{ .capture = capture },
+            .capture => |capture| RegisterOptions{ .capture = capture, .passive = self.defaultPassiveValue(typ) },
         };
     };
 
-    const callback = callback_ orelse return;
+    const callback = callback_.value orelse return;
 
     const em_callback: EventManager.Callback = switch (callback) {
         .object => |obj| .{ .object = obj },
@@ -143,8 +180,8 @@ const RemoveEventListenerOptions = union(enum) {
         capture: bool = false,
     };
 };
-pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: ?EventListenerCallback, opts_: ?RemoveEventListenerOptions, exec: *js.Execution) !void {
-    const callback = callback_ orelse return;
+pub fn removeEventListener(self: *EventTarget, typ: []const u8, callback_: js.Nullable(EventListenerCallback), opts_: ?RemoveEventListenerOptions, exec: *js.Execution) !void {
+    const callback = callback_.value orelse return;
 
     // For object callbacks, check if handleEvent exists
     if (callback == .object) {
