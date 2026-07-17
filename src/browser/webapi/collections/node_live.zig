@@ -46,6 +46,13 @@ const Mode = enum {
     form,
 };
 
+pub const ClassNameFilter = struct {
+    names: [][]const u8,
+    // getElementsByClassName matches class names ASCII case-insensitively
+    // when the document is in quirks mode.
+    case_insensitive: bool = false,
+};
+
 pub const TagNameNsFilter = struct {
     namespace: ?Element.Namespace, // null means wildcard "*"
     local_name: String,
@@ -55,7 +62,7 @@ const Filters = union(Mode) {
     tag: Element.Tag,
     tag_name: String,
     tag_name_ns: TagNameNsFilter,
-    class_name: [][]const u8,
+    class_name: ClassNameFilter,
     name: []const u8,
     all_elements,
     child_elements,
@@ -261,14 +268,14 @@ pub fn NodeLive(comptime mode: Mode) type {
                     return self._filter.local_name.eqlSlice(el.getLocalName());
                 },
                 .class_name => {
-                    if (self._filter.len == 0) {
+                    if (self._filter.names.len == 0) {
                         return false;
                     }
 
                     const el = node.is(Element) orelse return false;
                     const class_attr = el.getAttributeSafe(comptime .wrap("class")) orelse return false;
-                    for (self._filter) |class_name| {
-                        if (!Selector.classAttributeContains(class_attr, class_name)) {
+                    for (self._filter.names) |class_name| {
+                        if (!Selector.classAttributeContainsCase(class_attr, class_name, self._filter.case_insensitive)) {
                             return false;
                         }
                     }
@@ -276,6 +283,8 @@ pub fn NodeLive(comptime mode: Mode) type {
                 },
                 .name => {
                     const el = node.is(Element) orelse return false;
+                    // getElementsByName only considers HTML elements.
+                    if (el._namespace != .html) return false;
                     const name_attr = el.getAttributeSafe(comptime .wrap("name")) orelse return false;
                     return std.mem.eql(u8, name_attr, self._filter);
                 },
@@ -288,8 +297,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                 .cells => {
                     // HTMLTableRowElement.cells: td and th children.
                     const el = node.is(Element) orelse return false;
-                    const tag = el.getTag();
-                    return tag == .td or tag == .th;
+                    return el.is(Element.Html.TableCell) != null;
                 },
                 .selected_options => {
                     const el = node.is(Element) orelse return false;

@@ -183,28 +183,25 @@ pub fn matchesUncached(arena: Allocator, el: *Node.Element, input: []const u8, f
 }
 
 pub fn classAttributeContains(class_attr: []const u8, class_name: []const u8) bool {
-    if (class_name.len == 0 or class_name.len > class_attr.len) return false;
-
-    var search = class_attr;
-    while (std.mem.indexOf(u8, search, class_name)) |pos| {
-        const is_start = pos == 0 or isClassWhitespace(search[pos - 1]);
-        const end = pos + class_name.len;
-        const is_end = end == search.len or isClassWhitespace(search[end]);
-
-        if (is_start and is_end) return true;
-
-        search = search[pos + 1 ..];
-    }
-    return false;
+    return classAttributeContainsCase(class_attr, class_name, false);
 }
 
-// The class attribute tokens are separated by ASCII whitespace (which,
-// unlike std.ascii.isWhitespace, does not include vertical tab).
-fn isClassWhitespace(c: u8) bool {
-    return switch (c) {
-        '\t', '\n', 0x0C, '\r', ' ' => true,
-        else => false,
-    };
+pub fn classAttributeContainsCase(class_attr: []const u8, class_name: []const u8, case_insensitive: bool) bool {
+    if (class_name.len == 0) {
+        return false;
+    }
+
+    var it = std.mem.tokenizeAny(u8, class_attr, &[_]u8{ '\t', '\n', 0x0C, '\r', ' ' });
+    while (it.next()) |token| {
+        if (case_insensitive) {
+            if (std.ascii.eqlIgnoreCase(token, class_name)) {
+                return true;
+            }
+        } else if (std.mem.eql(u8, token, class_name)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 pub const Part = union(enum) {
@@ -218,7 +215,11 @@ pub const Part = union(enum) {
 };
 
 pub const Attribute = struct {
+    // Lowercased for the HTML-element case-insensitive match.
     name: String,
+    // As written in the selector: attribute names match case-sensitively on
+    // foreign (SVG/MathML) elements, whose attributes are stored unnormalized.
+    original_name: String,
     matcher: AttributeMatcher,
     case_insensitive: bool,
 };

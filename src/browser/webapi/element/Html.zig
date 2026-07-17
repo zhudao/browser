@@ -243,6 +243,11 @@ pub fn setInnerText(self: *HtmlElement, text: []const u8, frame: *Frame) !void {
 
 pub fn setOuterText(self: *HtmlElement, text: []const u8, frame: *Frame) !void {
     const el = self.asElement();
+    // outerText is an HTMLElement property. MathML elements currently share
+    // the HTML wrapper types, so keep the assignment inert for them.
+    if (el._namespace != .html) {
+        return;
+    }
     const node = el.asNode();
     const parent = node.parentNode() orelse return error.NoModificationAllowed;
 
@@ -343,6 +348,39 @@ pub fn setHidden(self: *HtmlElement, hidden: bool, frame: *Frame) !void {
     } else {
         try self.asElement().removeAttribute(comptime .wrap("hidden"), frame);
     }
+}
+
+// The translate IDL attribute reflects the element's translation mode:
+// translate="yes"/"" enables it, "no" disables it, anything else (or no
+// attribute) inherits from the parent, defaulting to enabled.
+pub fn getTranslate(self: *HtmlElement) bool {
+    var node: ?*Node = self.asElement().asNode();
+    while (node) |n| : (node = n.parentNode()) {
+        const el = n.is(Element) orelse continue;
+        const value = el.getAttributeSafe(comptime .wrap("translate")) orelse continue;
+        if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "yes")) {
+            return true;
+        }
+        if (std.ascii.eqlIgnoreCase(value, "no")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn setTranslate(self: *HtmlElement, translate: bool, frame: *Frame) !void {
+    try self.asElement().setAttributeSafe(comptime .wrap("translate"), .wrap(if (translate) "yes" else "no"), frame);
+}
+
+// accessKeyLabel: the UA-assigned shortcut for a valid (single character)
+// accesskey, or the empty string. We report an Alt+ chord like Chromium.
+pub fn getAccessKeyLabel(self: *HtmlElement, frame: *Frame) ![]const u8 {
+    const value = self.asElement().getAttributeSafe(comptime .wrap("accesskey")) orelse return "";
+    const codepoints = std.unicode.utf8CountCodepoints(value) catch return "";
+    if (codepoints != 1) {
+        return "";
+    }
+    return std.fmt.allocPrint(frame.call_arena, "Alt+{s}", .{value});
 }
 
 pub fn getPopover(self: *HtmlElement) ?[]const u8 {
@@ -1707,6 +1745,8 @@ pub const JsApi = struct {
     pub const autofocus = bridge.accessor(HtmlElement.getAutofocus, HtmlElement.setAutofocus, .{ .ce_reactions = true });
     pub const dir = bridge.accessor(HtmlElement.getDir, HtmlElement.setDir, .{ .ce_reactions = true });
     pub const hidden = bridge.accessor(HtmlElement.getHidden, HtmlElement.setHidden, .{ .ce_reactions = true });
+    pub const translate = bridge.accessor(HtmlElement.getTranslate, HtmlElement.setTranslate, .{ .ce_reactions = true });
+    pub const accessKeyLabel = bridge.accessor(HtmlElement.getAccessKeyLabel, null, .{});
     pub const popover = bridge.accessor(HtmlElement.getPopover, HtmlElement.setPopover, .{ .ce_reactions = true });
     pub const showPopover = bridge.function(HtmlElement.showPopover, .{});
     pub const hidePopover = bridge.function(HtmlElement.hidePopover, .{});

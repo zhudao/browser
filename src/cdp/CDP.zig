@@ -50,6 +50,7 @@ pub const URL_BASE = "chrome://newtab/";
 const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const SessionIdGen = Incrementing(u32, "SID");
+const BrowserSessionIdGen = Incrementing(u32, "BSID");
 const BrowserContextIdGen = Incrementing(u32, "BID");
 // webmcp tool invocation
 pub const InvocationIdGen = Incrementing(u32, "INV");
@@ -72,7 +73,13 @@ link: Network.CdpLink,
 target_auto_attach: bool = false,
 
 session_id_gen: SessionIdGen = .{},
+browser_session_id_gen: BrowserSessionIdGen = .{},
 browser_context_id_gen: BrowserContextIdGen = .{},
+
+// Session from Target.attachToBrowserTarget. Distinct from the page
+// session (BrowserContext.session_id) as it targets the browser itself and
+// outlives any browser context.
+browser_session_id: ?[]const u8 = null,
 
 browser_context: ?BrowserContext,
 
@@ -246,6 +253,11 @@ pub fn tick(self: *CDP) !bool {
     // so the flag can't be a stale leftover here. Exit.
     if (self.browser.env.terminatePending()) {
         log.warn(.cdp, "closing connection", .{ .reason = "pending terminate" });
+        // The worker thread is the sole writer of this socket, so sending the
+        // close frame here can't interleave with another write.
+        self.conn.send(&WS.CLOSE_GOING_AWAY) catch |err| {
+            log.warn(.app, "CDP terminate close", .{ .err = err });
+        };
         return false;
     }
 
@@ -429,6 +441,11 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
 }
 
 fn isValidSessionId(self: *const CDP, input_session_id: []const u8) bool {
+    if (self.browser_session_id) |browser_session_id| {
+        if (std.mem.eql(u8, browser_session_id, input_session_id)) {
+            return true;
+        }
+    }
     const browser_context = &(self.browser_context orelse return false);
     const session_id = browser_context.session_id orelse return false;
     return std.mem.eql(u8, session_id, input_session_id);
@@ -629,6 +646,7 @@ pub const BrowserContext = struct {
         try notification.register(.frame_created, self, onFrameCreated);
         try notification.register(.frame_navigate, self, onFrameNavigate);
         try notification.register(.frame_navigated, self, onFrameNavigated);
+        try notification.register(.frame_navigated_within_document, self, onFrameNavigatedWithinDocument);
         try notification.register(.frame_navigate_failed, self, onFrameNavigateFailed);
         try notification.register(.frame_child_frame_created, self, onFrameChildFrameCreated);
         try notification.register(.frame_dom_content_loaded, self, onFrameDOMContentLoaded);
@@ -920,6 +938,11 @@ pub const BrowserContext = struct {
     pub fn onFrameNavigateFailed(ctx: *anyopaque, msg: *const Notification.FrameNavigateFailed) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         return @import("domains/page.zig").frameNavigateFailed(self, msg);
+    }
+
+    pub fn onFrameNavigatedWithinDocument(ctx: *anyopaque, msg: *const Notification.FrameNavigatedWithinDocument) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        return @import("domains/page.zig").frameNavigatedWithinDocument(self, msg);
     }
 
     pub fn onFrameChildFrameCreated(ctx: *anyopaque, msg: *const Notification.FrameChildFrameCreated) !void {
@@ -1433,6 +1456,25 @@ test "cdp: disconnect latches so the worker keeps exiting" {
     // would never exit and Server.deinit() would spin on active_threads
     // (#2510). The latch keeps the terminal state sticky so the worker exits.
     try testing.expectError(error.ClientDisconnected, client.tick(0));
+}
+
+test "cdp: tick sends a close frame on pending terminate" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const cdp = ctx.cdp();
+    cdp.browser.env.requestTerminate();
+    // Clear the pending terminate so deinit's V8 calls don't trip over the
+    // terminating-state asserts.
+    defer cdp.browser.env.cancelTerminate();
+
+    try testing.expectEqual(false, try cdp.tick());
+
+    // The client should receive a close frame (code 1001, going away), not
+    // just an abrupt socket close.
+    var buf: [WS.CLOSE_GOING_AWAY.len]u8 = undefined;
+    const n = try posix.read(ctx.socket, &buf);
+    try testing.expectEqualSlices(u8, &WS.CLOSE_GOING_AWAY, buf[0..n]);
 }
 
 test "cdp: syncRequest short-circuits after disconnect" {

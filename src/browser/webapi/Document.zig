@@ -162,6 +162,54 @@ pub fn setLocation(self: *Document, url: [:0]const u8) !void {
     return frame.scheduleNavigation(url, .{ .reason = .script, .kind = .{ .push = null } }, .{ .script = frame });
 }
 
+// Approximation of quirks mode: an HTML document without a doctype is in quirks mode.
+pub fn isQuirksMode(self: *const Document) bool {
+    if (self._type != .html) {
+        return false;
+    }
+    var it = self._proto.childrenIterator();
+    while (it.next()) |child| {
+        if (child._type == .document_type) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn getCompatMode(self: *const Document) []const u8 {
+    return if (self.isQuirksMode()) "BackCompat" else "CSS1Compat";
+}
+
+// document.lastModified: the response's Last-Modified header in local time,
+// "MM/DD/YYYY hh:mm:ss", defaulting to the current time.
+pub fn getLastModified(self: *const Document, frame: *Frame) ![]const u8 {
+    const dt = @import("../../datetime.zig");
+
+    const timestamp = blk: {
+        if (self._frame) |owner| {
+            for (owner._http_headers.items) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "last-modified")) {
+                    if (dt.DateTime.parse(header.value, .rfc822)) |parsed| {
+                        break :blk parsed.unix(.seconds);
+                    } else |_| {}
+                    break;
+                }
+            }
+        }
+        break :blk std.time.timestamp();
+    };
+
+    const tm = try dt.localTime(timestamp);
+    return std.fmt.allocPrint(frame.local_arena, "{d:0>2}/{d:0>2}/{d} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u32, @intCast(tm.tm_mon + 1)),
+        @as(u32, @intCast(tm.tm_mday)),
+        tm.tm_year + 1900,
+        @as(u32, @intCast(tm.tm_hour)),
+        @as(u32, @intCast(tm.tm_min)),
+        @as(u32, @intCast(tm.tm_sec)),
+    });
+}
+
 pub fn getCharset(self: *const Document) []const u8 {
     if (self._charset) |charset| {
         return charset;
@@ -224,7 +272,18 @@ pub fn setDomain(self: *Document, value: []const u8) !void {
     try doc_frame.js.setOrigin(key);
 }
 
-pub fn getCookie(_: *Document, frame: *Frame) ![]const u8 {
+// A cookie-averse document (no browsing context: createHTMLDocument,
+// DOMParser, XHR documents) reads cookies as the empty string and ignores
+// writes.
+fn isCookieAverse(self: *const Document, frame: *const Frame) bool {
+    const doc_frame = self._frame orelse return true;
+    return doc_frame.document != self and frame.document != self;
+}
+
+pub fn getCookie(self: *Document, frame: *Frame) ![]const u8 {
+    if (self.isCookieAverse(frame)) {
+        return "";
+    }
     var buf: std.ArrayList(u8) = .empty;
     try frame._session.cookie_jar.forRequest(frame.url, buf.writer(frame.local_arena), .{
         .is_http = false,
@@ -233,7 +292,10 @@ pub fn getCookie(_: *Document, frame: *Frame) ![]const u8 {
     return buf.items;
 }
 
-pub fn setCookie(_: *Document, cookie_str: []const u8, frame: *Frame) ![]const u8 {
+pub fn setCookie(self: *Document, cookie_str: []const u8, frame: *Frame) ![]const u8 {
+    if (self.isCookieAverse(frame)) {
+        return cookie_str;
+    }
     // we use the cookie jar's allocator to parse the cookie because it
     // outlives the frame's arena.
     const Cookie = @import("storage/Cookie.zig");
@@ -490,8 +552,8 @@ pub fn createProcessingInstruction(self: *Document, target: []const u8, data: []
 }
 
 const Range = @import("Range.zig");
-pub fn createRange(_: *const Document, frame: *Frame) !*Range {
-    return Range.init(frame);
+pub fn createRange(self: *Document, frame: *Frame) !*Range {
+    return Range.initIn(self.asNode(), frame);
 }
 
 pub fn createEvent(_: *const Document, event_type: []const u8, frame: *Frame) !*@import("Event.zig") {
@@ -799,6 +861,17 @@ pub fn moveBefore(self: *Document, node: js.Value, child: js.Value, frame: *Fram
 }
 
 pub fn elementFromPoint(self: *Document, x: f64, y: f64, frame: *Frame) !?*Element {
+    return self.elementFromPointImpl(x, y, false, frame);
+}
+
+// The faux layout gives most elements no useful horizontal extent, so
+// viewport-relative hit-testing (WebDriver scroll actions) matches on the
+// vertical axis only.
+pub fn elementFromVerticalPoint(self: *Document, y: f64, frame: *Frame) !?*Element {
+    return self.elementFromPointImpl(0, y, true, frame);
+}
+
+fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: *Frame) !?*Element {
     // DFS in document order; topmost = last visited element whose rect contains (x, y).
     //
     // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
@@ -836,7 +909,8 @@ pub fn elementFromPoint(self: *Document, x: f64, y: f64, frame: *Frame) !?*Eleme
                 const top = pos;
                 const right = pos + dims.width;
                 const bottom = pos + dims.height;
-                if (x >= left and x <= right and y >= top and y <= bottom) {
+                const x_contained = ignore_x or (x >= left and x <= right);
+                if (x_contained and y >= top and y <= bottom) {
                     topmost = element;
                 }
             }
@@ -1428,6 +1502,7 @@ pub const JsApi = struct {
         return frame._factory.node(Document{
             ._proto = undefined,
             ._type = .generic,
+            ._url = "about:blank",
             ._charset = "UTF-8",
         });
     }
@@ -1517,8 +1592,8 @@ pub const JsApi = struct {
     pub const characterSet = bridge.accessor(getCharacterSet, null, .{});
     pub const charset = bridge.accessor(getCharacterSet, null, .{});
     pub const inputEncoding = bridge.accessor(getCharacterSet, null, .{});
-    pub const compatMode = bridge.property("CSS1Compat", .{ .template = false });
-
+    pub const compatMode = bridge.accessor(Document.getCompatMode, null, .{});
+    pub const lastModified = bridge.accessor(Document.getLastModified, null, .{});
     fn getCharacterSet(self: *const Document) []const u8 {
         return self.getCharset();
     }
