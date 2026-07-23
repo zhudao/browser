@@ -562,20 +562,31 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
     return transfer;
 }
 
-pub fn tick(self: *Client, timeout_ms: u32) !void {
+pub fn tick(self: *Client, timeout_ms: u32) !bool {
     self.processGraveyard();
     return self._tick(timeout_ms, .all);
 }
 
 pub fn tickSync(self: *Client, timeout_ms: u32) !void {
-    return self._tick(timeout_ms, .sync_wait);
+    if (self.hasPendingTeardown()) {
+        return error.SyncWaitInterrupted;
+    }
+    _ = try self._tick(timeout_ms, .sync_wait);
 }
 
-pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !void {
+fn hasPendingTeardown(self: *Client) bool {
+    return self.inbox.contains(isSyncWaitInterrupt);
+}
+
+// Returns false iff the tick was a no-op. When false is returned, immediately
+// calling this again will almost [instantly] return false again, potentially
+// causing a spin.
+pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     if (self.inbox.terminated) {
         return error.ClientDisconnected;
     }
 
+    var waited = true;
     const dispatched = self.dispatchCompleted(mode);
 
     try self.startPending();
@@ -596,6 +607,11 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !void {
             // poll only waits, so we do the perform -> process dance again
             _ = try self.handles.perform();
             _ = try self.processMessages();
+        } else {
+            // There's nothing inflight. Polling will always wait until
+            // timeout_ms. Rather than do that, let's signal our caller (by
+            // returning false) and letting it decide what to do.
+            waited = false;
         }
     } else {
         // If we DID dispatch or process messages, we don't wan to wait / poll.
@@ -610,6 +626,19 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !void {
 
     // dispatch CDP commands
     try self.drainInbox(mode);
+
+    if (comptime IS_DEBUG) {
+        if (waited == false) {
+            // we're about to tell our caller not to call us again without it
+            // doing some work (e.g. running tasks). Let's assert that we were
+            // right in doing that, else we'll likely introduce latency.
+            std.debug.assert(self.pending_queue.first == null);
+            std.debug.assert(self.dispatch_queue.first == null);
+            std.debug.assert(self.ws_dispatch_queue.first == null);
+        }
+    }
+
+    return waited;
 }
 
 // Deliver completed response. This is the ONLY place user callbacks run,
@@ -839,7 +868,7 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
 
     const cached = cache.get(arena, .{
         .url = req.url,
-        .timestamp = std.time.timestamp(),
+        .timestamp = std.Io.Clock.now(.real, lp.io).toSeconds(),
         .request_headers = req_headers.items,
     }) orelse {
         lp.metrics.http_cache.incr(.miss);
@@ -896,7 +925,7 @@ fn cacheRevalidated(self: *Client, transfer: *Transfer) !bool {
 
     cache.renew(transfer.arena, .{
         .url = transfer._cache_key,
-        .timestamp = std.time.timestamp(),
+        .timestamp = std.Io.Clock.now(.real, lp.io).toSeconds(),
         .headers = transfer.res.headers,
     }) catch |err| {
         log.warn(.cache, "renew failed", .{ .err = err });
@@ -934,7 +963,7 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     const vary = findHeader(headers, "vary");
     const maybe_cm = Cache.tryCache(
         arena,
-        std.time.timestamp(),
+        std.Io.Clock.now(.real, lp.io).toSeconds(),
         transfer._cache_key,
         rh.status,
         rh.contentType(),
@@ -1030,6 +1059,13 @@ pub fn syncRequest(self: *Client, allocator: Allocator, req: Request, owner: *Ow
         req.deinit();
         return error.ClientDisconnected;
     }
+    // A parser can start another blocking script/style fetch while unwinding
+    // a previous interrupted fetch. The first tickSync below would fail
+    // anyway; bail before creating the transfer and notifying CDP.
+    if (self.hasPendingTeardown()) {
+        req.deinit();
+        return error.SyncWaitInterrupted;
+    }
 
     var sync_ctx = SyncContext{ .allocator = allocator, .body = .empty };
     errdefer sync_ctx.body.deinit(allocator);
@@ -1056,21 +1092,16 @@ pub fn syncRequest(self: *Client, allocator: Allocator, req: Request, owner: *Ow
     while (sync_ctx.completion == .in_progress) {
         self.tickSync(200) catch |err| {
             if (sync_ctx.completion == .in_progress) {
-                // tick failed for a reason unrelated to our transfer (likely OOM or
-                // client disconnect). transfer.req.ctx points at &sync_ctx on this
-                // stack — abort to sever that reference before we return
+                // tick failed for a reason unrelated to our transfer: OOM,
+                // client disconnect, or a queued teardown command (which
+                // sync_wait can't dispatch mid-parse — it would free the
+                // Page/Frame this stack holds). transfer.req.ctx points at
+                // &sync_ctx on this stack — abort to sever that reference
+                // before we return
                 transfer.abort(err);
             }
             return err;
         };
-        if (sync_ctx.completion == .in_progress and self.inbox.contains(isSyncWaitInterrupt)) {
-            // A teardown/close command is queued but sync_wait can't dispatch
-            // it mid-parse (it would free the Page/Frame this stack holds).
-            // Abort the blocking fetch so the parser unwinds to the next safe
-            // drain and the command runs there, instead of stalling for the
-            // full per-request timeout per blocking script.
-            transfer.abort(error.SyncWaitInterrupted);
-        }
     }
 
     switch (sync_ctx.completion) {
@@ -1816,7 +1847,7 @@ pub const Transfer = struct {
     _node: std.DoublyLinkedList.Node = .{},
 
     // Buffered response ordered events awaiting dispatch.
-    _events: std.ArrayList(Event) = .{},
+    _events: std.ArrayList(Event) = .empty,
 
     // controls if _queue_node is in client.dispatch_queue (false) or
     // client.gated_queue (true)
@@ -2263,9 +2294,9 @@ pub const Transfer = struct {
         const body: []const u8 = switch (cached.data) {
             .buffer => |b| b,
             .file => |f| blk: {
-                defer f.file.close();
+                defer f.file.close(lp.io);
                 const buf = try arena.alloc(u8, f.len);
-                const n = try f.file.preadAll(buf, f.offset);
+                const n = try f.file.readPositionalAll(lp.io, buf, f.offset);
                 break :blk buf[0..n];
             },
         };
@@ -2859,7 +2890,7 @@ const Response = struct {
 
     // Response body. Filled by dataCallback, consumed in processMessages.
     // See Stream.spare to see how this works in streaming mode
-    buffer: std.ArrayList(u8) = .{},
+    buffer: std.ArrayList(u8) = .empty,
 
     // Error captured in dataCallback to be reported in processMessages.
     callback_error: ?anyerror = null,
@@ -2877,7 +2908,7 @@ const Response = struct {
 
         // Along with the main Response.buffer, acts as a double buffer allowing
         // us to accumulate new data while in a delivery callback.
-        spare: std.ArrayList(u8) = .{},
+        spare: std.ArrayList(u8) = .empty,
     };
 };
 
@@ -3258,7 +3289,7 @@ test "HttpClient: fulfillIntercepted follows a 3xx redirect" {
     // An empty pool makes processTransfer queue the re-issued request
     // instead of putting it on the wire — the queue IS the capture.
     net.available = .{};
-    net.conn_mutex = .{};
+    net.conn_mutex = .init;
 
     var client: Client = undefined;
     initTestClient(&client, &pool);
