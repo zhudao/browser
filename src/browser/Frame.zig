@@ -42,6 +42,8 @@ const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
 const HtmlElement = @import("webapi/element/Html.zig");
+const AnimatedLength = @import("webapi/svg/AnimatedLength.zig");
+const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRatio.zig");
 const AnimatedString = @import("webapi/svg/AnimatedString.zig");
 const Window = @import("webapi/Window.zig");
 const Location = @import("webapi/Location.zig");
@@ -142,6 +144,8 @@ _element_shadow_roots: Element.ShadowRootLookup = .empty,
 _node_owner_documents: Node.OwnerDocumentLookup = .empty,
 _element_scroll_positions: Element.ScrollPositionLookup = .empty,
 _element_namespace_uris: Element.NamespaceUriLookup = .empty,
+_svg_animated_lengths: AnimatedLength.Lookup = .empty,
+_svg_animated_preserve_aspect_ratios: AnimatedPreserveAspectRatio.Lookup = .empty,
 _svg_animated_strings: AnimatedString.Lookup = .empty,
 
 // Same as above, but for Nodes (slot assigments apply to both Element AND
@@ -1956,7 +1960,7 @@ pub fn domChanged(self: *Frame) void {
     // A DOM change is our "rendering opportunity": re-evaluate the layout
     // observers. Both are no-ops unless something they track actually changed.
     observers.scheduleIntersectionChecks(self);
-    observers.scheduleResizeDelivery(self);
+    observers.scheduleResizeChecks(self);
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
@@ -2910,6 +2914,9 @@ fn parseHtmlAsChildrenInner(self: *Frame, node: *Node, html: []const u8, opts: F
 
     var parser = Parser.init(self.call_arena, node, self, .{ .allow_declarative_shadow = opts.allow_declarative_shadow });
     parser.parseFragment(html);
+    if (parser.terminated) {
+        return error.ExecutionTerminated;
+    }
 
     // html5ever wraps fragment output in an <html> element; unwrap so its
     // children land directly on `node`. See https://github.com/servo/html5ever/issues/583.
