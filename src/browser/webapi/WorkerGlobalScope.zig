@@ -38,6 +38,7 @@ const Crypto = @import("Crypto.zig");
 const Console = @import("Console.zig");
 const Navigator = @import("Navigator.zig");
 const Timers = @import("Timers.zig");
+const Scheduler = @import("Scheduler.zig");
 const EventTarget = @import("EventTarget.zig");
 const Performance = @import("Performance.zig");
 const WorkerLocation = @import("WorkerLocation.zig");
@@ -118,6 +119,7 @@ _cookie_store: ?*CookieStore = null,
 _location: WorkerLocation,
 
 _timers: Timers = .{},
+_scheduler: Scheduler = .{},
 
 pub const Type = union(enum) {
     shared: *SharedWorkerGlobalScope,
@@ -305,6 +307,10 @@ pub fn getNavigator(self: *WorkerGlobalScope) *Navigator {
     return &self._navigator;
 }
 
+pub fn getScheduler(self: *WorkerGlobalScope) *Scheduler {
+    return &self._scheduler;
+}
+
 pub fn performance(self: *WorkerGlobalScope) *Performance {
     return &self._performance;
 }
@@ -396,7 +402,8 @@ pub fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void
     }
 
     const session = self._session;
-    const arena = try session.getArena(.large, "importScript");
+    // HttpClient will take out a larger arena for the body, if necessary
+    const arena = try session.getArena(.small, "importScript");
     defer arena.release();
 
     for (urls) |url| {
@@ -415,7 +422,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
     var headers = try http_client.newHeaders();
     try self.headersForRequest(&headers);
 
-    const response = http_client.syncRequest(arena, .{
+    var response = http_client.syncRequest(.{
         .url = resolved_url,
         .method = .GET,
         .frame_id = self._frame_id,
@@ -431,6 +438,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
         log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
         return error.NetworkError;
     };
+    defer response.deinit();
 
     if (response.status != 200) {
         log.warn(.http, "importScript", .{ .url = resolved_url, .status = response.status });
@@ -583,6 +591,7 @@ pub const JsApi = struct {
     pub const console = bridge.accessor(WorkerGlobalScope.getConsole, WorkerGlobalScope.setConsole, .{});
     pub const crypto = bridge.accessor(WorkerGlobalScope.getCrypto, null, .{});
     pub const navigator = bridge.accessor(WorkerGlobalScope.getNavigator, null, .{});
+    pub const scheduler = bridge.accessor(WorkerGlobalScope.getScheduler, null, .{});
     pub const performance = bridge.accessor(struct {
         // Unnecessary, But, our WebAPI getters are ALWAYS `fn getPerformance()...`.
         // But for performance, we _need_ to have fn performance() *Performance to

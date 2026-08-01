@@ -32,6 +32,7 @@ const MouseEvent = @import("webapi/event/MouseEvent.zig");
 const Element = @import("webapi/Element.zig");
 const Document = @import("webapi/Document.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
+const AbortSignal = @import("webapi/AbortSignal.zig");
 const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.zig");
 const Blob = @import("webapi/Blob.zig");
 const AbstractRange = @import("webapi/AbstractRange.zig");
@@ -485,11 +486,12 @@ pub fn svgElement(self: *Factory, tag_name: []const u8, child: anytype) !*@TypeO
     inline for (1..types.len - 1) |i| {
         const T = types[i];
         if (T == Element.Svg) {
-            chain.set(i, .{
-                ._proto = chain.get(i - 1),
+            const svg_ptr = chain.get(i);
+            svg_ptr.* = .{
                 ._tag_name = try String.init(self._arena, tag_name, .{}),
                 ._type = unionInit(Element.Svg.Type, chain.get(i + 1)),
-            });
+            };
+            setProto(svg_ptr, chain.get(i - 1));
         } else {
             chain.setMiddle(i, T.Type);
         }
@@ -512,6 +514,12 @@ pub fn xhrEventTarget(_: *const Factory, allocator: Allocator, child: anytype) !
     ).create(allocator, child);
 }
 
+pub fn taskSignal(self: *Factory, child: anytype) !*@TypeOf(child) {
+    return try AutoPrototypeChain(
+        &.{ EventTarget, AbortSignal, @TypeOf(child) },
+    ).create(self._slab.allocator(), child);
+}
+
 pub fn textTrackCue(self: *Factory, child: anytype) !*@TypeOf(child) {
     const allocator = self._slab.allocator();
     const TextTrackCue = @import("webapi/media/TextTrackCue.zig");
@@ -526,12 +534,10 @@ pub fn destroy(self: *Factory, value: anytype) void {
 
     if (comptime IS_DEBUG) {
         // We should always destroy from the leaf down.
-        if (@hasDecl(S, "_prototype_root")) {
-            // A Event{._type == .generic} (or any other similar types)
-            // _should_ be destroyed directly. The _type = .generic is a pseudo
-            // child
-            if (S != Event or value._type != .generic) {
-                log.fatal(.bug, "factory.destroy.event", .{ .type = @typeName(S) });
+        if (comptime @hasDecl(S, "_prototype_root")) {
+            const is_leaf = if (comptime @hasField(S, "_type")) value._type == .generic else false;
+            if (!is_leaf) {
+                log.fatal(.bug, "factory.destroy.root", .{ .type = @typeName(S) });
                 unreachable;
             }
         }

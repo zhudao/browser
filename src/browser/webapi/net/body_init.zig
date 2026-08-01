@@ -49,6 +49,16 @@ pub const BodyInit = union(enum) {
     buffer: js.TypedArray(u8),
     bytes: []const u8, // must be last, js.Bridge will map anything to a string
 
+    // How much a call to `extract` will dupe. Used for ArenaPool size selection.
+    pub fn sizeHint(self: BodyInit) ?usize {
+        return switch (self) {
+            .bytes => |b| b.len,
+            .buffer => |b| b.values.len,
+            .blob => |b| b._slice.len + b._mime.len,
+            .form_data, .url_search_params, .stream => null,
+        };
+    }
+
     pub fn extract(self: BodyInit, arena: Allocator) !Extracted {
         switch (self) {
             .bytes => |b| {
@@ -136,14 +146,12 @@ pub fn stripUtf8Bom(bytes: []const u8) []const u8 {
 
 const testing = @import("../../../testing.zig");
 test "BodyInit: bytes pass through with text/plain" {
-    defer testing.reset();
     const r = try (BodyInit{ .bytes = "hello" }).extract(testing.arena_allocator);
     try testing.expectString("hello", r.bytes);
     try testing.expectString("text/plain;charset=UTF-8", r.content_type.?);
 }
 
 test "BodyInit: URLSearchParams emit urlencoded body + content-type" {
-    defer testing.reset();
     const arena = try testing.test_app.arena_pool.acquire(.small, "body_init test");
     defer arena.release();
 
@@ -158,7 +166,6 @@ test "BodyInit: URLSearchParams emit urlencoded body + content-type" {
 }
 
 test "BodyInit: FormData emits multipart with random boundary" {
-    defer testing.reset();
     const arena = try testing.test_app.arena_pool.acquire(.small, "body_init test");
     defer arena.release();
 
@@ -184,7 +191,6 @@ test "BodyInit: FormData emits multipart with random boundary" {
 }
 
 test "BodyInit: buffer source has no default Content-Type" {
-    defer testing.reset();
     const r = try (BodyInit{ .buffer = .{ .values = "hello" } }).extract(testing.arena_allocator);
     try testing.expectString("hello", r.bytes);
     try testing.expectEqual(true, r.content_type == null);

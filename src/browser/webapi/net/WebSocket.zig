@@ -756,7 +756,7 @@ fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsF
             switch (self._binary_type) {
                 .arraybuffer => .{ .arraybuffer = .{ .values = data } },
                 .blob => blk: {
-                    const blob = try Blob.initFromBytes(data, "", exec.page);
+                    const blob = try Blob.initFromBytes(data, "", exec);
                     blob.acquireRef();
                     break :blk .{ .blob = blob };
                 },
@@ -1046,6 +1046,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: WebSocket" {
+    testing.expectLog(&.{.websocket});
     try testing.htmlRunner("net/websocket.html", .{});
 }
 

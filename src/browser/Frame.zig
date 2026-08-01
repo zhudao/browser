@@ -2180,7 +2180,8 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     }
     const element = link.asElement();
 
-    const arena = try session.getArena(.medium, "Frame.loadExternalStylesheet");
+    // HttpClient will take out a larger arena for the body, if necessary
+    const arena = try session.getArena(.small, "Frame.loadExternalStylesheet");
     defer arena.release();
 
     const resolved = URL.resolve(arena.allocator(), self.base(), href, .{ .encoding = self.charset }) catch |err| {
@@ -2212,7 +2213,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     sm.is_evaluating = true;
     defer sm.endEvaluationWindow(was_evaluating);
 
-    var response = http_client.syncRequest(arena.allocator(), .{
+    var response = http_client.syncRequest(.{
         .url = resolved,
         .method = .GET,
         .frame_id = self._frame_id,
@@ -2227,7 +2228,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
         log.warn(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
         return self.fireElementEvent(element, comptime .wrap("error"));
     };
-    defer response.deinit(arena.allocator());
+    defer response.deinit();
 
     if (response.status < 200 or response.status >= 300) {
         log.info(.http, "external stylesheet status", .{ .status = response.status, .url = resolved });
@@ -3460,8 +3461,7 @@ test "Frame: urlBasename" {
 }
 
 test "WebApi: Frame" {
-    const filter: testing.LogFilter = .init(&.{.http});
-    defer filter.deinit();
+    testing.silenceLog(&.{.http});
     try testing.htmlRunner("page", .{});
 }
 
@@ -3470,8 +3470,7 @@ test "WebApi: Frames" {
 }
 
 test "WebApi: Frame Blob" {
-    const filter: testing.LogFilter = .init(&.{ .frame, .browser, .js });
-    defer filter.deinit();
+    testing.silenceLog(&.{ .frame, .browser, .js });
     try testing.htmlRunner("frames/blob", .{});
 }
 
@@ -3524,6 +3523,8 @@ test "Page: isSameOrigin" {
 }
 
 test "Frame: httpMetadata after navigation" {
+    testing.expectLog(&.{.http});
+
     const page = try testing.pageTest("page/meta.html", .{});
     defer page.close();
 
@@ -3544,8 +3545,6 @@ test "Frame: httpMetadata 404" {
 }
 
 test "Frame: 401" {
-    defer testing.reset();
-
     var page = try testing.pageTest("401", .{});
     defer page.close();
 
