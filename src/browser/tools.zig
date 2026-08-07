@@ -276,6 +276,16 @@ pub const Tool = enum {
         };
     }
 
+    /// Waits for page readiness on its own, letting the recorder downgrade a
+    /// preceding `goto` to `domcontentloaded`. Exhaustive like the sibling
+    /// predicates so a new wait tool makes an explicit choice here.
+    pub fn waitsForReadiness(self: Tool) bool {
+        return switch (self) {
+            .waitForSelector, .waitForScript, .waitForState => true,
+            .goto, .evaluate, .extract, .click, .fill, .scroll, .hover, .press, .selectOption, .setChecked, .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => false,
+        };
+    }
+
     /// A read tool that navigates when handed a `url`. The read isn't recorded,
     /// but the navigation is, so the recorder captures it as a `goto`. Excludes
     /// `evaluate` (carries its own `url`), `search` (derived engine URL), and
@@ -329,7 +339,10 @@ pub const Tool = enum {
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "url": { "type": "string", "description": "The URL to navigate to, must be a valid URL." },
-                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
+                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." },
+                    \\    "waitUntil": { "type": "string", "enum":
+                ++ lp.Config.tagJsonArray(lp.Config.WaitUntil) ++
+                    \\, "description": "Event that completes the navigation. Defaults to 'load'. Prefer 'domcontentloaded' followed by waitForSelector on pages whose late scripts (ads) hold 'load' back. Avoid 'done' (full quiescence): on pages with constant background activity it is the slowest choice and can run to the timeout." }
                     \\  },
                     \\  "required": ["url"]
                     \\}
@@ -525,7 +538,7 @@ pub const Tool = enum {
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "selector": { "type": "string", "description": "The CSS selector to wait for." },
-                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 5000." }
+                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 5000, or 15000 when the page has not reached 'load' yet." }
                     \\  },
                     \\  "required": ["selector"]
                     \\}
@@ -539,7 +552,7 @@ pub const Tool = enum {
                     \\  "type": "object",
                     \\  "properties": {
                     \\    "script": { "type": "string", "description": "JS expression evaluated each tick until truthy. Must be an expression (not a statement)." },
-                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 5000." }
+                    \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 5000, or 15000 when the page has not reached 'load' yet." }
                     \\  },
                     \\  "required": ["script"]
                     \\}
@@ -758,6 +771,7 @@ pub const ToolResult = struct {
 pub const GotoParams = struct {
     url: [:0]const u8,
     timeout: ?u32 = null,
+    waitUntil: lp.Config.WaitUntil = default_nav_wait,
 };
 
 pub const UrlParams = struct {
@@ -786,7 +800,13 @@ pub fn call(
     tool_name: []const u8,
     arguments: ?std.json.Value,
 ) ToolError!ToolResult {
-    const tool = std.meta.stringToEnum(Tool, tool_name) orelse return ToolError.InvalidParams;
+    // In-band so an LLM that invented a tool name (e.g. OpenAI's internal
+    // `multi_tool_use.parallel` wrapper) learns the name is wrong instead of
+    // retrying it with different arguments.
+    const tool = std.meta.stringToEnum(Tool, tool_name) orelse return .{
+        .text = try std.fmt.allocPrint(arena, "Unknown tool: {s}", .{tool_name}),
+        .is_error = true,
+    };
     if (diagnoseArgs(arena, arguments)) |msg|
         return .{ .text = msg, .is_error = true };
     // Must run before substituteStringArgs so the `key=="value"` secret-
@@ -936,7 +956,7 @@ const schema_walker_suffix = ")";
 
 fn execGoto(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {
     const args = try parseArgs(GotoParams, arena, arguments);
-    return switch (try performGoto(session, registry, args.url, args.timeout)) {
+    return switch (try performGoto(session, registry, args.url, .{ .timeout = args.timeout, .wait_until = args.waitUntil })) {
         .completed => "Navigated successfully.",
         .timeout => "Navigation started but the page did not finish loading before the timeout.",
     };
@@ -988,7 +1008,7 @@ fn execSearch(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode
         .{encoded},
         0,
     ) catch return ToolError.OutOfMemory;
-    _ = try performGoto(session, registry, ddg_url, args.timeout);
+    _ = try performGoto(session, registry, ddg_url, .{ .timeout = args.timeout });
     const ddg_frame = try requireFrame(session);
     return .{ .text = try renderFrameMarkdown(arena, ddg_frame) };
 }
@@ -1619,6 +1639,14 @@ fn execScroll(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode
 /// already-loaded page rather than a full navigation (which uses 10000).
 const default_wait_timeout_ms: u32 = 5000;
 
+/// A wait entered before `load` also inherits the nav budget: a post-load
+/// selector keeps the wall time it had when `goto` waited for `load` itself.
+/// Shared with CDP's `LP.waitForSelector`, which fronts the same action.
+pub fn defaultWaitTimeout(frame: *const lp.Frame) u32 {
+    if (frame._load_state == .complete) return default_wait_timeout_ms;
+    return default_nav_timeout_ms + default_wait_timeout_ms;
+}
+
 fn execWaitForSelector(arena: std.mem.Allocator, session: *lp.Session, registry: *CDPNode.Registry, arguments: ?std.json.Value) ToolError![]const u8 {
     const Params = struct {
         selector: [:0]const u8,
@@ -1628,7 +1656,7 @@ fn execWaitForSelector(arena: std.mem.Allocator, session: *lp.Session, registry:
 
     const frame = try requireFrame(session);
 
-    const timeout_ms = args.timeout orelse default_wait_timeout_ms;
+    const timeout_ms = args.timeout orelse defaultWaitTimeout(frame);
 
     const node = lp.actions.waitForSelector(args.selector, timeout_ms, frame._frame_id, session) catch |err| switch (err) {
         error.InvalidSelector => return ToolError.InvalidParams,
@@ -1655,7 +1683,7 @@ fn execWaitForScript(arena: std.mem.Allocator, session: *lp.Session, arguments: 
 
     const frame = try requireFrame(session);
 
-    const timeout_ms = args.timeout orelse default_wait_timeout_ms;
+    const timeout_ms = args.timeout orelse defaultWaitTimeout(frame);
 
     lp.actions.waitForScript(args.script, timeout_ms, frame._frame_id, session) catch |err| switch (err) {
         error.Cancelled => return ToolError.Cancelled,
@@ -1921,7 +1949,7 @@ fn ensurePage(session: *lp.Session, registry: *CDPNode.Registry, url: ?[:0]const
         if (session.currentFrame()) |frame| {
             if (std.mem.eql(u8, frame.url, u)) return frame;
         }
-        _ = try performGoto(session, registry, u, timeout);
+        _ = try performGoto(session, registry, u, .{ .timeout = timeout });
     }
     return session.currentFrame() orelse ToolError.FrameNotLoaded;
 }
@@ -1937,6 +1965,7 @@ const default_nav_timeout_ms: u32 = 10000;
 pub const StartedGoto = struct {
     frame_id: u32,
     timeout_ms: u32,
+    until: lp.Config.WaitUntil,
 };
 
 /// Open a fresh top-level page and start its navigation. The frame is non-null
@@ -1971,10 +2000,19 @@ pub fn startGoto(
         }
     }
     const page = try openPage(session, args.url);
-    return .{ .frame_id = page.frame_id, .timeout_ms = args.timeout orelse default_nav_timeout_ms };
+    return .{
+        .frame_id = page.frame_id,
+        .timeout_ms = args.timeout orelse default_nav_timeout_ms,
+        .until = args.waitUntil,
+    };
 }
 
-fn performGoto(session: *lp.Session, registry: *CDPNode.Registry, url: [:0]const u8, timeout: ?u32) ToolError!lp.Session.Runner.WaitResult {
+const PerformGotoOpts = struct {
+    timeout: ?u32 = null,
+    wait_until: lp.Config.WaitUntil = default_nav_wait,
+};
+
+fn performGoto(session: *lp.Session, registry: *CDPNode.Registry, url: [:0]const u8, opts: PerformGotoOpts) ToolError!lp.Session.Runner.WaitResult {
     if (session.primaryPage()) |old_page| {
         registry.reset();
         old_page.close();
@@ -1982,9 +2020,9 @@ fn performGoto(session: *lp.Session, registry: *CDPNode.Registry, url: [:0]const
     const page = try openPage(session, url);
 
     var runner = session.runner(.{});
-    const condition = lp.Session.Runner.WaitCondition{ .frame_id = page.frame_id, .until = default_nav_wait };
+    const condition = lp.Session.Runner.WaitCondition{ .frame_id = page.frame_id, .until = opts.wait_until };
     var conditions = [_]lp.Session.Runner.WaitCondition{condition};
-    const result = runner.waitResult(timeout orelse default_nav_timeout_ms, &conditions) catch |err| {
+    const result = runner.waitResult(opts.timeout orelse default_nav_timeout_ms, &conditions) catch |err| {
         return if (err == error.Cancelled) ToolError.Cancelled else ToolError.NavigationFailed;
     };
 
@@ -2191,6 +2229,17 @@ pub fn reverseSubstituteEnvVars(arena: std.mem.Allocator, input: []const u8) err
         changed = true;
     }
     return if (changed) current else input;
+}
+
+test "call: unknown tool name surfaces in-band" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Session/registry are never touched on this branch; the name check is
+    // the first thing `call` does.
+    const r = try call(arena.allocator(), undefined, undefined, "multi_tool_use.parallel", null);
+    try std.testing.expect(r.is_error);
+    try std.testing.expectEqualStrings("Unknown tool: multi_tool_use.parallel", r.text);
 }
 
 test "substituteEnvVars resolves LP_* vars" {
