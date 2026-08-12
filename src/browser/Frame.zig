@@ -472,6 +472,11 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
             }.runIdleTasks, 200, .{ .name = "frame.runIdleTasks", .blocks_done = false });
         }
     }
+
+    if (parent == null) {
+        // no point reporting this for each child page
+        session.browser.reportJsHeap();
+    }
 }
 
 pub fn deinit(self: *Frame) void {
@@ -543,6 +548,9 @@ pub fn deinit(self: *Frame) void {
     const browser = page.session.browser;
 
     browser.http_client.abortOwner(&self._http_owner);
+    if (self.parent == null) {
+        browser.reportJsHeap();
+    }
 
     browser.env.destroyContext(self.js);
 
@@ -1228,6 +1236,10 @@ pub fn documentIsComplete(self: *Frame) void {
         error.JsException => {}, // already logged
         else => log.err(.frame, "document is complete", .{ .err = err, .type = self._type, .url = self.url }),
     };
+
+    if (self.parent == null) {
+        self._session.browser.reportJsHeap();
+    }
 }
 
 fn _documentIsComplete(self: *Frame) !void {
@@ -2578,6 +2590,15 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
         return;
     }
 
+    // Focus goes with the removed subtree. The focused element can be inside a
+    // shadow tree hanging off it, which the walk below doesn't descend into,
+    // so ask it directly whether it's still in the document.
+    if (self.document._active_element) |active| {
+        if (active.asNode().isConnected() == false) {
+            self.document._active_element = null;
+        }
+    }
+
     // The child was connected and now it no longer is. We need to "disconnect"
     // it and all of its descendants. For now "disconnect" just means updating
     // the ID map and invoking disconnectedCallback for custom elements
@@ -2809,7 +2830,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         return;
     }
 
-    const parent_in_shadow = parent.is(ShadowRoot) != null or parent.isInShadowTree();
+    const parent_in_shadow = parent.containingShadowRoot() != null;
 
     if (!parent_in_shadow and !parent_is_connected) {
         return;
