@@ -383,10 +383,10 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 // Headers _all_ requests include.
-pub fn baselineHeaders(self: *const Client) [3]http.Header {
+pub fn baselineHeaders(self: *const Client) [3]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
-        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua },
+        .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
@@ -533,7 +533,7 @@ pub fn request(self: *Client, req: Request, owner: ?*Owner) anyerror!void {
 //   const transfer = try client.newRequest(.{...}, owner);
 //   {
 //       errdefer transfer.deinit();
-//       try transfer.addHeader("Blah", "x", .{});
+//       try transfer.setHeader("Blah", "x", .{});
 //   }
 //   try transfer.submit();
 //
@@ -898,6 +898,16 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         return false;
     }
 
+    // A request already carrying its own validators (e.g. a script-set
+    // If-None-Match) should reach the server as-is. The script may be doing its
+    // own caching, and if we inject our own headers and our own interpretation,
+    // we can cause issues for the script (e.g. we respond with a 200 from our
+    // cache, the server repaints the page because it didn't get the correct 304
+    // that the upstream would have returned).
+    if (transfer.findRequestHeader("If-None-Match") != null or transfer.findRequestHeader("If-Modified-Since") != null) {
+        return false;
+    }
+
     // Redirects rewrite req.url; the entry must be stored/renewed under the
     // URL this lookup ran against, not the final hop. req.url is arena-owned,
     // so the captured slice outlives any redirect rewrite.
@@ -931,10 +941,10 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
                 .last_modified = cached.last_modified,
             });
             if (cached.etag) |etag| {
-                try transfer.addHeader("If-None-Match", etag, .{});
+                try transfer.setHeader("If-None-Match", etag, .{});
             }
             if (cached.last_modified) |lm| {
-                try transfer.addHeader("If-Modified-Since", lm, .{});
+                try transfer.setHeader("If-Modified-Since", lm, .{});
             }
             transfer._cache_intent = .{ .revalidate = cached };
             return false;
@@ -2728,15 +2738,17 @@ pub const Transfer = struct {
         source: HeaderSource = .user_agent,
     };
 
-    // Who put the header on the request. CORS cares: only non-safelisted
-    // author (i.e. script-set) headers trigger a preflight.
-    pub const HeaderSource = enum { user_agent, author };
+    // Who put the header on the request, ordered lowest priority first:
+    // setHeader/appendHeader let a source overwrite headers from its own or
+    // a lower layer, never a higher one. .fixed is hardcoded and can't be
+    // changed (Sec-Ch-Ua). For CORS, only script-set headers cause a preflight.
+    pub const HeaderSource = enum { user_agent, author, cdp, fixed };
 
     pub const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
     };
 
-    pub fn addHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
+    fn addHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
         const arena = self.arena.allocator();
         try self.req_headers.append(arena, .{
             .name = try arena.dupe(u8, name),
@@ -2765,8 +2777,21 @@ pub const Transfer = struct {
         }
     }
 
-    // Adds, replacing every existing header with the same case-insensitive name
+    // Add or replace or noops the header based on the source layering priority
     pub fn setHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
+        return self.putHeader(name, value, opts.source, .set);
+    }
+
+    // Add or append or noops the header based on the source layering priority
+    pub fn appendHeader(self: *Transfer, name: []const u8, value: []const u8, opts: HeaderOpts) !void {
+        return self.putHeader(name, value, opts.source, .append);
+    }
+
+    fn putHeader(self: *Transfer, name: []const u8, value: []const u8, source: HeaderSource, mode: enum { set, append }) !void {
+        if (verifyHeader(name, value) == false) {
+            return;
+        }
+
         var found = false;
         var i: usize = 0;
         while (i < self.req_headers.items.len) {
@@ -2780,19 +2805,43 @@ pub const Transfer = struct {
                 continue;
             }
             found = true;
+
+            if (@intFromEnum(hdr.source) > @intFromEnum(source)) {
+                if (hdr.source == .fixed) {
+                    log.warn(.http, "ignore overriding fixed header", .{ .header = hdr.name });
+                }
+                return;
+            }
+            if (mode == .append and hdr.source == source) {
+                const sep = if (std.ascii.eqlIgnoreCase(name, "cookie")) "; " else ", ";
+                hdr.value = try std.fmt.allocPrint(self.arena.allocator(), "{s}{s}{s}", .{ hdr.value, sep, value });
+                return;
+            }
             hdr.value = try self.arena.allocator().dupe(u8, value);
-            hdr.source = opts.source;
+            hdr.source = source;
             i += 1;
         }
         if (!found) {
-            try self.addHeader(name, value, opts);
+            try self.addHeader(name, value, .{ .source = source });
         }
+    }
+
+    // Central gate for every header entering req_headers; name-keyed
+    // restrictions live here so entry points don't need their own checks.
+    fn verifyHeader(name: []const u8, value: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
+            lp.Config.validateUserAgent(value) catch |err| {
+                log.warn(.http, "invalid header dropped", .{ .name = name, .err = err });
+                return false;
+            };
+        }
+        return true;
     }
 
     // The client's baseline headers, added to every request at creation.
     fn seedHeaders(self: *Transfer) !void {
         for (self.client.baselineHeaders()) |hdr| {
-            try self.addHeader(hdr.name, hdr.value, .{});
+            try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
     }
 
@@ -2804,7 +2853,7 @@ pub const Transfer = struct {
         self.req_headers.clearRetainingCapacity();
         try self.seedHeaders();
         for (headers) |hdr| {
-            try self.setHeader(hdr.name, hdr.value, .{});
+            try self.setHeader(hdr.name, hdr.value, .{ .source = .cdp });
         }
     }
 
@@ -3430,14 +3479,8 @@ test "HttpClient: URL blocking exempts internal transfers" {
     try testing.expect(!client.isUrlBlocked("https://example.test/robots.txt", true));
 }
 
-test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
-    var pool = ArenaPool.init(testing.allocator, .{});
-    defer pool.deinit();
-
-    const arena = try pool.acquire(.small, "test");
-    defer arena.release();
-
-    var transfer = Transfer{
+fn testTransfer(arena: *lp.Arena) Transfer {
+    return .{
         .arena = arena,
         .owner = null,
         .req = .{
@@ -3455,10 +3498,26 @@ test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
         .id = 1,
         .start_time = 0,
     };
+}
 
-    try transfer.addHeader("User-Agent", "Lightpanda/1.0", .{});
-    try transfer.addHeader("X-Twice", "a", .{});
-    try transfer.addHeader("x-twice", "b", .{});
+test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = testTransfer(arena);
+
+    try transfer.setHeader("User-Agent", "Lightpanda/1.0", .{});
+    try transfer.setHeader("X-Twice", "a", .{});
+
+    // force a duplicated value manually
+    try transfer.req_headers.append(transfer.arena.allocator(), .{
+        .name = "x-twice",
+        .value = "b",
+        .source = .user_agent,
+    });
 
     // replaces in place, collapsing duplicates
     try transfer.setHeader("user-agent", "Custom/1.0", .{});
@@ -3475,6 +3534,68 @@ test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
     try testing.expectEqual(.author, headers[1].source);
     try testing.expectEqual("X-New", headers[2].name);
     try testing.expectEqual("yes", headers[2].value);
+}
+
+test "HttpClient: Transfer.appendHeader combines same-source values" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = testTransfer(arena);
+
+    // no match: appends a new header
+    try transfer.appendHeader("Accept-Language", "en-US", .{});
+    // a higher layer replaces rather than joins
+    try transfer.appendHeader("ACCEPT-LANGUAGE", "fr", .{ .source = .author });
+    // a same-source repeat joins onto the existing value
+    try transfer.appendHeader("accept-language", "de", .{ .source = .author });
+
+    // Cookie joins with its own separator
+    try transfer.appendHeader("Cookie", "a=1", .{ .source = .author });
+    try transfer.appendHeader("COOKIE", "b=2", .{ .source = .author });
+
+    const headers = transfer.req_headers.items;
+    try testing.expectEqual(2, headers.len);
+    try testing.expectEqual("Accept-Language", headers[0].name);
+    try testing.expectEqual("fr, de", headers[0].value);
+    try testing.expectEqual(.author, headers[0].source);
+    try testing.expectEqual("Cookie", headers[1].name);
+    try testing.expectEqual("a=1; b=2", headers[1].value);
+}
+
+test "HttpClient: Transfer header layering" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = testTransfer(arena);
+
+    try transfer.setHeader("User-Agent", "Lightpanda/1.0", .{});
+    try transfer.setHeader("Sec-Ch-Ua", "\"Lightpanda\";v=\"1\"", .{ .source = .fixed });
+    try transfer.setHeader("If-None-Match", "\"author-etag\"", .{ .source = .author });
+
+    // a lower layer never takes back a header a higher one owns
+    try transfer.setHeader("If-None-Match", "\"cache-etag\"", .{});
+    try testing.expectEqual("\"author-etag\"", transfer.findRequestHeader("if-none-match").?);
+
+    // nothing overrides a fixed header, whatever the layer or mode
+    testing.expectLog(&.{ .http, .http });
+    try transfer.setHeader("sec-ch-ua", "\"Chromium\";v=\"140\"", .{ .source = .cdp });
+    try transfer.appendHeader("SEC-CH-UA", "\"Chromium\";v=\"140\"", .{ .source = .author });
+    try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
+
+    // an invalid User-Agent never enters the list
+    testing.expectLog(&.{.http});
+    try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
+    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
+
+    // a valid author User-Agent replaces the default
+    try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });
+    try testing.expectEqual("MyBot/2.0", transfer.findRequestHeader("user-agent").?);
 }
 
 test "HttpClient: Fetch header overrides restore after one hop" {
