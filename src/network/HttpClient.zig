@@ -35,6 +35,7 @@ const Network = @import("Network.zig");
 const Cache = @import("cache/Cache.zig");
 const RobotsGate = @import("RobotsGate.zig");
 const UrlBlocklist = @import("UrlBlocklist.zig");
+
 pub const BlockPattern = UrlBlocklist.Pattern;
 
 const log = lp.log;
@@ -304,6 +305,12 @@ pub fn setTlsVerify(self: *Client, verify: bool) !void {
     self.tls_verify = verify;
 }
 
+pub fn obeyRobots(self: *Client, enable: bool) !void {
+    if (self.obey_robots == enable) return;
+    try self.ensureNoActiveConnection();
+    self.obey_robots = enable;
+}
+
 pub fn disableCache(self: *Client, disable: bool) void {
     if (disable) {
         self.cache = null;
@@ -372,10 +379,26 @@ fn clearUrlBlocklist(self: *Client) void {
     }
 }
 
-fn isUrlBlocked(self: *const Client, url: []const u8, internal: bool) bool {
+/// Every reason a request is refused before it reaches the network:
+/// `--block-urls` patterns and the `--adblock-lists` filters both land here
+/// so that no call site can apply one without the other.
+fn isUrlBlocked(self: *const Client, url: [:0]const u8, internal: bool) bool {
     if (internal) return false;
-    const blocklist = self.url_blocklist orelse return false;
-    return blocklist.isBlocked(url);
+    if (self.url_blocklist) |*blocklist| {
+        if (blocklist.isBlocked(url)) return true;
+    }
+    return self.isHostAdblocked(url);
+}
+
+fn isHostAdblocked(self: *const Client, url: [:0]const u8) bool {
+    const blocker = if (self.network.adblocker) |*b| b else return false;
+    const host = URL.getHostname(url);
+    if (host.len == 0 or host.len > 253) return false;
+    // The trie expects normalized (lowercase) hostnames; URLs aren't
+    // guaranteed to arrive that way.
+    var buf: [253]u8 = undefined;
+    const hostname = std.ascii.lowerString(&buf, host);
+    return blocker.matchHostname(hostname) == .blocked;
 }
 
 pub fn getUserAgent(self: *const Client) [:0]const u8 {
@@ -383,10 +406,11 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 // Headers _all_ requests include.
-pub fn baselineHeaders(self: *const Client) [3]Transfer.RequestHeader {
+pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
         .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
@@ -846,7 +870,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
         },
         .after_intercept => {
             if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
-                log.warn(.http, "blocked url", .{ .url = transfer.req.url });
+                log.info(.http, "blocked url", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UrlBlocked);
             }
             if (try self.cacheLookup(transfer)) {
@@ -1498,7 +1522,7 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
                     }
 
                     if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
-                        log.warn(.http, "blocked url", .{ .url = transfer.req.url });
+                        log.info(.http, "blocked url", .{ .url = transfer.req.url });
                         self.removeConn(msg.conn);
                         transfer._conn = null;
                         transfer.failAsync(error.UrlBlocked);
@@ -2742,7 +2766,7 @@ pub const Transfer = struct {
     // setHeader/appendHeader let a source overwrite headers from its own or
     // a lower layer, never a higher one. .fixed is hardcoded and can't be
     // changed (Sec-Ch-Ua). For CORS, only script-set headers cause a preflight.
-    pub const HeaderSource = enum { user_agent, author, cdp, fixed };
+    pub const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
 
     pub const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
@@ -2842,6 +2866,12 @@ pub const Transfer = struct {
     fn seedHeaders(self: *Transfer) !void {
         for (self.client.baselineHeaders()) |hdr| {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
+        }
+
+        // --http-header extras; setHeader so a same-name header (e.g.
+        // Accept-Language) overrides the baseline instead of duplicating.
+        for (self.client.network.config.httpHeaders()) |hdr| {
+            try self.setHeader(hdr.name, hdr.value, .{ .source = .cli });
         }
     }
 
@@ -3270,6 +3300,11 @@ const Synthetic = struct {
 };
 
 const testing = @import("../testing.zig");
+const AdBlocker = @import("adblock/AdBlocker.zig");
+
+// The Network every test client points at: only the fields a test actually
+// exercises are ever set, by initTestClient or by the test itself.
+var test_network: Network = undefined;
 
 test "HttpClient: isFetchInterceptionMethod matches the four Fetch methods" {
     try testing.expect(isFetchInterceptionMethod("Fetch.continueRequest"));
@@ -3443,6 +3478,10 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
         .single_flight = .init(testing.allocator),
     };
     client.url_blocklist = null;
+    // isUrlBlocked reaches through here for the adblocker; tests that want
+    // one assign it to `client.network` after this returns.
+    test_network.adblocker = null;
+    client.network = &test_network;
 }
 
 test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
@@ -3464,6 +3503,32 @@ test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
 
     try client.setBlockedUrls(&.{});
     try testing.expectEqual(null, client.url_blocklist);
+}
+
+test "HttpClient: adblock verdicts apply per request hostname" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+
+    var blocker: AdBlocker = try .init(testing.allocator);
+    defer blocker.deinit();
+    var list: std.Io.Reader = .fixed(
+        \\||ads.example.com^
+        \\@@||good.ads.example.com^
+    );
+    try blocker.parse(&list);
+    client.network.adblocker = blocker;
+    defer client.network.adblocker = null;
+
+    try testing.expect(client.isUrlBlocked("https://ads.example.com/pixel.gif", false));
+    // Hostnames are matched case-insensitively and without the port.
+    try testing.expect(client.isUrlBlocked("https://SUB.ADS.EXAMPLE.COM:8443/x", false));
+    try testing.expect(!client.isUrlBlocked("https://good.ads.example.com/app.js", false));
+    try testing.expect(!client.isUrlBlocked("https://example.com/", false));
+    // Internal transfers (robots.txt, ...) are never adblocked.
+    try testing.expect(!client.isUrlBlocked("https://ads.example.com/", true));
 }
 
 test "HttpClient: URL blocking exempts internal transfers" {
@@ -3775,6 +3840,7 @@ test "HttpClient: fulfillIntercepted follows a 3xx redirect" {
     // network.cache and the (empty) connection pool are read on this path.
     var net: Network = undefined;
     net.cache = null;
+    net.adblocker = null;
     // An empty pool makes processTransfer queue the re-issued request
     // instead of putting it on the wire — the queue IS the capture.
     net.available = .{};
