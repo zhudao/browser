@@ -77,9 +77,11 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
-    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse
-        (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
+    // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
+    // Opt-in (CI passes it): it needs LLD and costs link time on every build.
+    const orderfile = b.option([]const u8, "orderfile", "Linker script packing hot sections, e.g. orderfile/lightpanda.ld (Linux/LLD release builds)");
 
     const version = resolveVersion(b);
     std.debug.print("Lightpanda {f}\n", .{version});
@@ -115,7 +117,7 @@ pub fn build(b: *Build) !void {
 
     linkV8(b, lightpanda_module, enable_asan, enable_tsan, prebuilt_v8_path, shared_v8);
     linkCurl(b, lightpanda_module, enable_tsan);
-    linkHtml5Ever(b, lightpanda_module);
+    linkRust(b, lightpanda_module);
     linkZenai(b, lightpanda_module);
     linkIsocline(b, lightpanda_module);
     linkSqlite(b, lightpanda_module, enable_csan, enable_tsan);
@@ -140,6 +142,7 @@ pub fn build(b: *Build) !void {
         .target = target,
         .optimize = optimize,
         .use_llvm = use_llvm,
+        .orderfile = orderfile,
         .sanitize_c = enable_csan,
         .sanitize_thread = enable_tsan,
     };
@@ -209,6 +212,7 @@ const ExeConfig = struct {
     target: Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     use_llvm: bool,
+    orderfile: ?[]const u8,
     sanitize_c: ?std.zig.SanitizeC,
     sanitize_thread: bool,
 };
@@ -228,6 +232,10 @@ fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8
             },
         }),
     });
+
+    exe.link_function_sections = true;
+    exe.link_data_sections = true;
+    if (config.orderfile) |path| exe.linker_script = .{ .cwd_relative = path };
 
     const exe_check = b.addLibrary(.{
         .name = check_name,
@@ -299,6 +307,14 @@ fn actionDefault(action: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Per-function/per-datum sections let the -Dorderfile linker script place
+/// individual hot functions; gc-sections already relies on them for pruning.
+fn sectionize(lib: *Build.Step.Compile) *Build.Step.Compile {
+    lib.link_function_sections = true;
+    lib.link_data_sections = true;
+    return lib;
+}
+
 fn linkV8(
     b: *Build,
     mod: *Build.Module,
@@ -323,42 +339,56 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkHtml5Ever(b: *Build, mod: *Build.Module) void {
+fn linkRust(b: *Build, mod: *Build.Module) void {
     const is_debug = mod.optimize.? == .Debug;
 
+    // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
     const exec_cargo = b.addSystemCommand(&.{
         "cargo",           "build",
         "--profile",       if (is_debug) "dev" else "release",
         "--features",      if (is_debug) "memstats" else "",
-        "--manifest-path", "src/html5ever/Cargo.toml",
+        "--manifest-path", "src/rust/ffi/Cargo.toml",
     });
 
-    // Track Rust sources so edits invalidate the cargo step's cache.
-    // Without this, Zig keys the step on argv only and won't re-run cargo
-    // when lib.rs/Cargo.toml change.
-    for ([_][]const u8{
-        "src/html5ever/Cargo.toml",
-        "src/html5ever/Cargo.lock",
-        "src/html5ever/lib.rs",
-        "src/html5ever/sink.rs",
-        "src/html5ever/types.rs",
-        "src/html5ever/url.rs",
-    }) |path| {
-        exec_cargo.addFileInput(b.path(path));
-    }
+    addDirInputs(b, exec_cargo, "src/rust", "target") catch |err| {
+        std.debug.panic("walk src/rust: {t}", .{err});
+    };
+
+    // Cargo reports progress on stderr; left uncaptured, Zig prints it as a
+    // "failed command: ..." diagnostic on a successful build. A non-zero exit
+    // still surfaces the captured output.
+    _ = exec_cargo.captureStdErr(.{});
 
     // don't let cargo's progress report (sent to stderr) cause Zig's build to
     // print a 'failed command: ...' message. (non-zero status still outputs the error)
     _ = exec_cargo.captureStdErr(.{});
 
     // TODO: We can prefer `--artifact-dir` once it become stable.
-    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "html5ever");
+    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "rust");
 
-    const html5ever_step = b.step("html5ever", "Install html5ever dependency (requires cargo)");
-    html5ever_step.dependOn(&exec_cargo.step);
+    const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
+    rust_step.dependOn(&exec_cargo.step);
 
-    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblitefetch_html5ever.a");
+    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblightpanda_ffi.a");
     mod.addObjectFile(obj);
+}
+
+/// Registers every file under `root` (relative to the build root) as an
+/// input of `run`, skipping the `skip_dir` subtree at any depth.
+fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []const u8) !void {
+    const io = b.graph.io;
+    var dir = try b.build_root.handle.openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => if (std.mem.eql(u8, entry.basename, skip_dir)) walker.leave(io),
+            .file => run.addFileInput(b.path(b.pathJoin(&.{ root, entry.path }))),
+            else => {},
+        }
+    }
 }
 
 fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool) void {
@@ -367,7 +397,7 @@ fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is
         .optimize = mod.optimize.?,
     });
 
-    const lib = dep.artifact("sqlite3");
+    const lib = sectionize(dep.artifact("sqlite3"));
     lib.root_module.sanitize_c = enable_csan;
     lib.root_module.sanitize_thread = is_tsan;
 
@@ -467,7 +497,7 @@ fn buildZlib(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Opti
     const dep = b.dependency("zlib", .{});
 
     const mod = cLibModule(b, target, optimize, is_tsan);
-    const lib = b.addLibrary(.{ .name = "z", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "z", .root_module = mod }));
     lib.installHeadersDirectory(dep.path(""), "", .{});
     mod.addCSourceFiles(.{
         .root = dep.path(""),
@@ -495,9 +525,9 @@ fn buildBrotli(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.Op
     const mod = cLibModule(b, target, optimize, is_tsan);
     mod.addIncludePath(dep.path("c/include"));
 
-    const brotlicmn = b.addLibrary(.{ .name = "brotlicommon", .root_module = mod });
-    const brotlidec = b.addLibrary(.{ .name = "brotlidec", .root_module = mod });
-    const brotlienc = b.addLibrary(.{ .name = "brotlienc", .root_module = mod });
+    const brotlicmn = sectionize(b.addLibrary(.{ .name = "brotlicommon", .root_module = mod }));
+    const brotlidec = sectionize(b.addLibrary(.{ .name = "brotlidec", .root_module = mod }));
+    const brotlienc = sectionize(b.addLibrary(.{ .name = "brotlienc", .root_module = mod }));
 
     brotlicmn.installHeadersDirectory(dep.path("c/include/brotli"), "brotli", .{});
     mod.addCSourceFiles(.{
@@ -538,10 +568,10 @@ fn buildBoringSsl(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin
         .force_pic = true,
     });
 
-    const ssl = dep.artifact("ssl");
+    const ssl = sectionize(dep.artifact("ssl"));
     ssl.bundle_ubsan_rt = false;
 
-    const crypto = dep.artifact("crypto");
+    const crypto = sectionize(dep.artifact("crypto"));
     crypto.bundle_ubsan_rt = false;
 
     return .{ ssl, crypto };
@@ -562,7 +592,7 @@ fn buildNghttp2(b: *Build, target: Build.ResolvedTarget, optimize: std.builtin.O
     });
     mod.addConfigHeader(config);
 
-    const lib = b.addLibrary(.{ .name = "nghttp2", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "nghttp2", .root_module = mod }));
 
     lib.installConfigHeader(config);
     lib.installHeadersDirectory(dep.path("lib/includes/nghttp2"), "nghttp2", .{});
@@ -841,7 +871,7 @@ fn buildCurl(
     });
     curl_config.addValues(config);
 
-    const lib = b.addLibrary(.{ .name = "curl", .root_module = mod });
+    const lib = sectionize(b.addLibrary(.{ .name = "curl", .root_module = mod }));
     mod.addConfigHeader(curl_config);
     lib.installHeadersDirectory(dep.path("include/curl"), "curl", .{});
     mod.addCSourceFiles(.{
