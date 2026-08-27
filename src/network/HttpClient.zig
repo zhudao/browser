@@ -140,6 +140,11 @@ use_proxy: bool,
 // Current TLS verification state, applied per-connection in makeRequest.
 tls_verify: bool = true,
 
+// Test-only fault injection: makes the next submit() fail synchronously from
+// inside the pipeline, the shape where error_callback fires AND the error is
+// returned to the caller (see Transfer.submit).
+test_fail_submit: if (lp.IS_TEST) ?anyerror else void = if (lp.IS_TEST) null else {},
+
 // User agent override set via CDP Emulation.setUserAgentOverride.
 // When set, takes precedence over the config's http_headers value.
 // Allocated from self.allocator when set, null otherwise.
@@ -914,6 +919,12 @@ const SubmitFrom = enum { start, after_intercept, network };
 fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
     sw: switch (from) {
         .start => {
+            if (comptime lp.IS_TEST) {
+                if (self.test_fail_submit) |err| {
+                    return err;
+                }
+            }
+
             if (self.network.web_bot_auth) |wba| {
                 const authority = URL.getHost(transfer.req.url);
                 try wba.signRequest(transfer, authority);
@@ -1225,69 +1236,6 @@ const SyncContext = struct {
         self.completion = .shutdown;
     }
 };
-
-// Synchronous submit for a transfer created with newRequest. Like `submit`,
-// `syncRequest` consuems the transfer unconditionally.
-// Caller must deinit SyncResponse or otherwise take ownership of its optional arena
-pub fn syncRequest(self: *Client, transfer: *Transfer) !SyncResponse {
-    if (self.inbox.terminated) {
-        transfer.deinit();
-        return error.ClientDisconnected;
-    }
-    // A parser can start another blocking script/style fetch while unwinding
-    // a previous interrupted fetch. The first tickSync below would fail
-    // anyway; bail before submitting and notifying CDP.
-    if (self.hasPendingTeardown()) {
-        transfer.deinit();
-        return error.SyncWaitInterrupted;
-    }
-
-    var sync_ctx = SyncContext{ .client = self, .body = .empty };
-    errdefer if (sync_ctx.arena) |arena| arena.release();
-
-    const req = &transfer.req;
-    req.sync = true;
-    req.ctx = &sync_ctx;
-    req.header_callback = SyncContext.headerCallback;
-    req.data_callback = SyncContext.dataCallback;
-    req.done_callback = SyncContext.doneCallback;
-    req.error_callback = SyncContext.errorCallback;
-    req.shutdown_callback = SyncContext.shutdownCallback;
-
-    const frame_id = req.frame_id;
-    self.blocking_requests.putNoClobber(self.allocator, frame_id, transfer.id) catch |err| {
-        transfer.deinit();
-        return err;
-    };
-    defer self.releaseBlocking(frame_id);
-
-    try transfer.submit();
-
-    while (sync_ctx.completion == .in_progress) {
-        self.tickSync(200) catch |err| {
-            if (sync_ctx.completion == .in_progress) {
-                // tick failed for a reason unrelated to our transfer: OOM,
-                // client disconnect, or a queued teardown command (which
-                // sync_wait can't dispatch mid-parse — it would free the
-                // Page/Frame this stack holds). transfer.req.ctx points at
-                // &sync_ctx on this stack — abort to sever that reference
-                // before we return
-                transfer.abort(err);
-            }
-            return err;
-        };
-    }
-
-    switch (sync_ctx.completion) {
-        .in_progress => @panic("Impossible to be in progress here."),
-        .done, .shutdown => return .{
-            .status = sync_ctx.status,
-            .body = sync_ctx.body,
-            .arena = sync_ctx.arena,
-        },
-        .err => |e| return e,
-    }
-}
 
 fn processTransfer(self: *Client, transfer: *Transfer) !void {
     if (self.network.getConnection()) |conn| {
@@ -2283,6 +2231,69 @@ pub const Transfer = struct {
         };
     }
 
+    pub fn submitSync(self: *Transfer) !SyncResponse {
+        const client = self.client;
+
+        if (client.inbox.terminated) {
+            self.deinit();
+            return error.ClientDisconnected;
+        }
+
+        // A parser can start another blocking script/style fetch while unwinding
+        // a previous interrupted fetch. The first tickSync below would fail
+        // anyway; bail before submitting and notifying CDP.
+        if (client.hasPendingTeardown()) {
+            self.deinit();
+            return error.SyncWaitInterrupted;
+        }
+
+        var sync_ctx = SyncContext{ .client = client, .body = .empty };
+        errdefer if (sync_ctx.arena) |arena| arena.release();
+
+        const req = &self.req;
+        req.sync = true;
+        req.ctx = &sync_ctx;
+        req.header_callback = SyncContext.headerCallback;
+        req.data_callback = SyncContext.dataCallback;
+        req.done_callback = SyncContext.doneCallback;
+        req.error_callback = SyncContext.errorCallback;
+        req.shutdown_callback = SyncContext.shutdownCallback;
+
+        const frame_id = req.frame_id;
+        client.blocking_requests.putNoClobber(client.allocator, frame_id, self.id) catch |err| {
+            self.deinit();
+            return err;
+        };
+        defer client.releaseBlocking(frame_id);
+
+        try self.submit();
+
+        while (sync_ctx.completion == .in_progress) {
+            client.tickSync(200) catch |err| {
+                if (sync_ctx.completion == .in_progress) {
+                    // tick failed for a reason unrelated to our transfer: OOM,
+                    // client disconnect, or a queued teardown command (which
+                    // sync_wait can't dispatch mid-parse — it would free the
+                    // Page/Frame this stack holds). transfer.req.ctx points at
+                    // &sync_ctx on this stack — abort to sever that reference
+                    // before we return
+                    self.abort(err);
+                }
+                return err;
+            };
+        }
+
+        switch (sync_ctx.completion) {
+            .in_progress => @panic("Impossible to be in progress here."),
+            .done, .shutdown => return .{
+                .status = sync_ctx.status,
+                .body = sync_ctx.body,
+                .arena = sync_ctx.arena,
+            },
+            .err => |e| return e,
+        }
+    }
+
     pub fn deinit(self: *Transfer) void {
         if (self._retired) {
             // transfer.deinit should be called once. But _retired and the graveyard
@@ -2857,6 +2868,14 @@ pub const Transfer = struct {
             }
             break :blk resolved;
         };
+
+        // When the redirect target is not same-origin with the current URL,
+        // the Authorization header must not follow the request to the new
+        // origin.
+        // _auth_challenge is always cleared thanks to detectAuthChallenge.
+        if (!URL.isSameOrigin(url, req.url)) {
+            transfer.removeHeader("Authorization");
+        }
 
         try transfer.updateURL(url);
         // 301, 302, 303 → change to GET, drop body.
@@ -3672,6 +3691,7 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
         .single_flight = .init(testing.allocator),
     };
     client.url_blocklist = null;
+    client.test_fail_submit = null;
     // isUrlBlocked reaches through here for the adblocker; tests that want
     // one assign it to `client.network` after this returns.
     test_network.adblocker = null;
