@@ -410,17 +410,6 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._http_owner = undefined,
     };
     self._queued_events = &self._queued_events_1;
-    self._http_owner = .{
-        .blob_urls = &page.blob_urls,
-        .origin = &self.origin,
-        .url = &self.url,
-        .parent = if (parent) |p| &p._http_owner else null,
-        .frame_id = frame_id,
-        .document_frame_id = frame_id,
-        .loader_id = self._loader_id,
-        .cookie_jar = &session.cookie_jar,
-        .notification = session.notification,
-    };
 
     var screen: *Screen = undefined;
     var visual_viewport: *VisualViewport = undefined;
@@ -442,7 +431,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._proto = undefined,
         ._document = self.document,
         ._location = undefined,
-        ._performance = .init(),
+        ._performance = .init(factory, arena),
         ._screen = screen,
         ._visual_viewport = visual_viewport,
         ._cross_origin_wrapper = undefined,
@@ -458,6 +447,19 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     }
     self.window._cross_origin_wrapper = .{ .window = self.window };
 
+    self._http_owner = .{
+        .blob_urls = &page.blob_urls,
+        .origin = &self.origin,
+        .url = &self.url,
+        .parent = if (parent) |p| &p._http_owner else null,
+        .frame_id = frame_id,
+        .document_frame_id = frame_id,
+        .loader_id = self._loader_id,
+        .cookie_jar = &session.cookie_jar,
+        .notification = session.notification,
+        .performance = &self.window._performance,
+    };
+
     self._style_manager = try StyleManager.init(self);
     errdefer self._style_manager.deinit();
 
@@ -472,6 +474,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .local_arena = self.local_arena,
     });
     errdefer browser.env.destroyContext(self.js);
+    self.window._performance._scheduler = &self.js.scheduler;
 
     const location = try Location.init("about:blank", self);
     // We're holding a reference in Zig-side.
@@ -854,8 +857,10 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         // do, they probably don't want the cached version.
         .skip_cache = self.parent == null,
         .throttle = self.parent == null,
-        .cookie_origin = opts.initiator_url,
+        .origin = self.origin,
         .resource_type = .document,
+        .request_mode = .navigate,
+        .credentials_mode = .include,
         .header_callback = frameHeaderDoneCallback,
         .data_callback = frameDataCallback,
         .done_callback = frameDoneCallback,
@@ -2379,6 +2384,9 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     const transfer = http_client.newRequest(.{
         .url = resolved,
         .method = .GET,
+        .origin = self.origin,
+        .request_mode = .no_cors,
+        .credentials_mode = .same_origin,
         .resource_type = .stylesheet,
         .shutdown_callback = HttpClient.noopShutdown, // syncRequest installs its own
     }, &self._http_owner) catch |err| {
