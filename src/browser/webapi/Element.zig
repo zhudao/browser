@@ -1153,6 +1153,41 @@ pub fn remove(self: *Element, frame: *Frame) void {
     frame.removeNode(parent, node, .{ .reconnect_to = null });
 }
 
+// The tabindex of a focusable area, or null when the element can't take focus
+// at all. A negative value is still focusable, just skipped by sequential
+// focus navigation.
+// https://html.spec.whatwg.org/multipage/interaction.html#focusable-area
+pub fn focusTabIndex(self: *Element) ?i32 {
+    if (self.isDisabled()) {
+        return null;
+    }
+    if (self.is(Html) == null) {
+        return null;
+    }
+
+    if (self.getAttributeInterned("tabindex")) |attr| {
+        return Html.parseInteger(attr) orelse 0;
+    }
+
+    return switch (self.getTag()) {
+        .button, .select, .textarea, .iframe => 0,
+        .input => if (self.as(Html.Input)._input_type != .hidden) 0 else null,
+        .anchor, .area => if (self.getAttributeInterned("href") != null) 0 else null,
+        else => null,
+    };
+}
+
+// A focusable area that can take focus right now: connected and being rendered.
+pub fn isFocusable(self: *Element, frame: *Frame, comptime access: StyleManager.InlineAccess) bool {
+    if (self.focusTabIndex() == null) {
+        return false;
+    }
+    if (self.asNode().isConnected() == false) {
+        return false;
+    }
+    return self.isVisible(frame, access);
+}
+
 pub fn focus(self: *Element, frame: *Frame) !void {
     if (self.asNode().isConnected() == false) {
         // a disconnected node cannot take focus
@@ -1161,7 +1196,7 @@ pub fn focus(self: *Element, frame: *Frame) !void {
 
     // Per HTML spec §6.4.4, an element must be "being rendered" (not
     // display:none on self or any ancestor) to be focusable.
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return;
     }
 
@@ -1170,7 +1205,7 @@ pub fn focus(self: *Element, frame: *Frame) !void {
     const new_target = self.asEventTarget();
     const doc = self.asNode().ownerDocument(frame) orelse frame.document;
     const old_active = doc._active_element;
-    doc._active_element = self;
+    doc.setActiveElement(self, frame);
 
     if (old_active) |old| {
         if (old == self) {
@@ -1203,7 +1238,7 @@ pub fn blur(self: *Element, frame: *Frame) !void {
     const doc = self.asNode().ownerDocument(frame) orelse frame.document;
     if (doc._active_element != self) return;
 
-    doc._active_element = null;
+    doc.setActiveElement(null, frame);
 
     const FocusEvent = @import("event/FocusEvent.zig");
     const old_target = self.asEventTarget();
@@ -1349,29 +1384,15 @@ pub fn parentElement(self: *Element) ?*Element {
     return self.asNode().parentElement();
 }
 
-/// Cache for visibility checks - re-exported from StyleManager for convenience.
-pub const VisibilityCache = StyleManager.VisibilityCache;
-
-/// Cache for pointer-events checks - re-exported from StyleManager for convenience.
-pub const PointerEventsCache = StyleManager.PointerEventsCache;
-
 // Style checks go through the StyleManager of the element's own frame, not
 // the caller's: its stylesheets and materialized inline styles are per-frame,
 // and a same-origin script can reach an element in another frame.
-pub fn hasPointerEventsNone(self: *Element, cache: ?*PointerEventsCache, frame: *Frame) bool {
-    return self.ownerFrame(frame)._style_manager.hasPointerEventsNone(self, cache);
+pub fn hasPointerEventsNone(self: *Element, frame: *Frame, comptime access: StyleManager.InlineAccess) bool {
+    return self.ownerFrame(frame)._style_manager.hasPointerEventsNone(self, access);
 }
 
-pub fn checkVisibilityCached(self: *Element, cache: ?*VisibilityCache, frame: *Frame, comptime access: StyleManager.InlineAccess) bool {
-    return !self.ownerFrame(frame)._style_manager.isHidden(self, cache, .{}, access);
-}
-
-// The element's own display:none only, no ancestor walk. For a child or
-// sibling of an element already known to be visible, that is the whole
-// answer: they share the visible ancestor chain — and the owner frame, which
-// the caller resolves once rather than per element.
-fn isVisibleSelf(self: *Element, style_manager: *StyleManager) bool {
-    return !style_manager.hasDisplayNone(self, .materialize);
+pub fn isVisible(self: *Element, frame: *Frame, comptime access: StyleManager.InlineAccess) bool {
+    return !self.ownerFrame(frame)._style_manager.isHidden(self, .{}, access);
 }
 
 const CheckVisibilityOpts = struct {
@@ -1382,7 +1403,7 @@ const CheckVisibilityOpts = struct {
 };
 pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, frame: *Frame) bool {
     const opts = opts_ orelse CheckVisibilityOpts{};
-    return !self.ownerFrame(frame)._style_manager.isHidden(self, null, .{
+    return !self.ownerFrame(frame)._style_manager.isHidden(self, .{
         .check_opacity = opts.checkOpacity or opts.opacityProperty,
         .check_visibility = opts.visibilityProperty or opts.checkVisibilityCSS,
     }, .materialize);
@@ -1439,7 +1460,7 @@ pub fn getClientHeight(self: *Element, frame: *Frame) f64 {
 }
 
 fn clientAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
     return self.viewportAxis(frame, axis) orelse self.boxAxis(frame, axis);
@@ -1487,7 +1508,7 @@ pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
 // getBoundingClientRect, getClientRects, and IntersectionObserver. A DOMRect is
 // only materialized at the JS boundary.
 pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return .{};
     }
     return self.boundingClientRectValuesForVisible(frame);
@@ -1504,7 +1525,7 @@ pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect
 }
 
 pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return &.{};
     }
     const rects = try frame.local_arena.alloc(*DOMRect, 1);
@@ -1556,7 +1577,7 @@ pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
 }
 
 pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
 
@@ -1573,7 +1594,7 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
 }
 
 pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
 
@@ -1623,7 +1644,7 @@ fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
     var child = self.asNode().firstChild();
     while (child) |node| : (child = node.nextSibling()) {
         if (node.is(Element)) |el| {
-            if (el.isVisibleSelf(style_manager)) {
+            if (!style_manager.hasDisplayNone(el, .materialize)) {
                 total += el.getElementAxis(frame, axis).value;
             }
         }
@@ -1635,35 +1656,35 @@ fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
 // Unlike clientHeight, the root's offsetHeight is its box (the document
 // extent), so it stays on the synthetic root default.
 pub fn getOffsetHeight(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
     return self.boxAxis(frame, .height);
 }
 
 pub fn getOffsetWidth(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
     return self.boxAxis(frame, .width);
 }
 
 pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
     return calculateDocumentPosition(self.asNode());
 }
 
 pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
-    if (!self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.isVisible(frame, .materialize)) {
         return 0.0;
     }
     return self.horizontalPosition(frame);
 }
 
 pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
-    if (!self.asNode().isConnected() or !self.checkVisibilityCached(null, frame, .materialize)) {
+    if (!self.asNode().isConnected() or !self.isVisible(frame, .materialize)) {
         return null;
     }
 
@@ -1802,7 +1823,7 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
         while (sibling) |s| : (sibling = s.nextSibling()) {
             if (s == current) break;
             if (s.is(Element)) |el| {
-                if (el.isVisibleSelf(style_manager)) {
+                if (!style_manager.hasDisplayNone(el, .materialize)) {
                     x += el.getElementAxis(frame, .width).value;
                 }
             }

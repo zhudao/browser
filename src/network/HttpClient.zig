@@ -46,7 +46,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Method = http.Method;
 pub const Header = http.Header;
-pub const HeaderIterator = http.HeaderIterator;
+const HeaderIterator = http.HeaderIterator;
 
 // This is loosely tied to a browser Frame. Loading all the <scripts>, doing
 // XHR requests, and loading imports all happens through here. Sine the app
@@ -570,7 +570,7 @@ pub fn cancelRequests(self: *Client, owner: *Owner) void {
 }
 
 // Point-in-time snapshot of the client's outstanding work
-pub const Activity = struct {
+const Activity = struct {
     // in-flight + buffered-awaiting-dispatch + parked-for-CDP-interception
     http: usize,
 
@@ -1499,23 +1499,33 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
 
         defer msg.deinit();
 
-        switch (msg.payload) {
-            .cdp, .bidi => driver.onMessage(msg) catch |err| {
-                // A single malformed/failed dispatch shouldn't poison
-                // the rest of the batch — log and continue.
-                log.err(.app, "client dispatch", .{ .err = err });
+        const done = switch (msg.payload) {
+            .cdp, .bidi => blk: {
+                driver.onMessage(msg) catch |err| {
+                    // A single malformed/failed dispatch shouldn't poison
+                    // the rest of the batch — log and continue.
+                    log.err(.app, "client dispatch", .{ .err = err });
+                };
+                break :blk false;
             },
-            .ping => |body| driver.onPing(body),
-            .close => {
-                driver.onClose();
-                self.disconnected = true;
-                return error.ClientDisconnected;
+            .ping => |body| blk: {
+                driver.onPing(body);
+                break :blk false;
             },
-            .disconnect => |err| {
-                driver.onDisconnect(err);
-                self.disconnected = true;
-                return error.ClientDisconnected;
+            .link => |link| blk: {
+                driver.onLink(link);
+                break :blk false;
             },
+            .quit => blk: {
+                driver.onQuit();
+                break :blk true; // quit always shutsdown
+            },
+            .close => driver.onClose(), // close is up to the driver if it shutsdown
+            .disconnect => |err| driver.onDisconnect(err), // same with disconnect
+        };
+        if (done) {
+            self.disconnected = true;
+            return error.ClientDisconnected;
         }
     }
 }
@@ -1534,7 +1544,7 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
 // eval frame above us will dereference.
 fn allowDuringSyncWait(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .ping, .close, .disconnect => true,
+        .ping, .close, .disconnect, .quit, .link => true,
         .cdp => |c| isFetchInterceptionMethod(c.input.method),
         // BiDi has no request interception yet, so nothing it can send is
         // safe to dispatch from inside a JS callback.
@@ -1544,8 +1554,8 @@ fn allowDuringSyncWait(msg: *Inbox.Message) bool {
 
 fn isTerminal(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .close, .disconnect => true,
-        .ping, .cdp, .bidi => false,
+        .close, .disconnect, .quit => true,
+        .ping, .cdp, .bidi, .link => false,
     };
 }
 
@@ -1562,8 +1572,8 @@ fn isFetchInterceptionMethod(method: []const u8) bool {
 // teardown command sits undispatched behind the sync_wait allowlist.
 fn isSyncWaitInterrupt(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .close, .disconnect => true,
-        .ping => false,
+        .close, .disconnect, .quit => true,
+        .ping, .link => false,
         .cdp => |c| isTeardownMethod(c.input.method),
         // Frames aren't parsed on the Network thread for BiDi, so we
         // can't spot a teardown command without re-parsing here.
@@ -1850,12 +1860,12 @@ fn ensureNoActiveConnection(self: *const Client) !void {
 }
 
 pub const Request = struct {
-    pub const StartCallback = *const fn (transfer: *Transfer) anyerror!void;
-    pub const HeaderCallback = *const fn (transfer: *Transfer) anyerror!Transfer.HeaderResult;
-    pub const DataCallback = *const fn (transfer: *Transfer, data: []const u8) anyerror!void;
-    pub const DoneCallback = *const fn (ctx: *anyopaque) anyerror!void;
-    pub const ErrorCallback = *const fn (ctx: *anyopaque, err: anyerror) void;
-    pub const ShutdownCallback = *const fn (ctx: *anyopaque) void;
+    const StartCallback = *const fn (transfer: *Transfer) anyerror!void;
+    const HeaderCallback = *const fn (transfer: *Transfer) anyerror!Transfer.HeaderResult;
+    const DataCallback = *const fn (transfer: *Transfer, data: []const u8) anyerror!void;
+    const DoneCallback = *const fn (ctx: *anyopaque) anyerror!void;
+    const ErrorCallback = *const fn (ctx: *anyopaque, err: anyerror) void;
+    const ShutdownCallback = *const fn (ctx: *anyopaque) void;
 
     pub const ResourceType = enum {
         document,
@@ -1887,7 +1897,7 @@ pub const Request = struct {
 
     // Fetch request redirect mode. `.follow` keeps navigations, XHR and
     // internal requests transparently following redirects.
-    pub const RedirectMode = enum { follow, manual, @"error" };
+    const RedirectMode = enum { follow, manual, @"error" };
 
     // How much of a headers_only body we'll read rather than abort. Draining
     // costs bandwidth but keeps the connection poolable; aborting saves
@@ -1996,7 +2006,7 @@ pub const Request = struct {
     }
 };
 
-pub const SyncResponse = struct {
+const SyncResponse = struct {
     status: u16,
     body: std.ArrayList(u8),
 
@@ -2207,11 +2217,11 @@ pub const Owner = struct {
         return .{ .url = own_url };
     }
 
-    pub fn addTransfer(self: *Owner, t: *Transfer) void {
+    fn addTransfer(self: *Owner, t: *Transfer) void {
         self.transfers.append(&t.owner_node);
     }
 
-    pub fn removeTransfer(self: *Owner, t: *Transfer) void {
+    fn removeTransfer(self: *Owner, t: *Transfer) void {
         self.transfers.remove(&t.owner_node);
     }
 
@@ -3305,7 +3315,7 @@ pub const Transfer = struct {
     }
 
     // `url` must have transfer-arena lifetime: it's stored as-is, not duped.
-    pub fn updateURL(self: *Transfer, url: [:0]const u8) !void {
+    fn updateURL(self: *Transfer, url: [:0]const u8) !void {
         self.req.url = url;
     }
 
@@ -3445,7 +3455,7 @@ pub const Transfer = struct {
         self.req.basic_auth_credentials = userpwd;
     }
 
-    pub const RequestHeader = struct {
+    const RequestHeader = struct {
         name: []const u8,
         value: []const u8,
         source: HeaderSource = .user_agent,
@@ -3455,9 +3465,9 @@ pub const Transfer = struct {
     // setHeader/appendHeader let a source overwrite headers from its own or
     // a lower layer, never a higher one. .fixed is hardcoded and can't be
     // changed (Sec-Ch-Ua). For CORS, only script-set headers cause a preflight.
-    pub const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
+    const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
 
-    pub const HeaderOpts = struct {
+    const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
     };
 
@@ -4390,11 +4400,26 @@ test "HttpClient: adblock verdicts apply per request" {
         \\||typed.example.com^$script
         \\||partied.example.com^$third-party
         \\||framed.example.com^$subdocument
+        \\/\/[a-z]{4}\.js$/$match-case,script
     );
     try blocker.parse(&list);
     try blocker.build();
     client.network.adblocker = blocker;
     defer client.network.adblocker = null;
+
+    // A regex filter reads the URL as requested: case kept, fragment gone.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/abcd.js",
+        .resource_type = .script,
+    }));
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/abcd.js#v2",
+        .resource_type = .script,
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/ABCD.js",
+        .resource_type = .script,
+    }));
 
     try testing.expect(testIsUrlBlocked(&client, .{ .url = "https://ads.example.com/pixel.gif" }));
     // Hostnames are matched case-insensitively and without the port.
