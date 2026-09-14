@@ -348,6 +348,11 @@ pub const Connection = struct {
         try libcurl.curl_easy_setopt(easy, .copy_post_fields, body.ptr);
     }
 
+    pub fn setNoBody(self: *const Connection) !void {
+        const easy = self._easy;
+        try libcurl.curl_easy_setopt(easy, .no_body, true);
+    }
+
     pub fn setGetMode(self: *const Connection) !void {
         try libcurl.curl_easy_setopt(self._easy, .http_get, true);
     }
@@ -454,6 +459,9 @@ pub const Connection = struct {
         // timeouts
         try libcurl.curl_easy_setopt(self._easy, .timeout_ms, config.httpTimeout());
         try libcurl.curl_easy_setopt(self._easy, .connect_timeout_ms, config.httpConnectTimeout());
+
+        // Otherwise requests issued before ALPN settles each open a socket.
+        try libcurl.curl_easy_setopt(self._easy, .pipewait, true);
 
         // compression, don't remove this. CloudFront will send gzip content
         // even if we don't support it, and then it won't be decompressed.
