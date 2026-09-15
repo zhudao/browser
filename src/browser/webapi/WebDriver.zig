@@ -97,7 +97,7 @@ fn getNamedCookie(_: *const WebDriver, name: []const u8, frame: *Frame) ?WebDriv
 
     jar.removeExpired(null);
     for (jar.cookies.items) |*cookie| {
-        if (cookie.appliesTo(&target, true, true, true) == false) {
+        if (cookie.appliesTo(&target, .{ .same_site = true, .is_http = true, .kind = .navigation }) == false) {
             continue;
         }
         if (std.mem.eql(u8, cookie.name, name) == false) {
@@ -626,17 +626,9 @@ fn dispatchWheel(el: *Element, delta_x: i32, delta_y: i32, frame: *Frame) void {
         return;
     }
 
-    // Apply the scroll and fire a trusted scroll event, mirroring actions.scroll.
-    const new_left: i32 = @as(i32, @intCast(el.getScrollLeft(frame))) + delta_x;
-    const new_top: i32 = @as(i32, @intCast(el.getScrollTop(frame))) + delta_y;
-    el.setScrollLeft(new_left, frame) catch {};
-    el.setScrollTop(new_top, frame) catch {};
-
-    const scroll_evt = Event.initTrusted(comptime .wrap("scroll"), .{ .bubbles = true }, frame._page) catch |err| {
-        log.warn(.app, "webdriver scroll event", .{ .err = err });
-        return;
+    Frame.user_input.wheelScroll(el, delta_x, delta_y, frame) catch |err| {
+        log.warn(.app, "webdriver scroll", .{ .err = err });
     };
-    dispatch(el.asEventTarget(), scroll_evt, frame, "scroll");
 }
 
 fn dispatch(target: *EventTarget, event: *Event, frame: *Frame, typ: []const u8) void {
@@ -649,7 +641,7 @@ fn hasNonPassiveListener(el: *Element, typ: []const u8, frame: *Frame) bool {
     // Listeners live in the event manager of the element's own frame (and the
     // propagation path ends at that frame's window), which is not the caller's
     // frame when the element belongs to e.g. an iframe's document.
-    const owner = el.ownerFrame(frame);
+    const owner = el.ownerFrame(frame) orelse return false;
     const base = &owner._event_manager.base;
     var current: ?*@import("Node.zig") = el.asNode();
     while (current) |node| : (current = node.parentNode()) {

@@ -22,6 +22,7 @@ const lp = @import("lightpanda");
 const js = @import("../js/js.zig");
 const dump = @import("../dump.zig");
 const Frame = @import("../Frame.zig");
+const StyleManager = @import("../StyleManager.zig");
 const Factory = @import("../Factory.zig");
 
 const CSS = @import("CSS.zig");
@@ -219,6 +220,10 @@ pub fn is(self: *Element, comptime T: type) ?*T {
 
 pub fn as(self: *Element, comptime T: type) *T {
     return self.is(T).?;
+}
+
+pub fn getDocument(self: *Element, frame: *const Frame) *Node.Document {
+    return self.asNode().getDocument(frame);
 }
 
 pub fn asNode(self: *Element) *Node {
@@ -568,7 +573,7 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
 
     var fragment: ?*Node = null;
     if (html.len > 0) {
-        const frag = (try Node.DocumentFragment.init(frame)).asNode();
+        const frag = (try Node.DocumentFragment.init(node.getDocument(frame), frame)).asNode();
         // The parent is the parse context (a fragment parent means body).
         try Frame.parse.fragment(frame, frag, html, .{ .context = parent.is(Element) });
         fragment = frag;
@@ -936,7 +941,7 @@ pub fn insertAdjacentText(
         error.AdjacentNoParent => return,
         else => return err,
     };
-    const text_node = try Frame.node_factory.createTextNode(frame, data);
+    const text_node = try Frame.node_factory.createTextNode(self.getDocument(frame), data);
     _ = try target_node.insertBefore(text_node, prev_node, frame);
 }
 
@@ -1001,7 +1006,7 @@ pub fn getAttributeNamedNodeMap(self: *Element, frame: *Frame) !*Attribute.Named
 // the caller's: attributeChange (which resyncs it) is dispatched on the owner
 // frame, and a same-origin script can reach an element in another frame.
 pub fn getOrCreateStyle(self: *Element, frame: *Frame) !*CSSStyleProperties {
-    const owner = self.ownerFrame(frame);
+    const owner = self.ownerFrame(frame) orelse frame;
     const gop = try owner._element_styles.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try CSSStyleProperties.init(self, false, owner);
@@ -1014,7 +1019,7 @@ pub fn existingStyle(self: *Element, frame: *Frame) ?*CSSStyleProperties {
     if (!self._flags.has_inline_style) {
         return null;
     }
-    return self.ownerFrame(frame)._element_styles.get(self);
+    return (self.ownerFrame(frame) orelse frame)._element_styles.get(self);
 }
 
 /// The inline style object, parsed from the style attribute on first use;
@@ -1128,7 +1133,7 @@ pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame
     var rm_ref_node = true;
 
     for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(frame);
+        const child = try node_or_text.toNode(self.getDocument(frame));
 
         // If a child is the ref node. We keep it at its own current position.
         if (child == ref_node) {
@@ -1290,7 +1295,7 @@ pub fn before(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !vo
     const parent = node.parentNode() orelse return;
 
     for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(frame);
+        const child = try node_or_text.toNode(self.getDocument(frame));
         _ = try parent.insertBefore(child, node, frame);
     }
 }
@@ -1301,7 +1306,7 @@ pub fn after(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !voi
     const viable_next = Node.NodeOrText.viableNextSibling(node, nodes);
 
     for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(frame);
+        const child = try node_or_text.toNode(self.getDocument(frame));
         _ = try parent.insertBefore(child, viable_next, frame);
     }
 }
@@ -1405,11 +1410,13 @@ pub fn parentElement(self: *Element) ?*Element {
 // the caller's: its stylesheets and materialized inline styles are per-frame,
 // and a same-origin script can reach an element in another frame.
 pub fn hasPointerEventsNone(self: *Element, frame: *Frame) bool {
-    return self.ownerFrame(frame)._style_manager.hasPointerEventsNone(self);
+    const owner = self.ownerFrame(frame) orelse return false;
+    return owner._style_manager.hasPointerEventsNone(self);
 }
 
 pub fn isVisible(self: *Element, frame: *Frame) bool {
-    return !self.ownerFrame(frame)._style_manager.isHidden(self, .{});
+    const owner = self.ownerFrame(frame) orelse return false;
+    return !owner._style_manager.isHidden(self, .{});
 }
 
 const CheckVisibilityOpts = struct {
@@ -1420,7 +1427,8 @@ const CheckVisibilityOpts = struct {
 };
 pub fn checkVisibility(self: *Element, opts_: ?CheckVisibilityOpts, frame: *Frame) bool {
     const opts = opts_ orelse CheckVisibilityOpts{};
-    return !self.ownerFrame(frame)._style_manager.isHidden(self, .{
+    const owner = self.ownerFrame(frame) orelse return false;
+    return !owner._style_manager.isHidden(self, .{
         .check_opacity = opts.checkOpacity or opts.opacityProperty,
         .check_visibility = opts.visibilityProperty or opts.checkVisibilityCSS,
     });
@@ -1556,13 +1564,13 @@ pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
 // owner frame first so the state, the fired events and the document
 // comparison stay in the element's frame.
 pub fn getScrollTop(self: *Element, frame: *Frame) u32 {
-    const owner = self.ownerFrame(frame);
+    const owner = self.ownerFrame(frame) orelse return 0;
     const pos = owner._element_scroll_positions.get(self) orelse return 0;
     return pos.y;
 }
 
 pub fn setScrollTop(self: *Element, value: i32, frame: *Frame) !void {
-    const owner = self.ownerFrame(frame);
+    const owner = self.ownerFrame(frame) orelse return;
     const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
@@ -1575,13 +1583,13 @@ pub fn setScrollTop(self: *Element, value: i32, frame: *Frame) !void {
 }
 
 pub fn getScrollLeft(self: *Element, frame: *Frame) u32 {
-    const owner = self.ownerFrame(frame);
+    const owner = self.ownerFrame(frame) orelse return 0;
     const pos = owner._element_scroll_positions.get(self) orelse return 0;
     return pos.x;
 }
 
 pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
-    const owner = self.ownerFrame(frame);
+    const owner = self.ownerFrame(frame) orelse return;
     const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
@@ -1591,6 +1599,45 @@ pub fn setScrollLeft(self: *Element, value: i32, frame: *Frame) !void {
         gop.value_ptr.x = new_x;
         try self.scheduleScrollEvents(owner);
     }
+}
+
+pub const ScrollAxes = struct { x: bool = false, y: bool = false };
+
+/// Nearest ancestor-or-self that is a scroll container along any of `axes`.
+/// null once the chain reaches html/body: those scroll the viewport.
+pub fn scrollContainer(self: *Element, axes: ScrollAxes, frame: *Frame) ?*Element {
+    if (!axes.x and !axes.y) return null;
+    const owner = self.ownerFrame(frame) orelse return null;
+    const style_manager = &owner._style_manager;
+    var current: ?*Element = self;
+    while (current) |el| : (current = el.parentElement()) {
+        const tag = el.getTag();
+        if (tag == .html or tag == .body) return null;
+        if ((axes.x and el.overflowScrolls(.x, style_manager)) or (axes.y and el.overflowScrolls(.y, style_manager))) {
+            return el;
+        }
+    }
+    return null;
+}
+
+// Only inline `overflow` is resolved: computed styles don't cascade stylesheet
+// rules, so a sheet-declared scroll container is treated as page content.
+fn overflowScrolls(self: *Element, axis: enum { x, y }, style_manager: *StyleManager) bool {
+    const longhand = switch (axis) {
+        .x => style_manager.inlineStyleValue(self, comptime .wrap("overflow-x")),
+        .y => style_manager.inlineStyleValue(self, comptime .wrap("overflow-y")),
+    };
+    const value = longhand orelse blk: {
+        // `overflow: <x> [<y>]`; a single value applies to both axes.
+        const shorthand = style_manager.inlineStyleValue(self, comptime .wrap("overflow")) orelse return false;
+        var it = std.mem.tokenizeAny(u8, shorthand, &std.ascii.whitespace);
+        const x = it.next() orelse return false;
+        break :blk switch (axis) {
+            .x => x,
+            .y => it.next() orelse x,
+        };
+    };
+    return std.ascii.eqlIgnoreCase(value, "auto") or std.ascii.eqlIgnoreCase(value, "scroll");
 }
 
 pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
@@ -1656,7 +1703,8 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
 // script actually consists of.
 fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
     var total: f64 = 0;
-    const style_manager = &self.ownerFrame(frame)._style_manager;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const style_manager = &owner._style_manager;
 
     var child = self.asNode().firstChild();
     while (child) |node| : (child = node.nextSibling()) {
@@ -1824,7 +1872,8 @@ fn countSubtreeNodes(node: *Node) f64 {
 pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
     var x: f64 = 0.0;
     var current = self.asNode();
-    const style_manager = &self.ownerFrame(frame)._style_manager;
+    const owner = self.ownerFrame(frame) orelse return 0;
+    const style_manager = &owner._style_manager;
 
     if (self.inlineStyle(frame)) |style| {
         x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
@@ -1863,9 +1912,9 @@ pub fn getElementsByClassName(self: *Element, class_name: []const u8, frame: *Fr
     return self.asNode().getElementsByClassName(class_name, frame);
 }
 
-pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
+pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {
     const tag_name = self.getTagNameDump();
-    const node = try Frame.node_factory.createElementNS(frame, self._namespace, tag_name, &self._attributes);
+    const node = try Frame.node_factory.createElementNS(document, self._namespace, tag_name, &self._attributes);
 
     // A namespace outside the built-in set lives in a side table; the clone
     // must report the same namespaceURI.
@@ -1896,7 +1945,7 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
             const cloned_shadow_node = cloned_shadow.asNode();
             var shadow_child_it = shadow.asNode().childrenIterator();
             while (shadow_child_it.next()) |child| {
-                if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
+                if (try child.cloneNodeForAppending(true, document, frame)) |cloned_child| {
                     try frame.appendNode(cloned_shadow_node, cloned_child, .{});
                 }
             }
@@ -1906,7 +1955,7 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
     if (deep) {
         var child_it = self.asNode().childrenIterator();
         while (child_it.next()) |child| {
-            if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
+            if (try child.cloneNodeForAppending(true, document, frame)) |cloned_child| {
                 try frame.appendNode(node, cloned_child, .{});
             }
         }
@@ -1939,36 +1988,41 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) 
     frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
 }
 
-const ScrollToOpts = union(enum) {
+// The scrollTo/scrollBy argument shape shared with Window: positional (x, y)
+// or a dictionary.
+pub const ScrollToOpts = union(enum) {
     x: i32,
     opts: Opts,
 
-    const Opts = struct {
+    pub const Opts = struct {
         behavior: []const u8 = "",
         left: ?i32 = null,
         top: ?i32 = null,
     };
+
+    pub const Offsets = struct { left: ?i32, top: ?i32 };
+
+    /// Per-axis values; null leaves that axis where it is. Only the dictionary
+    /// form can omit an axis.
+    pub fn offsets(self: ScrollToOpts, y: ?i32) Offsets {
+        return switch (self) {
+            .x => |x| .{ .left = x, .top = y orelse 0 },
+            .opts => |o| .{ .left = o.left, .top = o.top },
+        };
+    }
 };
 
 pub fn scrollTo(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
-    const o = opts orelse return;
-    const owner = self.ownerFrame(frame);
+    const o = (opts orelse return).offsets(y);
+    const owner = self.ownerFrame(frame) orelse return;
     const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
     const old_x = gop.value_ptr.x;
     const old_y = gop.value_ptr.y;
-    switch (o) {
-        .x => |x| {
-            gop.value_ptr.x = @intCast(@max(0, x));
-            gop.value_ptr.y = @intCast(@max(0, y orelse 0));
-        },
-        .opts => |dict| {
-            if (dict.left) |left| gop.value_ptr.x = @intCast(@max(0, left));
-            if (dict.top) |top| gop.value_ptr.y = @intCast(@max(0, top));
-        },
-    }
+    if (o.left) |left| gop.value_ptr.x = @intCast(@max(0, left));
+    if (o.top) |top| gop.value_ptr.y = @intCast(@max(0, top));
     if (gop.value_ptr.x != old_x or gop.value_ptr.y != old_y) {
         try self.scheduleScrollEvents(owner);
     }
@@ -1976,20 +2030,16 @@ pub fn scrollTo(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !vo
 
 // scrollBy(): like scrollTo() but relative to the current position.
 pub fn scrollBy(self: *Element, opts: ?ScrollToOpts, y: ?i32, frame: *Frame) !void {
-    const o = opts orelse return;
-    const owner = self.ownerFrame(frame);
+    const o = (opts orelse return).offsets(y);
+    const owner = self.ownerFrame(frame) orelse return;
     const gop = try owner._element_scroll_positions.getOrPut(owner.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
-    const dx: i32, const dy: i32 = switch (o) {
-        .x => |x| .{ x, y orelse 0 },
-        .opts => |dict| .{ dict.left orelse 0, dict.top orelse 0 },
-    };
     const old_x = gop.value_ptr.x;
     const old_y = gop.value_ptr.y;
-    gop.value_ptr.x = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.x)) +| dx));
-    gop.value_ptr.y = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.y)) +| dy));
+    gop.value_ptr.x = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.x)) +| (o.left orelse 0)));
+    gop.value_ptr.y = @intCast(@max(0, @as(i32, @intCast(gop.value_ptr.y)) +| (o.top orelse 0)));
     if (gop.value_ptr.x != old_x or gop.value_ptr.y != old_y) {
         try self.scheduleScrollEvents(owner);
     }
@@ -2187,8 +2237,8 @@ pub fn getTag(self: *const Element) Tag {
     };
 }
 
-pub fn ownerFrame(self: *const Element, default: *Frame) *Frame {
-    return self.asConstNode().ownerFrame(default);
+pub fn ownerFrame(self: *const Element, frame: *const Frame) ?*Frame {
+    return self.asConstNode().ownerFrame(frame);
 }
 
 pub const Tag = enum {

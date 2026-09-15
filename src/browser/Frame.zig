@@ -151,7 +151,6 @@ _element_rel_lists: Element.RelListLookup = .empty,
 _element_part_lists: Element.PartListLookup = .empty,
 _element_token_lists: Element.TokenListLookup = .empty,
 _element_shadow_roots: Element.ShadowRootLookup = .empty,
-_node_owner_documents: Node.OwnerDocumentLookup = .empty,
 _element_scroll_positions: Element.ScrollPositionLookup = .empty,
 _element_namespace_uris: Element.NamespaceUriLookup = .empty,
 _svg_animated_enumerations: AnimatedEnumeration.Lookup = .empty,
@@ -255,9 +254,6 @@ _custom_element_creation: enum {
     // constructor must not run (you end up in an endless loop if the constructor
     // does this.innerHTML = '...', which happens).
     bare_context,
-    // The target document has no custom element registry (e.g. DOMParser). The
-    // element stays undefined until it's inserted into the frame's document.
-    undefined,
 } = .construct,
 
 // List of custom elements that were created before their definition was registered
@@ -484,6 +480,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     location.acquireRef();
     self.window._location = location;
 
+    lp.assert(document._page == page, "unexpected document page", .{});
     document._frame = self;
 
     if (comptime lp.IS_TEST == false) {
@@ -497,11 +494,6 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
                 }
             }.runIdleTasks, 200, .{ .name = "frame.runIdleTasks", .blocks_done = false });
         }
-    }
-
-    if (parent == null) {
-        // no point reporting this for each child page
-        session.browser.reportJsHeap();
     }
 }
 
@@ -576,9 +568,6 @@ pub fn deinit(self: *Frame) void {
     const browser = page.session.browser;
 
     browser.http_client.abortOwner(&self._http_owner);
-    if (self.parent == null) {
-        browser.reportJsHeap();
-    }
 
     // fired the last moment the js context is still alive
     page.session.notification.dispatch(.frame_destroyed, self);
@@ -589,6 +578,10 @@ pub fn deinit(self: *Frame) void {
     for (self.workers.items) |worker| {
         worker.deinit();
     }
+
+    // The document outlives the frame (it's nodes stay reachable from any other
+    // live frame)
+    self.document._frame = null;
 
     self._script_manager.base.shutdown = true;
 
@@ -872,6 +865,9 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         .skip_cache = self.parent == null,
         .throttle = self.parent == null,
         .origin = self.origin,
+        // Our own url is already the destination, so the owner's site for
+        // cookies would say "same-site" for any top-level navigation.
+        .cookie_origin = opts.initiator_url,
         .resource_type = .document,
         .request_mode = .navigate,
         .credentials_mode = .include,
@@ -1308,10 +1304,6 @@ pub fn documentIsComplete(self: *Frame) void {
     if (self._maybe_meta_refresh) {
         self._maybe_meta_refresh = false;
         self.metaRefreshOnLoad();
-    }
-
-    if (self.parent == null) {
-        self._session.browser.reportJsHeap();
     }
 }
 
@@ -2594,20 +2586,9 @@ pub fn nodeComplete(self: *Frame, node: *Node) !void {
     return self.nodeIsReady(true, node);
 }
 
-// Sets the owner document for a node. Only stores entries for nodes whose owner
-// is NOT frame.document to minimize memory overhead.
-pub fn setNodeOwnerDocument(self: *Frame, node: *Node, owner: *Document) !void {
-    if (owner == self.document) {
-        // No need to store if it's the main document - remove if present
-        _ = self._node_owner_documents.remove(node);
-    } else {
-        try self._node_owner_documents.put(self.arena, node, owner);
-    }
-}
-
 // Recursively sets the owner document for a node and all its descendants
 pub fn adoptNodeTree(self: *Frame, node: *Node, old_owner: *Document, new_owner: *Document) !void {
-    try self.setNodeOwnerDocument(node, new_owner);
+    node._owner = new_owner._index;
 
     // Per spec, adopted steps run on each element after its document is set.
     if (node.is(Element)) |el| {
@@ -3253,31 +3234,31 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
             }
         }
 
-        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
         frame.scriptAddedCallback(from_parser, script) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "script", .type = frame._type, .url = frame.url });
             return err;
         };
     } else if (node.is(IFrame)) |iframe| {
-        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
         frame.iframeAddedCallback(iframe) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "iframe", .type = frame._type, .url = frame.url });
             return err;
         };
     } else if (node.is(Element.Html.Meta)) |meta| {
-        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
         meta.processRefresh(frame) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "meta", .type = frame._type, .url = frame.url });
             return err;
         };
     } else if (node.is(Element.Html.Link)) |link| {
-        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
         link.linkAddedCallback(frame) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "link", .type = frame._type });
             return error.LinkLoadError;
         };
     } else if (node.is(Element.Html.Style)) |style| {
-        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        const frame = if (comptime from_parser) self else (node.ownerFrame(self) orelse return);
         style.styleAddedCallback(frame) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "style", .type = frame._type });
             return error.StyleLoadError;
@@ -3613,7 +3594,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
 
     const target: TargetFrame = blk: {
         const target_name = target_name_ orelse {
-            break :blk .{ .frame = form_element.ownerFrame(self) };
+            break :blk .{ .frame = form_element.ownerFrame(self) orelse return };
         };
         break :blk self.resolveTargetFrame(target_name);
     };
@@ -3780,7 +3761,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     // no stray window.
     const target_frame = switch (target) {
         .frame => |f| f,
-        .blank => try form_element.ownerFrame(self).openBlankTarget(form_element, ""),
+        .blank => try (form_element.ownerFrame(self) orelse return).openBlankTarget(form_element, ""),
     };
     return self.scheduleNavigationWithArena(arena, action, opts, .{ .form = target_frame });
 }
