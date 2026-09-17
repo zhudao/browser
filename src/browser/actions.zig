@@ -22,7 +22,6 @@ const DOMNode = @import("webapi/Node.zig");
 const Element = @import("webapi/Element.zig");
 const Event = @import("webapi/Event.zig");
 const MouseEvent = @import("webapi/event/MouseEvent.zig");
-const PointerEvent = @import("webapi/event/PointerEvent.zig");
 const KeyboardEvent = @import("webapi/event/KeyboardEvent.zig");
 const Frame = @import("Frame.zig");
 const Session = @import("Session.zig");
@@ -39,41 +38,6 @@ fn dispatchInputAndChangeEvents(el: *Element, frame: *Frame) !void {
     };
 }
 
-fn dispatch(el: *Element, event: *Event, comptime typ: []const u8, frame: *Frame) !bool {
-    return frame._event_manager.dispatchCancelable(el.asEventTarget(), event) catch |err| {
-        lp.log.err(.app, "click " ++ typ ++ " failed", .{ .err = err });
-        return error.ActionFailed;
-    };
-}
-
-fn dispatchPointer(el: *Element, comptime typ: []const u8, buttons: u16, detail: u32, frame: *Frame) !bool {
-    const event: *PointerEvent = try .initTrusted(typ, .{
-        .bubbles = true,
-        .cancelable = true,
-        .composed = true,
-        .buttons = buttons,
-        .detail = detail,
-        .pointerId = 1,
-        .pointerType = "mouse",
-        .isPrimary = true,
-        .pressure = if (buttons != 0) 0.5 else 0.0,
-    }, frame);
-    return dispatch(el, event.asEvent(), typ, frame);
-}
-
-fn dispatchMouse(el: *Element, comptime typ: []const u8, buttons: u16, frame: *Frame) !bool {
-    const event: *MouseEvent = try .initTrusted(comptime .wrap(typ), .{
-        .bubbles = true,
-        .cancelable = true,
-        .composed = true,
-        .buttons = buttons,
-        .detail = 1,
-    }, frame);
-    return dispatch(el, event.asEvent(), typ, frame);
-}
-
-/// The trusted primary-button gesture a real user click produces; widgets key
-/// off pointerdown/mousedown, not click alone.
 pub fn click(node: *DOMNode, frame: *Frame) !void {
     const el = node.is(Element) orelse return error.InvalidNodeType;
 
@@ -83,25 +47,10 @@ pub fn click(node: *DOMNode, frame: *Frame) !void {
 
     Frame.user_input.updateHoverTarget(frame, el, .{ .with_pointer = true });
 
-    // preventDefault() on pointerdown suppresses both compatibility mouse
-    // events (mousedown and mouseup) for the rest of this gesture; click
-    // still fires.
-    const suppress_mouse = try dispatchPointer(el, "pointerdown", 1, 0, frame);
-    if (!suppress_mouse) {
-        const suppress_focus = try dispatchMouse(el, "mousedown", 1, frame);
-        if (!suppress_focus) {
-            Frame.user_input.focusForMouseDown(frame, el) catch |err| {
-                lp.log.warn(.app, "click mousedown focus", .{ .err = err });
-            };
-        }
-    }
-
-    _ = try dispatchPointer(el, "pointerup", 0, 0, frame);
-    if (!suppress_mouse) {
-        _ = try dispatchMouse(el, "mouseup", 0, frame);
-    }
-
-    _ = try dispatchPointer(el, "click", 0, 1, frame);
+    Frame.user_input.triggerClick(frame, el, .{}) catch |err| {
+        lp.log.err(.app, "click failed", .{ .err = err });
+        return error.ActionFailed;
+    };
 }
 
 pub fn hover(node: *DOMNode, frame: *Frame) !void {
@@ -288,9 +237,13 @@ pub fn fill(node: *DOMNode, text: []const u8, frame: *Frame) !void {
 }
 
 pub const ScrollResult = struct {
-    /// What moved: the given node, its nearest scroll container, or null for
-    /// the window.
-    scrolled: ?*DOMNode,
+    /// What scrolled. Always the node the caller named, its nearest scroll
+    /// container, or the window.
+    target: union(enum) {
+        window,
+        node: *DOMNode,
+        container: *DOMNode,
+    },
     x: u32,
     y: u32,
 };
@@ -301,17 +254,22 @@ pub fn scroll(node: ?*DOMNode, x: ?i32, y: ?i32, frame: *Frame) !ScrollResult {
             lp.log.err(.app, "scroll failed", .{ .err = err });
             return error.ActionFailed;
         };
-        return .{ .scrolled = null, .x = frame.window.getScrollX(), .y = frame.window.getScrollY() };
+        return .{ .target = .window, .x = frame.window.getScrollX(), .y = frame.window.getScrollY() };
     };
     const el = n.is(Element) orelse return error.InvalidNodeType;
 
-    const target = el.scrollContainer(.{ .x = x != null, .y = y != null }, frame) orelse el;
+    // A node with no scroll container scrolls itself, not the viewport: the
+    // caller named it.
+    const target = switch (el.scrollContainer(.{ .x = x != null, .y = y != null }, frame)) {
+        .container => |container| container,
+        .viewport => el,
+    };
     target.scrollTo(.{ .opts = .{ .left = x, .top = y } }, null, frame) catch |err| {
         lp.log.err(.app, "scroll failed", .{ .err = err });
         return error.ActionFailed;
     };
     return .{
-        .scrolled = target.asNode(),
+        .target = if (target == el) .{ .node = n } else .{ .container = target.asNode() },
         .x = target.getScrollLeft(frame),
         .y = target.getScrollTop(frame),
     };

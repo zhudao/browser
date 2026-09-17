@@ -37,6 +37,7 @@ const AnimatedLength = @import("webapi/svg/AnimatedLength.zig");
 const AnimatedNumber = @import("webapi/svg/AnimatedNumber.zig");
 const AnimatedString = @import("webapi/svg/AnimatedString.zig");
 const AnimatedTransformList = @import("webapi/svg/AnimatedTransformList.zig");
+const ServiceWorkerGlobalScope = @import("webapi/ServiceWorkerGlobalScope.zig");
 const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRatio.zig");
 
 const Allocator = std.mem.Allocator;
@@ -185,6 +186,10 @@ input_modifiers: if (lp.build_config.wpt_extensions) @import("frame/user_input.z
 // The element the synthetic pointer is currently over
 input_hover_target: ?*Element = null,
 
+// Per-gesture button state for the synthetic mouse pointer; see
+// user_input.PointerButtons.
+input_pointer: @import("frame/user_input.zig").PointerButtons = .{},
+
 // Popup Frames opened by window.open. They are top-level browsing contexts
 // (parent == null, no iframe element) but share this Page's factory, arena,
 // and identity map.
@@ -201,6 +206,11 @@ closed_frames: std.ArrayList(*Frame) = .empty,
 // SharedWorkerGlobalScopes created by this Page's frames (also registered in
 // session.shared_workers so other pages can connect).
 shared_workers: std.ArrayList(*SharedWorkerGlobalScope) = .empty,
+
+// ServiceWorkerGlobalScopes created by this Page's frames. The page "owns" it,
+// but it's also shared with the Session so that two registers with the same URL
+// return the same SWGS, even across pages (but the owning page will tear it down)
+service_workers: std.ArrayList(*ServiceWorkerGlobalScope) = .empty,
 
 // In-flight navigation for a root page. When not null, this page will "replace"
 // the referenced page once the response header arrives. This is necessary
@@ -284,6 +294,11 @@ pub fn deinit(self: *Page) void {
         scope.deinit();
     }
     self.shared_workers = .empty;
+
+    for (self.service_workers.items) |scope| {
+        scope.deinit();
+    }
+    self.service_workers = .empty;
 
     {
         if (comptime lp.IS_DEBUG) {

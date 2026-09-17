@@ -1196,6 +1196,19 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
         out.clearRetainingCapacity();
     }
 
+    // The container may be declared in a stylesheet rather than inline.
+    {
+        const leaf = frame.document.getElementById("sheetleaf", frame).?.asNode();
+        const leaf_id = (try server.active_session.registry.register(leaf)).id;
+        const outer = frame.document.getElementById("sheetscroll", frame).?.asNode();
+        const outer_id = (try server.active_session.registry.register(outer)).id;
+        const msg = try std.fmt.allocPrint(aa, "{{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\",\"params\":{{\"name\":\"scroll\",\"arguments\":{{\"backendNodeId\":{d},\"y\":30}}}}}}", .{leaf_id});
+        try router.handleMessage(server, aa, msg);
+        const expected = try std.fmt.allocPrint(aa, "Scrolled scroll container (backendNodeId: {d}) of element (backendNodeId: {d}) to x: 0, y: 30", .{ outer_id, leaf_id });
+        try testing.expect(std.mem.indexOf(u8, out.written(), expected) != null);
+        out.clearRetainingCapacity();
+    }
+
     // Without a node the window scrolls; an omitted axis keeps its offset.
     {
         try router.handleMessage(server, aa,
@@ -1279,8 +1292,8 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
 
     const result = try ls.local.exec(
         \\ JSON.stringify(window.seq) === JSON.stringify([
-        \\   'pointerdown:0:1:mouse:true', 'mousedown:0:1::true',
-        \\   'pointerup:0:0:mouse:true', 'mouseup:0:0::true', 'click:0:0:mouse:true'
+        \\   'pointerdown:0:1:0:mouse:true', 'mousedown:0:1:1::true',
+        \\   'pointerup:0:0:0:mouse:true', 'mouseup:0:0:1::true', 'click:0:0:1:mouse:true'
         \\ ]) &&
         \\ JSON.stringify(window.seqPrevented) === JSON.stringify(['pointerdown', 'pointerup', 'click']) &&
         \\ JSON.stringify(window.disabledEvents) === '[]' &&
@@ -1289,6 +1302,7 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
         \\ window.changed === true && window.selChanged === 'opt2' &&
         \\ document.getElementById('outerscroll').scrollTop === 30 &&
         \\ document.getElementById('innerleaf').scrollTop === 0 &&
+        \\ document.getElementById('sheetscroll').scrollTop === 30 &&
         \\ document.getElementById('plain').scrollTop === 7 &&
         \\ window.scrollX === 5 && window.scrollY === 20 &&
         \\ window.hovered === true &&
@@ -1446,6 +1460,36 @@ test "MCP - findElement" {
         ;
         try router.handleMessage(server, aa, msg);
         try testing.expect(std.mem.indexOf(u8, out.written(), "error") != null);
+        out.clearRetainingCapacity();
+    }
+
+    {
+        const msg =
+            \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"findElement","arguments":{"name":"/^PREVENT.*default$/i"}}}
+        ;
+        try router.handleMessage(server, aa, msg);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "Prevent Default") != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "Click Me") == null);
+        out.clearRetainingCapacity();
+    }
+
+    {
+        const msg =
+            \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"findElement","arguments":{"name":"/(/"}}}
+        ;
+        try router.handleMessage(server, aa, msg);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "\"isError\":true") != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "missing closing parenthesis at offset 1") != null);
+        out.clearRetainingCapacity();
+    }
+
+    {
+        const msg =
+            \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"findElement","arguments":{"name":"/prevent/g"}}}
+        ;
+        try router.handleMessage(server, aa, msg);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "\"isError\":true") != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), "unsupported regex flag 'g' in '/prevent/g'") != null);
         out.clearRetainingCapacity();
     }
 }
