@@ -556,7 +556,7 @@ pub fn base(self: *const Frame) [:0]const u8 {
     return self.base_url orelse self.url;
 }
 
-fn referrerSource(self: *const Frame) [:0]const u8 {
+pub fn referrerSource(self: *const Frame) [:0]const u8 {
     var frame = self;
     while (std.mem.startsWith(u8, frame.url, "about:")) {
         // about:blank and about:srcdoc documents aren't valid referrer sources,
@@ -594,7 +594,9 @@ pub fn httpMetadata(self: *const Frame) HttpMetadata {
 
 // Add common headers for a request:
 // * referer
-pub fn headersForRequest(self: *Frame, transfer: *HttpClient.Transfer) !void {
+pub fn headersForRequest(self: *Frame, transfer: *HttpClient.Transfer, opts: JS.Execution.HeadersForRequestOptions) !void {
+    if (!opts.referer) return;
+
     const arena = transfer.arena.allocator();
     if (try referrer.compute(arena, self.referrer_policy, self.referrerSource(), transfer.req.url)) |ref| {
         try transfer.setHeader("Referer", ref, .{});
@@ -1075,7 +1077,7 @@ pub fn makeRequest(self: *Frame, req: HttpClient.Request) !void {
     const transfer = try self._session.browser.http_client.newRequest(req, &self._http_owner);
     {
         errdefer transfer.deinit();
-        try self.headersForRequest(transfer);
+        try self.headersForRequest(transfer, .{});
     }
     transfer.submit() catch {};
 }
@@ -2434,7 +2436,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     {
         errdefer transfer.deinit();
         try transfer.setHeader("Accept", "text/css,*/*;q=0.1", .{});
-        try self.headersForRequest(transfer);
+        try self.headersForRequest(transfer, .{});
     }
 
     // Set the script-manager `is_evaluating` flag for the same reason
@@ -2694,6 +2696,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
     child._parent = null;
 
     Element.Html.Select.childRemoved(parent, child);
+    Element.Html.Picture.childRemoved(parent, child, next_sibling, self);
 
     // Update live ranges for removal (DOM spec remove steps 4-7)
     if (child_index_for_ranges) |idx| {
@@ -2937,6 +2940,12 @@ fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, 
     child._parent = parent;
 
     Element.Html.Select.childInserted(parent, child);
+    if (child.is(Element.Html.Image)) |img| {
+        // noop if it didn't actually change
+        try img.sourceChanged(self);
+    } else {
+        try Element.Html.Picture.childInserted(parent, child, self);
+    }
 
     // Update live ranges for insertion (DOM spec insert step 6).
     // For .before/.after the child was inserted at a specific position;
