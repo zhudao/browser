@@ -23,6 +23,24 @@
   }
 </script>
 
+<script id="service_worker_absent_outside_secure_context" type=module>
+  // navigator.serviceWorker is [SecureContext]. A data: document has an opaque
+  // origin, so it isn't one, and (like Chrome) doesn't get the accessor.
+  {
+    const state = await testing.async();
+    window.addEventListener('message', (e) => state.resolve(e.data));
+
+    const f = document.createElement('iframe');
+    f.src = "data:text/html,<script>parent.postMessage({secure: isSecureContext, sw: 'serviceWorker' in navigator}, '*')<\/script>";
+    document.body.appendChild(f);
+
+    await state.done((data) => {
+      testing.expectEqual(false, data.secure);
+      testing.expectEqual(false, data.sw);
+    });
+  }
+</script>
+
 <script id="service_worker_realm_exclusions" type=module>
   // A service worker's realm is worker_common_apis, not worker_extended_apis:
   // the blocking APIs a dedicated/shared worker gets must not be there. A
@@ -54,6 +72,7 @@
       // Both realms keep the async pieces.
       testing.expectEqual(true, fromDedicated.hasFetch);
       testing.expectEqual(true, fromDedicated.hasWebSocket);
+      testing.expectEqual(true, fromDedicated.isSecureContext);
       // CookieStore is [Exposed=(ServiceWorker,Window)]: none of the three
       // should be reachable from a dedicated worker.
       testing.expectEqual(false, fromDedicated.hasCookieStoreCtor);
@@ -364,6 +383,30 @@
       testing.expectTrue(here !== reg);
       // One ServiceWorker object for the one worker.
       testing.expectTrue(reg.active === reg.active);
+    });
+  }
+</script>
+
+<script id="service_worker_precache" type=module>
+  // What the worker's install handler stored is what the page reads: one
+  // store per origin, shared by both realms.
+  {
+    const state = await testing.async();
+    await caches.delete('sw-precache');
+
+    const reg = await navigator.serviceWorker.register('./cache-worker.js', { scope: './precache/' });
+    await workerReached(reg.installing, 'activated');
+
+    const cache = await caches.open('sw-precache');
+    const keys = await cache.keys();
+    const script = await (await caches.match('./lifecycle-worker.js')).text();
+    const json = await (await cache.match('/xhr/json')).json();
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual(2, keys.length);
+      testing.expectTrue(script.includes("seen.push('install')"));
+      testing.expectEqual('9000!!!', json.over);
     });
   }
 </script>

@@ -46,6 +46,7 @@ const WorkerLocation = @import("WorkerLocation.zig");
 const ErrorEvent = @import("event/ErrorEvent.zig");
 const Fetch = @import("net/Fetch.zig");
 const idb = @import("storage/idb/idb.zig");
+const CacheStorage = @import("cache/CacheStorage.zig");
 const MessagePort = @import("MessagePort.zig");
 const SharedWorkerGlobalScope = @import("SharedWorkerGlobalScope.zig");
 const ServiceWorkerGlobalScope = @import("ServiceWorkerGlobalScope.zig");
@@ -79,6 +80,10 @@ local_arena: Allocator,
 url: [:0]const u8,
 // Same-origin constraint: a worker's origin is inherited from its parent frame.
 origin: ?[]const u8 = null,
+// Inherited from the creating frame, captured at creation since the worker
+// can outlive it. Always true for a service worker: only a secure context can
+// register one.
+_secure_context: bool,
 buf: [1024]u8 = undefined, // same size as frame.buf
 // Document charset (matches Page.charset). Workers default to UTF-8.
 charset: []const u8 = "UTF-8",
@@ -109,6 +114,7 @@ _crypto: Crypto = .init,
 _navigator: WorkerNavigator = .init,
 _performance: *Performance,
 _idb_factory: ?*idb.IDBFactory = null,
+_caches: ?*CacheStorage = null,
 _on_error: ?JS.Function.Global = null,
 _on_rejection_handled: ?JS.Function.Global = null,
 _on_unhandled_rejection: ?JS.Function.Global = null,
@@ -149,6 +155,7 @@ pub fn init(
             .url = url,
             .arena = arena,
             .origin = frame.origin,
+            ._secure_context = tag == .service or frame.isSecureContext(),
             .js = undefined,
             ._call_arena = call_arena,
             ._local_arena = local_arena,
@@ -310,6 +317,10 @@ fn getScheduler(self: *WorkerGlobalScope) *Scheduler {
 
 pub fn performance(self: *WorkerGlobalScope) *Performance {
     return self._performance;
+}
+
+fn getIsSecureContext(self: *const WorkerGlobalScope) bool {
+    return self._secure_context;
 }
 
 pub fn getLocation(self: *WorkerGlobalScope) *WorkerLocation {
@@ -545,6 +556,15 @@ fn clearInterval(self: *WorkerGlobalScope, id: u32) void {
     self._timers.clear(id);
 }
 
+fn getCaches(self: *WorkerGlobalScope, exec: *JS.Execution) !*CacheStorage {
+    if (self._caches) |c| {
+        return c;
+    }
+    const c = try exec._factory.create(CacheStorage{});
+    self._caches = c;
+    return c;
+}
+
 fn getIndexedDB(self: *WorkerGlobalScope, exec: *JS.Execution) !*idb.IDBFactory {
     if (self._idb_factory) |f| {
         return f;
@@ -600,6 +620,7 @@ pub const JsApi = struct {
     pub const self = bridge.accessor(WorkerGlobalScope.getSelf, WorkerGlobalScope.setSelf, .{});
     pub const location = bridge.accessor(WorkerGlobalScope.getLocation, null, .{});
     pub const indexedDB = bridge.accessor(WorkerGlobalScope.getIndexedDB, null, .{});
+    pub const caches = bridge.accessor(WorkerGlobalScope.getCaches, null, .{});
 
     pub const onerror = bridge.accessor(WorkerGlobalScope.getOnError, WorkerGlobalScope.setOnError, .{});
     pub const onrejectionhandled = bridge.accessor(WorkerGlobalScope.getOnRejectionHandled, WorkerGlobalScope.setOnRejectionHandled, .{});
@@ -617,6 +638,5 @@ pub const JsApi = struct {
     pub const setInterval = bridge.function(WorkerGlobalScope.setInterval, .{});
     pub const clearInterval = bridge.function(WorkerGlobalScope.clearInterval, .{});
 
-    // Return false since workers don't have secure-context-only APIs
-    pub const isSecureContext = bridge.property(false, .{ .template = false });
+    pub const isSecureContext = bridge.accessor(WorkerGlobalScope.getIsSecureContext, null, .{});
 };
