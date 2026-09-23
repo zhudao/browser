@@ -487,16 +487,44 @@ pub fn wheel(frame: *Frame, target: *Element, x: f64, y: f64, delta_x: f64, delt
     }
 
     // Deltas come from the wire, so guard NaN and saturate the addition.
-    try wheelScroll(target, deltaToScroll(delta_x), deltaToScroll(delta_y), owner);
+    try scrollAxis(target, .width, deltaToScroll(delta_x), owner);
+    try scrollAxis(target, .height, deltaToScroll(delta_y), owner);
 }
 
-/// Each axis scrolls the nearest ancestor-or-self scroll container along it,
-/// else the viewport. Relative deltas may land on different scrollers per
-/// axis, unlike an absolute position.
-fn wheelScroll(target: *Element, delta_x: i32, delta_y: i32, frame: *Frame) !void {
-    // A zero delta resolves to .viewport and scrolls it by nothing.
-    try target.scrollContainer(.{ .x = delta_x != 0 }, frame).scrollBy(delta_x, 0, frame);
-    try target.scrollContainer(.{ .y = delta_y != 0 }, frame).scrollBy(0, delta_y, frame);
+/// A wheel latches to a single scroller and a delta is never split across two,
+/// as in Chrome's FindNodeToLatch (cc/input/input_handler.cc): the whole delta
+/// goes to the nearest ancestor-or-self container that can still move along
+/// this axis. One whose overscroll-behavior doesn't propagate takes the latch
+/// even when it can't move, which ends the walk.
+fn scrollAxis(target: *Element, comptime axis: Element.Axis, delta: i32, frame: *Frame) !void {
+    if (delta == 0) {
+        return;
+    }
+    const axes: Element.ScrollAxes = switch (axis) {
+        .width => .{ .x = true },
+        .height => .{ .y = true },
+    };
+
+    var current: ?*Element = target;
+    while (current) |el| {
+        const container = switch (el.scrollContainer(axes, frame)) {
+            .container => |c| c,
+            .viewport => break,
+        };
+        if (try container.scrollByAxis(axis, delta, frame)) {
+            return;
+        }
+        if (container.containsOverscroll(axes, frame)) {
+            return;
+        }
+        current = container.parentElement();
+    }
+
+    const opts: Element.ScrollToOpts = switch (axis) {
+        .width => .{ .opts = .{ .left = delta } },
+        .height => .{ .opts = .{ .top = delta } },
+    };
+    return frame.window.scrollBy(opts, null, frame);
 }
 
 fn deltaToScroll(d: f64) i32 {
@@ -509,7 +537,7 @@ fn deltaToScroll(d: f64) i32 {
 fn hasClickActivationBehavior(node: *Node) bool {
     const element = node.is(Element) orelse return false;
 
-    const html_element = element.is(Element.Html) orelse return isSvgLink(element);
+    const html_element = element.is(Element.Html) orelse return element.isSvgLink();
 
     return switch (html_element._type) {
         .anchor => element.getAttributeInterned("href") != null,
@@ -519,36 +547,11 @@ fn hasClickActivationBehavior(node: *Node) bool {
     };
 }
 
-// SVG 2 <a> links via `href`; xlink:href is the deprecated SVG 1.1 spelling.
-fn svgAnchorHref(element: *Element) ?[]const u8 {
-    return element.getAttributeInterned("href") orelse element.getAttributeSafe(comptime .wrap("xlink:href"));
-}
-
-fn isSvgLink(element: *Element) bool {
-    return element.is(Element.Svg.Graphics.A) != null and svgAnchorHref(element) != null;
-}
-
-/// Focusable without a tabindex attribute.
-fn isNativelyFocusable(el: *Element) bool {
-    if (el.is(Element.Html) == null) {
-        return isSvgLink(el);
-    }
-    return switch (el.getTag()) {
-        .button, .select, .textarea, .iframe => true,
-        .input => el.as(Element.Html.Input)._input_type != .hidden,
-        .anchor, .area => el.getAttributeInterned("href") != null,
-        else => false,
-    };
-}
-
 // Clicks on editable content are for editing: they don't activate the
 // element or any enclosing link.
-// "contenteditable" is 15 bytes — past the comptime SSO limit — so the
-// String wrap runs at runtime, mirroring Html.getIsContentEditable.
 fn isEditingHost(node: *Node) bool {
     const element = node.is(Element) orelse return false;
-    const value = element.getAttributeSafe(.wrap("contenteditable")) orelse return false;
-    return std.ascii.eqlIgnoreCase(value, "false") == false;
+    return element.isEditingHost();
 }
 
 fn outermostEditingHost(target: *Element) ?*Element {
@@ -570,17 +573,6 @@ fn outermostEditingHost(target: *Element) ?*Element {
     return host.is(Element);
 }
 
-/// Unlike sequential focus, a negative tabindex is still mouse-focusable, and
-/// an unparsable one counts as absent (HTML §6.6.3), not as "not focusable".
-fn isMouseFocusable(el: *Element) bool {
-    if (el.isDisabled()) return false;
-
-    if (el.getAttributeInterned("tabindex")) |attr| {
-        if (Element.Html.parseInteger(attr) != null) return true;
-    }
-    return isNativelyFocusable(el);
-}
-
 /// Mousedown default action. A mousedown outside any focusable element moves
 /// focus to the body.
 pub fn focusForMouseDown(frame: *Frame, target: *Element) !void {
@@ -592,7 +584,9 @@ pub fn focusForMouseDown(frame: *Frame, target: *Element) !void {
     var node: ?*Node = target.asNode();
     while (node) |n| : (node = n._parent) {
         const el = n.is(Element) orelse continue;
-        if (isMouseFocusable(el)) {
+        // Unlike sequential focus navigation, a negative tabindex is still
+        // mouse-focusable, so any focusable area qualifies.
+        if (el.focusTabIndex() != null) {
             try el.focus(frame);
             return;
         }
@@ -690,7 +684,7 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
     const element = target.is(Element) orelse return;
 
     if (element.is(Element.Svg.Graphics.A) != null) {
-        const href = svgAnchorHref(element) orelse return;
+        const href = element.svgAnchorHref() orelse return;
         const target_name = element.getAttributeInterned("target") orelse "";
         return followLink(frame, target, element, href, target_name);
     }
