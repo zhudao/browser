@@ -40,6 +40,7 @@ const DOMImplementation = @import("DOMImplementation.zig");
 const StyleSheetList = @import("css/StyleSheetList.zig");
 const FontFaceSet = @import("css/FontFaceSet.zig");
 const Selection = @import("Selection.zig");
+const Sanitizer = @import("Sanitizer.zig");
 const XPathResult = @import("XPathResult.zig");
 const XPathExpression = @import("XPathExpression.zig");
 
@@ -197,7 +198,7 @@ fn getLastModified(self: *const Document, frame: *Frame) ![]const u8 {
     const timestamp = blk: {
         if (self._frame) |owner| {
             for (owner._http_headers.items) |header| {
-                if (std.ascii.eqlIgnoreCase(header.name, "last-modified")) {
+                if (std.mem.eql(u8, header.name, "last-modified")) {
                     if (dt.DateTime.parse(header.value, .rfc822)) |parsed| {
                         break :blk parsed.unix(.seconds);
                     } else |_| {}
@@ -1549,6 +1550,16 @@ pub const JsApi = struct {
     pub const constructor = bridge.constructor(_constructor, .{});
     fn _constructor(frame: *Frame) !*Document {
         return frame._factory.genericDocument(.{ .url = "about:blank", .charset = "UTF-8" });
+    }
+
+    pub const parseHTML = bridge.function(_parseHTML, .{ .static = true });
+    fn _parseHTML(html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !*Document {
+        return Sanitizer.parseHTML(html, options, true, frame);
+    }
+
+    pub const parseHTMLUnsafe = bridge.function(_parseHTMLUnsafe, .{ .static = true });
+    fn _parseHTMLUnsafe(html: []const u8, options: ?Sanitizer.Options, frame: *Frame) !*Document {
+        return Sanitizer.parseHTML(html, options, false, frame);
     }
 
     pub const onselectionchange = bridge.accessor(Document.getOnSelectionChange, Document.setOnSelectionChange, .{});
