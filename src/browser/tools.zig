@@ -24,6 +24,8 @@ const NodeRegistry = @import("../NodeRegistry.zig");
 
 const DOMNode = @import("webapi/Node.zig");
 const Selector = @import("webapi/selector/Selector.zig");
+const SelectorPath = @import("SelectorPath.zig");
+const Element = @import("webapi/Element.zig");
 
 const log = lp.log;
 const tavily = zenai.search.tavily;
@@ -106,9 +108,7 @@ pub const driver_guidance =
     \\- Triage from `search` snippets before opening links; open only the few
     \\  most promising. Don't re-run a search you already ran, and skip
     \\  near-duplicate sources that repeat the same announcement verbatim.
-    \\- Stop once the gathered material answers the question. For opinion or
-    \\  discussion questions, a couple of high-signal threads (e.g. Hacker
-    \\  News, Reddit) usually beat scraping a dozen news sites.
+    \\- Stop once the gathered material answers the question.
     \\
     \\Selector rules:
     \\- NEVER pass backendNodeId to click/fill/hover/selectOption/setChecked.
@@ -179,9 +179,8 @@ pub const save_synthesis_prompt =
     \\list, fan out to detail pages, aggregate, return) stating what that block
     \\accomplishes toward the goal — NOT restating the API call. One comment per
     \\step, not per line; skip self-evident lines.
-    \\Output ONLY JavaScript source — no markdown fences and no prose outside the
-    \\code, but DO annotate the script with the `//` intent comments described
-    \\above.
+    \\Output the JavaScript source alone, with no markdown fences or prose
+    \\around it.
 ;
 
 /// Script-language rules for consumers that never see the full
@@ -345,7 +344,7 @@ pub const Tool = enum {
     pub fn definition(self: Tool) Definition {
         return switch (self) {
             .goto => .{
-                .description = "Navigate to a specified URL and load the page in memory so it can be reused later for info extraction.",
+                .description = "Navigate the current page to a URL. Returns a short status once `waitUntil` fires (default `load`), or a timeout notice; content rendered by post-load JavaScript may not be there yet (see `waitForState`). The page stays loaded for later reads and actions. To navigate and read in one call, pass `url` to `markdown`, `tree` or `html` instead; use `goto` when the next step is an action or `extract`.",
                 .summary = "Open a URL and keep the page in memory",
                 .input_schema = minify(
                     \\{
@@ -448,7 +447,7 @@ pub const Tool = enum {
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
-                    \\    "script": { "type": "string" },
+                    \\    "script": { "type": "string", "description": "JavaScript run in the page context. A bare trailing expression, or `return` with top-level `await`, is the result." },
                     \\    "url": { "type": "string", "description": "Optional URL to navigate to before evaluating." },
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." },
                     \\    "save": { "type": "string", "description": "Optional bridge-store key. The evaluate's return value is stored under this name and re-exposed as `lp.<name>` to subsequent evaluates. Objects, arrays, and strings are serialized automatically — no JSON.stringify needed." }
@@ -489,7 +488,7 @@ pub const Tool = enum {
                 ),
             },
             .tree => .{
-                .description = "Simplified semantic DOM tree (role, name, value, backendNodeId per node). Pass `backendNodeId` to scope, `maxDepth` to limit depth.",
+                .description = "Semantic outline of the page as indented text: one node per line with its role, accessible name, value and backendNodeId, plus checked state and select options with the selected one marked. The default first read of an unfamiliar page; input and select values are already here, so no `nodeDetails` call is needed to read them. Pass `backendNodeId` to scope to a subtree and `maxDepth` to survey structure before going deeper. Read it again after any page-changing action, since the DOM it describes may have changed; use `nodeDetails` to turn a backendNodeId into a CSS selector for actions.",
                 .summary = "Semantic DOM tree of the page",
                 .input_schema = minify(
                     \\{
@@ -517,17 +516,17 @@ pub const Tool = enum {
                 ),
             },
             .interactiveElements => .{
-                .description = "Extract interactive elements from the opened page. If a url is provided, it navigates to that url first.",
+                .description = "List every visible interactive element on the page as a JSON array: native controls, ARIA widgets, contenteditable regions, elements with event listeners, and focusable elements. Each entry has `backendNodeId`, `tagName`, `role`, `name`, `type` (why it counts as interactive), `tabIndex`, and when present `listeners`, `disabled`, `id`, `class`, `href`, `inputType`, `value`, `elementName` and `placeholder`. Use it to survey what can be acted on; to locate one element by role or name, `findElement` is cheaper. If a url is provided, it navigates there first.",
                 .summary = "List interactive elements on the page",
                 .input_schema = url_params_schema,
             },
             .structuredData => .{
-                .description = "Extract structured data (like JSON-LD, OpenGraph, etc) from the opened page. If a url is provided, it navigates to that url first.",
+                .description = "Page metadata as JSON: `jsonLd` (each JSON-LD block as a string), `openGraph`, `twitterCard`, `meta` and `links` (key/value lists), plus `alternate` (hreflang variants) and `linkHeaders` (relations from the HTTP Link header) when present. Empty sections come back as empty arrays. Use it for publisher-declared facts such as product price, article author or canonical URL before scraping the visible text for them. If a url is provided, it navigates there first.",
                 .summary = "Extract JSON-LD / OpenGraph data",
                 .input_schema = url_params_schema,
             },
             .detectForms => .{
-                .description = "Detect all forms on the page and return their structure including fields, types, and required status. If a url is provided, it navigates to that url first.",
+                .description = "List the forms on the page as JSON: each form's `backendNodeId`, `action`, `method` and `fields`, where each field has `backendNodeId`, `tagName`, `name`, `inputType`, `required`, `disabled`, and when present `value`, `placeholder` and select `options`. Use it before filling a form to see every field it expects. It returns no CSS selectors; get one per field with `nodeDetails` so the fill calls stay replayable. If a url is provided, it navigates there first.",
                 .summary = "List forms and their fields",
                 .input_schema = url_params_schema,
             },
@@ -560,13 +559,14 @@ pub const Tool = enum {
                 ),
             },
             .scroll => .{
-                .description = "Scroll the page or a specific element. Returns the scroll position and current page URL and title.",
+                .description = "Scroll the window, or an element's scroll container, to an absolute position; an omitted axis keeps its current offset. Target an element with a CSS selector (preferred for reproducibility) or a backendNodeId; omit both to scroll the window. Page scripts receive a `scroll` event, so content that loads on scroll (infinite feeds, lazy lists) may appear: read the page again afterwards, with `waitForState` if it is still loading. Returns the final scroll position and the current page URL and title.",
                 .summary = "Scroll the page or an element",
                 .input_schema = minify(
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
-                    \\    "backendNodeId": { "type": "integer", "description": "Optional: The backend node ID of the element to scroll. If the element is not itself a scroll container, its nearest scrollable ancestor is scrolled instead. If omitted (or 0), scrolls the window." },
+                    \\    "selector": { "type": "string", "description": "Optional: CSS selector of the element to scroll. Preferred over backendNodeId. If the element is not itself a scroll container, its nearest scrollable ancestor is scrolled instead." },
+                    \\    "backendNodeId": { "type": "integer", "description": "Optional: The backend node ID of the element to scroll. If the element is not itself a scroll container, its nearest scrollable ancestor is scrolled instead. If neither this nor selector is given (or it is 0), scrolls the window." },
                     \\    "x": { "type": "integer", "description": "Optional: The horizontal scroll offset." },
                     \\    "y": { "type": "integer", "description": "Optional: The vertical scroll offset." }
                     \\  }
@@ -795,6 +795,7 @@ pub const ToolError = error{
     InvalidParams,
     NodeNotFound,
     NavigationFailed,
+    NavigationTimeout,
     Cancelled,
     Timeout,
     InternalError,
@@ -807,6 +808,7 @@ pub fn errorMessage(err: ToolError) []const u8 {
     return switch (err) {
         error.NodeNotFound => "NodeNotFound: the selector or backendNodeId matched nothing on the current page. Re-inspect the page (tree/interactiveElements) for fresh node ids, or omit backendNodeId to target the document root.",
         error.FrameNotLoaded => "FrameNotLoaded: no page is loaded — call goto (or pass a url) first.",
+        error.NavigationTimeout => "NavigationTimeout: no response arrived before the timeout, so the page is empty. Other sessions may be holding every connection (see --http-max-concurrent); retry goto or close idle sessions.",
         else => @errorName(err),
     };
 }
@@ -823,6 +825,9 @@ pub const ToolResult = struct {
     is_error: bool = false,
     /// Only set when the caller passed `CallOpts.inline_image`.
     image: ?lp.screenshot.Prepared = null,
+    /// Resolved before the action runs, because a navigation takes the node
+    /// with it.
+    selector: ?[]const u8 = null,
 };
 
 const GotoParams = struct {
@@ -854,6 +859,9 @@ const NodeAndPage = struct { node: *DOMNode, page: *lp.Frame, target: ActionTarg
 pub const CallOpts = struct {
     /// The caller can hand an image to a model.
     inline_image: bool = false,
+    /// Fill in `ToolResult.selector`: a registry id means nothing in a later
+    /// session, so `--save` cannot replay a call that used one.
+    record: bool = false,
 };
 
 // An inline screenshot is re-sent on every turn; keep it within what models
@@ -886,13 +894,44 @@ pub fn call(
     };
     const substituted = try substituteStringArgs(arena, tool, normalized);
 
-    return dispatch(arena, session, registry, tool, substituted, opts) catch |err| {
+    // Before dispatch, because a navigation takes the node with it. Gated on
+    // `isRecorded` because `SelectorPath.build` is the expensive part of a tool
+    // call and the read-only tools that take a `backendNodeId` -- tree,
+    // markdown, html, nodeDetails -- would only have it thrown away.
+    const selector = if (opts.record and tool.isRecorded())
+        selectorForArgs(arena, session, registry, substituted)
+    else
+        null;
+
+    var result = dispatch(arena, session, registry, tool, substituted, opts) catch |err| {
         if (err == error.NavigationFailed) {
             if (formatNavigationError(arena, session)) |text|
                 return .{ .text = text, .is_error = true };
         }
         return err;
     };
+    result.selector = selector;
+    return result;
+}
+
+/// The CSS selector for a call's `backendNodeId`, so the call can be recorded
+/// in a form that still resolves in a later session.
+fn selectorForArgs(
+    arena: std.mem.Allocator,
+    session: *lp.Session,
+    registry: *NodeRegistry,
+    arguments: ?std.json.Value,
+) ?[]const u8 {
+    const args = arguments orelse return null;
+    if (args != .object) return null;
+    if (args.object.contains("selector")) return null;
+    const id = args.object.get("backendNodeId") orelse return null;
+    if (id != .integer) return null;
+
+    const node = registry.lookup_by_id.get(std.math.cast(NodeRegistry.Id, id.integer) orelse return null) orelse return null;
+    const el = node.dom.is(Element) orelse return null;
+    const frame = session.currentFrame() orelse return null;
+    return SelectorPath.init(arena, frame).build(el) catch null;
 }
 
 fn dispatch(
@@ -1055,7 +1094,7 @@ const api_engines = .{
         .init_options = brave.Client.InitOptions{},
         // text_decorations=false: no <strong> markup in model-read snippets.
         .options = brave.types.SearchOptions{ .count = 10, .text_decorations = false },
-        .format = formatBraveMarkdown,
+        .collect = collectBrave,
     },
     .{
         .tag = SearchEngine.tavily,
@@ -1063,7 +1102,7 @@ const api_engines = .{
         .Client = tavily.Client,
         .init_options = tavily.Client.InitOptions{},
         .options = tavily.types.SearchOptions{ .max_results = 10 },
-        .format = formatTavilyMarkdown,
+        .collect = collectTavily,
     },
     .{
         .tag = SearchEngine.exa,
@@ -1073,7 +1112,7 @@ const api_engines = .{
         // highlights: Exa returns no snippet text unless contents is requested;
         // capped at 3 sentences since the default excerpts run long.
         .options = exa.types.SearchOptions{ .numResults = 10, .contents = .{ .highlights = .{ .numSentences = 3 } } },
-        .format = formatExaMarkdown,
+        .collect = collectExa,
     },
     .{
         .tag = SearchEngine.keenable,
@@ -1083,7 +1122,7 @@ const api_engines = .{
         // snippet_max_length is a hint the API may round up to a word
         // boundary; 500 keeps ten results within a few KB of context.
         .options = keenable.types.SearchOptions{ .max_results = 10, .snippet_max_length = 500 },
-        .format = formatKeenableMarkdown,
+        .collect = collectKeenable,
     },
 };
 
@@ -1131,13 +1170,24 @@ const KeyStatus = struct {
     state: enum { set, keyless, missing },
 };
 
-/// `null` for `.auto`, which has no key of its own.
+fn keyStatusOf(comptime e: anytype) KeyStatus {
+    return .{
+        .env_var = e.env_var,
+        .state = if (engineKey(e)) |key| (if (key != null) .set else .keyless) else |_| .missing,
+    };
+}
+
+/// For `.auto`, the rung the cascade would actually land on -- it has no key of
+/// its own, but "which engine is about to serve, and on what terms" is the
+/// question worth answering, and `.auto` is the default.
 pub fn searchKeyStatus(engine: SearchEngine) ?KeyStatus {
     inline for (api_engines) |e| {
-        if (engine == e.tag) return .{
-            .env_var = e.env_var,
-            .state = if (engineKey(e)) |key| (if (key != null) .set else .keyless) else |_| .missing,
-        };
+        if (engine == e.tag) return keyStatusOf(e);
+    }
+    if (engine != .auto) return null;
+    inline for (api_engines) |e| {
+        const status = keyStatusOf(e);
+        if (status.state != .missing) return status;
     }
     return null;
 }
@@ -1150,19 +1200,25 @@ fn execSearch(arena: std.mem.Allocator, arguments: ?std.json.Value) ToolError!To
     switch (search_engine) {
         .auto => {
             var last_err: ?anyerror = null;
+            var last_label: []const u8 = "web";
+            var last_detail: Failure = .{};
             inline for (api_engines) |engine| {
                 if (engineKey(engine)) |api_key| {
                     // Fall through on any failure so one outage doesn't kill
                     // a whole benchmark run.
-                    if (apiSearch(engine, arena, api_key, timeout_ms, args.query)) |markdown_| {
+                    var detail: Failure = .{};
+                    if (apiSearch(engine, arena, api_key, timeout_ms, args.query, &detail)) |markdown_| {
                         return .{ .text = markdown_ };
                     } else |err| {
                         last_err = err;
+                        last_label = @tagName(engine.tag);
+                        last_detail = detail;
                         log.warn(.browser, @tagName(engine.tag) ++ " fallback", .{ .err = err });
                     }
                 } else |_| {}
             }
-            return searchFailed(arena, "web", last_err.?);
+            // The last engine's reason, not a generic one -- the model can act on it.
+            return searchFailed(arena, last_label, last_err.?, last_detail);
         },
         inline else => |tag| {
             inline for (api_engines) |engine| {
@@ -1180,16 +1236,36 @@ fn searchExplicit(arena: std.mem.Allocator, comptime engine: anytype, timeout_ms
         .text = "web search engine is set to " ++ label ++ " but " ++ engine.env_var ++ " is not set in the environment",
         .is_error = true,
     };
-    const markdown_ = apiSearch(engine, arena, api_key, timeout_ms, query) catch |err|
-        return searchFailed(arena, label, err);
+    var detail: Failure = .{};
+    const markdown_ = apiSearch(engine, arena, api_key, timeout_ms, query, &detail) catch |err|
+        return searchFailed(arena, label, err, detail);
     return .{ .text = markdown_ };
 }
 
-fn searchFailed(arena: std.mem.Allocator, comptime label: []const u8, err: anyerror) ToolError!ToolResult {
-    return .{
-        .text = try std.fmt.allocPrint(arena, label ++ " search failed: {s}", .{@errorName(err)}),
-        .is_error = true,
-    };
+/// Duped out of the client before `deinit` takes it; otherwise the model sees
+/// only the error name.
+const Failure = struct {
+    status: ?u10 = null,
+    message: []const u8 = "",
+};
+
+fn searchFailed(arena: std.mem.Allocator, label: []const u8, err: anyerror, detail: Failure) ToolError!ToolResult {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    writeFailure(&aw.writer, label, err, detail) catch return ToolError.OutOfMemory;
+    return .{ .text = aw.written(), .is_error = true };
+}
+
+fn writeFailure(w: *std.Io.Writer, label: []const u8, err: anyerror, detail: Failure) !void {
+    try w.print("{s} search failed: {s}", .{ label, @errorName(err) });
+    if (detail.status) |status| try w.print(" (HTTP {d})", .{status});
+    if (detail.message.len > 0) {
+        try w.writeAll(": ");
+        try writeSingleLine(w, detail.message);
+    }
+    // The one failure where the right move is not "try another query".
+    if (detail.status == 429) {
+        try w.writeAll(". This engine is rate-limited right now; wait before retrying, or read the answer from a page instead.");
+    }
 }
 
 /// `arena` owns the returned slice.
@@ -1199,6 +1275,7 @@ fn apiSearch(
     api_key: ?[]const u8,
     timeout_ms: u32,
     query: []const u8,
+    detail: *Failure,
 ) ![]const u8 {
     var init_options = engine.init_options;
     // The cascade (or the model) is the retry; honoring a Retry-After (60 s
@@ -1217,61 +1294,78 @@ fn apiSearch(
         if (client.last_error.status) |status| {
             log.warn(.browser, @tagName(engine.tag) ++ " non-2xx", .{
                 .status = status,
-                .body = client.last_error.body,
+                .message = client.last_error.message,
             });
+            detail.* = .{
+                .status = status,
+                .message = if (client.last_error.message) |m| (arena.dupe(u8, m) catch "") else "",
+            };
         }
         return err;
     };
     defer response.deinit();
 
+    return renderResults(arena, try engine.collect(arena, response.value));
+}
+
+pub const Hit = struct {
+    title: []const u8,
+    url: []const u8,
+    snippet: []const u8,
+};
+
+pub const SearchResults = struct {
+    /// Tavily's synthesized answer; empty for the engines that have none.
+    answer: []const u8 = "",
+    hits: []const Hit = &.{},
+};
+
+/// The engines agree on title and url and disagree only on which field holds
+/// the snippet.
+fn collectHits(arena: std.mem.Allocator, results: anytype, comptime snippet: []const u8) ![]Hit {
+    const hits = try arena.alloc(Hit, results.len);
+    for (results, hits) |r, *hit| hit.* = .{ .title = r.title, .url = r.url, .snippet = @field(r, snippet) };
+    return hits;
+}
+
+fn collectTavily(arena: std.mem.Allocator, resp: tavily.types.SearchResponse) !SearchResults {
+    return .{ .answer = resp.answer orelse "", .hits = try collectHits(arena, resp.results, "content") };
+}
+
+fn collectBrave(arena: std.mem.Allocator, resp: brave.types.SearchResponse) !SearchResults {
+    const results: []const brave.types.Result = if (resp.web) |web| web.results else &.{};
+    return .{ .hits = try collectHits(arena, results, "description") };
+}
+
+fn collectExa(arena: std.mem.Allocator, resp: exa.types.SearchResponse) !SearchResults {
+    const hits = try arena.alloc(Hit, resp.results.len);
+    for (resp.results, hits) |r, *hit| {
+        const highlights = r.highlights orelse &[_][]const u8{};
+        hit.* = .{
+            .title = r.title orelse "",
+            .url = r.url,
+            .snippet = if (highlights.len > 0) highlights[0] else "",
+        };
+    }
+    return .{ .hits = hits };
+}
+
+fn collectKeenable(arena: std.mem.Allocator, resp: keenable.types.SearchResponse) !SearchResults {
+    // `snippet` carries the page text; the wire format's always-empty
+    // `description` is deliberately not even mapped by the client.
+    return .{ .hits = try collectHits(arena, resp.results, "snippet") };
+}
+
+fn renderResults(arena: std.mem.Allocator, results: SearchResults) ToolError![]const u8 {
+    if (results.answer.len == 0 and results.hits.len == 0) return "No results.";
     var aw: std.Io.Writer.Allocating = .init(arena);
-    try engine.format(&aw.writer, response.value);
+    writeResults(&aw.writer, results) catch return ToolError.OutOfMemory;
     return aw.written();
 }
 
-fn formatTavilyMarkdown(w: *std.Io.Writer, resp: tavily.types.SearchResponse) !void {
-    const answer = resp.answer orelse "";
-    if (answer.len == 0 and resp.results.len == 0) {
-        return w.writeAll("No results.");
-    }
-    if (answer.len > 0) {
-        try w.print("**Answer:** {s}\n\n", .{answer});
-    }
-    for (resp.results, 0..) |r, i| {
-        try writeResultItem(w, i, r.title, r.url, r.content);
-    }
-}
-
-fn formatBraveMarkdown(w: *std.Io.Writer, resp: brave.types.SearchResponse) !void {
-    const results: []const brave.types.Result = if (resp.web) |web| web.results else &.{};
-    if (results.len == 0) {
-        return w.writeAll("No results.");
-    }
-    for (results, 0..) |r, i| {
-        try writeResultItem(w, i, r.title, r.url, r.description);
-    }
-}
-
-fn formatExaMarkdown(w: *std.Io.Writer, resp: exa.types.SearchResponse) !void {
-    if (resp.results.len == 0) {
-        return w.writeAll("No results.");
-    }
-    for (resp.results, 0..) |r, i| {
-        const highlights = r.highlights orelse &[_][]const u8{};
-        const snippet = if (highlights.len > 0) highlights[0] else "";
-        try writeResultItem(w, i, r.title orelse "", r.url, snippet);
-    }
-}
-
-fn formatKeenableMarkdown(w: *std.Io.Writer, resp: keenable.types.SearchResponse) !void {
-    if (resp.results.len == 0) {
-        return w.writeAll("No results.");
-    }
-    for (resp.results, 0..) |r, i| {
-        // snippet carries the page text (the wire format's always-empty
-        // `description` is deliberately not even mapped by the client).
-        try writeResultItem(w, i, r.title, r.url, r.snippet);
-    }
+fn writeResults(w: *std.Io.Writer, results: SearchResults) !void {
+    if (results.answer.len > 0) try w.print("**Answer:** {s}\n\n", .{results.answer});
+    for (results.hits, 0..) |hit, i| try writeResultItem(w, i, hit.title, hit.url, hit.snippet);
 }
 
 /// An empty title (providers default it to "") would render as `****`.
@@ -1870,20 +1964,24 @@ fn execFill(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeRegis
 fn execScroll(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeRegistry, arguments: ?std.json.Value) ToolError![]const u8 {
     const Params = struct {
         backendNodeId: ?NodeRegistry.Id = null,
+        selector: ?[]const u8 = null,
         x: ?i32 = null,
         y: ?i32 = null,
     };
     const args = try parseArgsOrDefault(Params, arena, arguments);
     const scope = beginAction(session);
-    const page = try requireFrame(session);
-    const target_node = try resolveOptionalNode(registry, args.backendNodeId);
+    const resolved: ?NodeAndPage = if (args.selector != null or args.backendNodeId != null)
+        try resolveTarget(session, registry, args.selector, args.backendNodeId)
+    else
+        null;
+    const page = if (resolved) |r| r.page else try requireFrame(session);
 
-    const result = lp.actions.scroll(target_node, args.x, args.y, page) catch |err| return mapActionError(err);
+    const result = lp.actions.scroll(if (resolved) |r| r.node else null, args.x, args.y, page) catch |err| return mapActionError(err);
 
     const body = (switch (result.target) {
         .window => std.fmt.allocPrint(arena, "Scrolled window to x: {d}, y: {d}", .{ result.x, result.y }),
         .node => std.fmt.allocPrint(arena, "Scrolled element ({f}) to x: {d}, y: {d}", .{
-            ActionTarget{ .backend_node_id = args.backendNodeId.? },
+            resolved.?.target,
             result.x,
             result.y,
         }),
@@ -1891,7 +1989,7 @@ fn execScroll(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeReg
             const registered = registry.register(container) catch return ToolError.InternalError;
             break :blk std.fmt.allocPrint(arena, "Scrolled scroll container ({f}) of element ({f}) to x: {d}, y: {d}", .{
                 ActionTarget{ .backend_node_id = registered.id },
-                ActionTarget{ .backend_node_id = args.backendNodeId.? },
+                resolved.?.target,
                 result.x,
                 result.y,
             });
@@ -2359,6 +2457,7 @@ fn performGoto(session: *lp.Session, registry: *NodeRegistry, url: [:0]const u8,
     // re-fetch frame, navigate might have changed it.
     const frame = page.frame() orelse return ToolError.NavigationFailed;
     if (frame._last_navigate_error != null) return ToolError.NavigationFailed;
+    if (result == .timeout and frame._parse_state == .pre) return ToolError.NavigationTimeout;
     return result;
 }
 
@@ -2606,6 +2705,32 @@ test "tree and nodeDetails read the node's own frame" {
     try std.testing.expect(std.mem.indexOf(u8, details.text, "child-label") != null);
 }
 
+test "goto: a navigation stuck waiting for a connection is an error" {
+    var registry: NodeRegistry = .init(std.testing.allocator);
+    defer registry.deinit();
+
+    const network = &testing.test_app.network;
+    var held: std.ArrayList(*@import("../network/http.zig").Connection) = .empty;
+    defer held.deinit(std.testing.allocator);
+    defer for (held.items) |conn| network.releaseConnection(conn);
+    while (network.getConnection()) |conn| try held.append(std.testing.allocator, conn);
+
+    const session = testing.test_session;
+    defer if (session.primaryPage()) |page| page.close();
+
+    const aa = testing.arena_allocator;
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, aa,
+        \\{"url":"http://localhost:9582/src/browser/tests/mcp_actions.html","timeout":300}
+    , .{});
+    try std.testing.expectError(error.NavigationTimeout, call(aa, session, &registry, "goto", args, .{}));
+
+    for (held.items) |conn| network.releaseConnection(conn);
+    held.clearRetainingCapacity();
+
+    const r = try call(aa, session, &registry, "goto", args, .{});
+    try std.testing.expectEqualStrings("Navigated successfully.", r.text);
+}
+
 test "parseValue: zero-filled optional backendNodeId treated as omitted" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -2745,7 +2870,7 @@ test "formatLpEnvNames reports empty when no names" {
     try std.testing.expectEqualStrings("No LP_* environment variables are set.", r);
 }
 
-test "formatTavilyMarkdown renders answer and results" {
+test "tavily results render as markdown" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -2759,9 +2884,7 @@ test "formatTavilyMarkdown renders answer and results" {
         },
     };
 
-    var aw: std.Io.Writer.Allocating = .init(aa);
-    try formatTavilyMarkdown(&aw.writer, resp);
-    const md = aw.written();
+    const md = try renderResults(aa, try collectTavily(aa, resp));
     try std.testing.expect(std.mem.indexOf(u8, md, "**Answer:** Paris") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "1. **Paris - Wikipedia**") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "https://en.wikipedia.org/wiki/Paris") != null);
@@ -2769,17 +2892,15 @@ test "formatTavilyMarkdown renders answer and results" {
     try std.testing.expect(std.mem.indexOf(u8, md, "2. **France**") != null);
 }
 
-test "formatTavilyMarkdown handles empty results" {
+test "tavily: no results render as a notice" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var aw: std.Io.Writer.Allocating = .init(aa);
-    try formatTavilyMarkdown(&aw.writer, .{});
-    try std.testing.expectEqualStrings("No results.", aw.written());
+    try std.testing.expectEqualStrings("No results.", try renderResults(aa, try collectTavily(aa, .{})));
 }
 
-test "formatBraveMarkdown renders web results" {
+test "brave results render as markdown" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -2793,30 +2914,24 @@ test "formatBraveMarkdown renders web results" {
         },
     };
 
-    var aw: std.Io.Writer.Allocating = .init(aa);
-    try formatBraveMarkdown(&aw.writer, resp);
-    const md = aw.written();
+    const md = try renderResults(aa, try collectBrave(aa, resp));
     try std.testing.expect(std.mem.indexOf(u8, md, "1. **Paris - Wikipedia**") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "https://en.wikipedia.org/wiki/Paris") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "Paris is the capital of France.") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "2. **France**") != null);
 }
 
-test "formatBraveMarkdown handles empty results" {
+test "brave: no results render as a notice" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var no_web: std.Io.Writer.Allocating = .init(aa);
-    try formatBraveMarkdown(&no_web.writer, .{});
-    try std.testing.expectEqualStrings("No results.", no_web.written());
+    try std.testing.expectEqualStrings("No results.", try renderResults(aa, try collectBrave(aa, .{})));
 
-    var empty_web: std.Io.Writer.Allocating = .init(aa);
-    try formatBraveMarkdown(&empty_web.writer, .{ .web = .{} });
-    try std.testing.expectEqualStrings("No results.", empty_web.written());
+    try std.testing.expectEqualStrings("No results.", try renderResults(aa, try collectBrave(aa, .{ .web = .{} })));
 }
 
-test "formatKeenableMarkdown reads snippet" {
+test "keenable results render the snippet as the body" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -2829,9 +2944,7 @@ test "formatKeenableMarkdown reads snippet" {
         },
     };
 
-    var aw: std.Io.Writer.Allocating = .init(aa);
-    try formatKeenableMarkdown(&aw.writer, resp);
-    const md = aw.written();
+    const md = try renderResults(aa, try collectKeenable(aa, resp));
     try std.testing.expect(std.mem.indexOf(u8, md, "1. **Zig (programming language)**") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "Zig is a system programming language.") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "2. **Zig guide**") != null);
@@ -2846,15 +2959,14 @@ test "writeResultItem uses the URL as title when the title is empty" {
     try std.testing.expectEqualStrings("1. **https://example.org/x.pdf** — https://example.org/x.pdf\n   snippet\n\n", aw.written());
 }
 
-test "formatKeenableMarkdown handles empty results" {
+test "keenable: no results render as a notice" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
-    try formatKeenableMarkdown(&aw.writer, .{});
-    try std.testing.expectEqualStrings("No results.", aw.written());
+    const aa = arena.allocator();
+    try std.testing.expectEqualStrings("No results.", try renderResults(aa, try collectKeenable(aa, .{})));
 }
 
-test "formatBraveMarkdown flattens newlines in titles and descriptions" {
+test "brave titles and descriptions render on one line" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -2867,9 +2979,30 @@ test "formatBraveMarkdown flattens newlines in titles and descriptions" {
         },
     };
 
-    var aw: std.Io.Writer.Allocating = .init(aa);
-    try formatBraveMarkdown(&aw.writer, resp);
-    try std.testing.expectEqualStrings("1. **Multi line title** — https://example.org\n   line one line two\n\n", aw.written());
+    try std.testing.expectEqualStrings(
+        "1. **Multi line title** — https://example.org\n   line one line two\n\n",
+        try renderResults(aa, try collectBrave(aa, resp)),
+    );
+}
+
+test "searchFailed: a rate limit says so, a bare failure stays short" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const limited = try searchFailed(aa, "keenable", error.ApiError, .{
+        .status = 429,
+        .message = "Public API hourly limit reached.\nWait 2 minutes to continue.",
+    });
+    try std.testing.expect(limited.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, limited.text, "(HTTP 429)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited.text, "Public API hourly limit reached.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited.text, "rate-limited right now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited.text, "\n") == null);
+
+    const bare = try searchFailed(aa, "web", error.ConnectionRefused, .{});
+    try std.testing.expectEqualStrings("web search failed: ConnectionRefused", bare.text);
+    try std.testing.expect(bare.is_error);
 }
 
 test "isPathSafe: relative paths without traversal are accepted" {

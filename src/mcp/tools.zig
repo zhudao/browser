@@ -166,7 +166,7 @@ fn dispatchBrowserTool(
             error.FrameNotLoaded => .FrameNotLoaded,
             error.NodeNotFound, error.InvalidParams => .InvalidParams,
             error.Cancelled => .Cancelled,
-            error.Timeout => .Timeout,
+            error.Timeout, error.NavigationTimeout => .Timeout,
             error.NavigationFailed, error.InternalError, error.OutOfMemory => .InternalError,
         };
         return server.sendError(id, code, browser_tools.errorMessage(err));
@@ -1192,6 +1192,18 @@ test "MCP - Actions: click, fill, scroll, hover, press, selectOption, setChecked
         const msg = try std.fmt.allocPrint(aa, "{{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{{\"name\":\"scroll\",\"arguments\":{{\"backendNodeId\":{d},\"y\":30}}}}}}", .{leaf_id});
         try router.handleMessage(server, aa, msg);
         const expected = try std.fmt.allocPrint(aa, "Scrolled scroll container (backendNodeId: {d}) of element (backendNodeId: {d}) to x: 0, y: 30", .{ outer_id, leaf_id });
+        try testing.expect(std.mem.indexOf(u8, out.written(), expected) != null);
+        out.clearRetainingCapacity();
+    }
+
+    // A selector targets the element as a backendNodeId does.
+    {
+        const outer = frame.document.getElementById("outerscroll", frame).?.asNode();
+        const outer_id = (try server.active_session.registry.register(outer)).id;
+        try router.handleMessage(server, aa,
+            \\{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"scroll","arguments":{"selector":"#innerleaf","y":30}}}
+        );
+        const expected = try std.fmt.allocPrint(aa, "Scrolled scroll container (backendNodeId: {d}) of element (selector: #innerleaf) to x: 0, y: 30", .{outer_id});
         try testing.expect(std.mem.indexOf(u8, out.written(), expected) != null);
         out.clearRetainingCapacity();
     }
