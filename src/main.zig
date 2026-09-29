@@ -61,13 +61,13 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args) !void {
     lp.core_dump.disableIfRequested();
+    lp.malloc_tuning.apply();
     lp.crash_handler.attachSignalHandlers();
 
     const args = Config.parseArgs(main_arena, proc_args) catch |err| switch (err) {
         // Already logged where they were found.
         error.UnknownCommand,
         error.UnknownOption,
-        error.InvalidOption,
         error.InvalidArgument,
         error.MissingArgument,
         error.TooManyPositionalArguments,
