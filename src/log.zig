@@ -19,6 +19,8 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+threadlocal var current_page: ?*PageContext = null;
+
 pub const Scope = enum {
     app,
     bidi,
@@ -233,6 +235,12 @@ pub fn logKVs(scope: Scope, level: Level, msg: []const u8, kvs: []const KV) void
         }
     }
 
+    if (current_page) |page| {
+        if (level != .note and @intFromEnum(level) > @intFromEnum(page.max_level)) {
+            page.max_level = level;
+        }
+    }
+
     if (sink) |s| {
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -312,6 +320,10 @@ fn logLogFmtPrefix(scope: Scope, level: Level, msg: []const u8, writer: *std.Io.
     try writer.writeAll(" $msg=\"");
     try writer.writeAll(msg);
     try writer.writeByte('"');
+
+    if (current_page) |page| {
+        try writer.print(" $page={d}", .{page.id});
+    }
 }
 
 fn logPretty(scope: Scope, level: Level, msg: []const u8, kvs: []const KV, writer: *std.Io.Writer) !void {
@@ -343,15 +355,20 @@ fn logPrettyPrefix(scope: Scope, level: Level, msg: []const u8, writer: *std.Io.
     try writer.writeAll(msg);
 
     {
-        // msg.len cannot be > 30, and @tagName(scope).len cannot be > 15
-        // so this is safe
-        const prefix_len = @tagName(scope).len + msg.len + 2;
-        const padding = 55 - prefix_len;
+        // msg.len cannot be > 30, and @tagName(scope).len cannot be > 15.
+        // The page tag eats into the dot leaders so the elapsed column stays
+        // aligned and the line stays within 80 columns.
+        const page_len = if (current_page) |page| std.fmt.count(" page={d}", .{page.id}) else 0;
+        const prefix_len = @tagName(scope).len + msg.len + 2 + page_len;
+        const padding = 55 -| prefix_len;
         for (0..padding / 2) |_| {
             try writer.writeAll(" .");
         }
         if (@mod(padding, 2) == 1) {
             try writer.writeByte(' ');
+        }
+        if (current_page) |page| {
+            try writer.print(" page={d}", .{page.id});
         }
         const el = elapsed();
         try writer.print(" \x1b[0m[+{d}{s}]", .{ el.time, el.unit });
@@ -627,6 +644,41 @@ fn timestamp(comptime clock: std.Io.Clock) u64 {
     return datetime.milliTimestamp(clock);
 }
 
+pub const PageContext = struct {
+    id: u64,
+    url: *const [:0]const u8,
+    max_level: Level = .info,
+};
+
+var page_id_gen = std.atomic.Value(u64).init(0);
+
+pub fn nextPageId() u64 {
+    return page_id_gen.fetchAdd(1, .monotonic) + 1;
+}
+
+pub const PageScope = struct {
+    page: ?*PageContext,
+    previous: ?*PageContext,
+
+    pub fn exit(self: PageScope) void {
+        if (comptime lp.IS_DEBUG) {
+            // enter/exit must nest
+            std.debug.assert(current_page == self.page);
+        }
+        current_page = self.previous;
+    }
+};
+
+pub fn enterPage(page: ?*PageContext) PageScope {
+    const previous = current_page;
+    current_page = page;
+    return .{ .page = page, .previous = previous };
+}
+
+pub fn currentPage() ?*const PageContext {
+    return current_page;
+}
+
 const testing = @import("testing.zig");
 test "log: colored" {
     opts.format = .logfmt;
@@ -699,6 +751,59 @@ test "log: string escape" {
         aw.clearRetainingCapacity();
         try logTo(.app, .err, "test", .{ .string = "\n \thi  \" \" " }, &aw.writer);
         try testing.expectEqual(prefix ++ "string=\"\\n \thi  \\\" \\\" \"\n", aw.written());
+    }
+}
+
+test "log: page context" {
+    opts.format = .logfmt;
+    defer opts.format = .pretty;
+
+    var aw = std.Io.Writer.Allocating.init(testing.allocator);
+    defer aw.deinit();
+
+    const url: [:0]const u8 = "https://lightpanda.io/";
+    var page: PageContext = .{ .id = 42, .url = &url };
+
+    const page_scope = enterPage(&page);
+    {
+        try logTo(.frame, .info, "tagged", .{}, &aw.writer);
+        try testing.expectEqual("$time=1739795092929 $scope=frame $level=info $msg=\"tagged\" $page=42\n", aw.written());
+    }
+
+    {
+        // Not expectLog: an expected line is consumed before it can raise
+        // max_level. Discard the output instead.
+        sink = struct {
+            fn discard(_: []const u8) void {}
+        }.discard;
+        defer sink = null;
+        err(.http, "first", .{});
+        warn(.http, "second", .{});
+        try testing.expectEqual(.err, page.max_level);
+    }
+
+    page_scope.exit();
+    try testing.expectEqual(null, currentPage());
+
+    {
+        var other: PageContext = .{ .id = 43, .url = &url };
+        const outer = enterPage(&page);
+        const inner = enterPage(&other);
+        try testing.expectEqual(&other, currentPage().?);
+        inner.exit();
+        try testing.expectEqual(&page, currentPage().?);
+        outer.exit();
+        try testing.expectEqual(null, currentPage());
+    }
+
+    {
+        aw.clearRetainingCapacity();
+        try logTo(.frame, .info, "untagged", .{}, &aw.writer);
+        try testing.expectEqual("$time=1739795092929 $scope=frame $level=info $msg=\"untagged\"\n", aw.written());
+
+        expectLog(&.{.http});
+        fatal(.http, "not this page", .{});
+        try testing.expectEqual(.err, page.max_level);
     }
 }
 

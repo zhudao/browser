@@ -203,7 +203,7 @@ fn addScriptToEvaluateOnNewDocument(cmd: *CDP.Command) !void {
 
                 ls.local.eval(source_dupe, null) catch |err| {
                     const caught = try_catch.caughtOrError(cmd.arena, err);
-                    log.warn(.cdp, "script on new doc", .{ .caught = caught });
+                    log.debug(.cdp, "script on new doc", .{ .caught = caught });
                 };
             }
         }
@@ -256,7 +256,7 @@ fn createIsolatedWorld(cmd: *CDP.Command) !void {
         grantUniveralAccess: bool = false,
     })) orelse return error.InvalidParams;
     if (!params.grantUniveralAccess) {
-        log.warn(.not_implemented, "Page.createIsolatedWorld", .{ .param = "grantUniveralAccess" });
+        log.debug(.not_implemented, "Page.createIsolatedWorld", .{ .param = "grantUniveralAccess" });
         // When grantUniveralAccess == false and the client attempts to resolve
         // or otherwise access a DOM or other JS Object from another context that should fail.
     }
@@ -810,7 +810,7 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
 
         ls.local.eval(script.source, null) catch |err| {
             const caught = try_catch.caughtOrError(arena, err);
-            log.warn(.cdp, "script on new doc", .{ .caught = caught });
+            log.debug(.cdp, "script on new doc", .{ .caught = caught });
         };
     }
 
@@ -1054,11 +1054,11 @@ fn captureScreenshot(cmd: *CDP.Command) !void {
 
     const format = params.format orelse "png";
     if (!std.mem.eql(u8, format, "png")) {
-        log.warn(.not_implemented, "Page.captureScreenshot params", .{ .format = format });
+        log.debug(.not_implemented, "Page.captureScreenshot params", .{ .format = format });
         return cmd.sendError(-32000, "unsupported screenshot format.", .{});
     }
     if (params.quality != null) {
-        log.warn(.not_implemented, "Page.captureScreenshot params", .{ .quality = params.quality });
+        log.debug(.not_implemented, "Page.captureScreenshot params", .{ .quality = params.quality });
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -1099,7 +1099,7 @@ fn printToPDF(cmd: *CDP.Command) !void {
     };
     const params = try cmd.params(Params) orelse Params{};
     if (params.displayHeaderFooter) {
-        log.warn(.not_implemented, "Page.printToPDF params", .{ .displayHeaderFooter = true });
+        log.debug(.not_implemented, "Page.printToPDF params", .{ .displayHeaderFooter = true });
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
@@ -2535,8 +2535,9 @@ test "cdp.frame: anchor click sends Referer matching the originating page" {
         f.js.localScope(&ls);
         defer ls.deinit();
         _ = try ls.local.exec("document.getElementById('link').click()", null);
-        try testing.waitForPage(bc);
     }
+    // Outside the scope: the navigation destroys the page it's entered on.
+    try testing.waitForPage(bc);
 
     // After the click navigation completes, the loaded page is /echo_referer
     // and its body echoes the Referer header the server actually saw.
