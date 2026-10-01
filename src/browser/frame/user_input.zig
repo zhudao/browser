@@ -699,7 +699,6 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
         },
         .input => {
             const input = html_element.subtype(Element.Html.Input);
-            try element.focus(frame);
             // Per HTML §4.10.18.6.4 "Image Button state (type=image)", clicking an
             // image button submits its form. The form-data set already gets the
             // submitter's coordinate fields appended via FormData.collectForm
@@ -710,12 +709,10 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
         },
         .button => {
             const button = html_element.subtype(Element.Html.Button);
-            try element.focus(frame);
             if (std.mem.eql(u8, button.getType(), "submit")) {
                 return frame.submitForm(element, button.getForm(frame), .{});
             }
         },
-        .select, .textarea => try element.focus(frame),
         .label => {
             const label = html_element.subtype(Element.Html.Label);
             // Per HTML §4.10.4 "The label element", a label's activation
@@ -728,6 +725,7 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
                 // label (into an infinite loop)
                 return;
             }
+            try control.focus(frame);
             const control_html = control.is(Element.Html) orelse return;
             try control_html.click(frame);
         },
@@ -778,14 +776,12 @@ fn followLink(frame: *Frame, target: *Node, element: *Element, href: []const u8,
         break :blk switch (frame.resolveTargetFrame(target_name)) {
             .frame => |f| f,
             .blank => {
-                try element.focus(frame);
                 _ = try (target.ownerFrame(frame) orelse return).openBlankTarget(element, href);
                 return;
             },
         };
     };
 
-    try element.focus(frame);
     try frame.scheduleNavigation(href, .{
         .reason = .script,
         .kind = .{ .push = null },
@@ -988,10 +984,7 @@ fn allowEdit(frame: *Frame, target: *Element, before_data: ?[]const u8, text_dat
             .data = before_data,
             .inputType = input_type,
         }, frame)).asEvent();
-        before.acquireRef(); // need to check its _prevent_default
-        defer _ = before.releaseRef(frame.page);
-        try frame._event_manager.dispatch(target.asEventTarget(), before);
-        if (before._prevent_default) {
+        if (try frame._event_manager.dispatchCancelable(target.asEventTarget(), before)) {
             return false;
         }
     }
@@ -1004,10 +997,7 @@ fn allowEdit(frame: *Frame, target: *Element, before_data: ?[]const u8, text_dat
             .view = frame.window,
             .data = data,
         }, frame)).asEvent();
-        text_event.acquireRef(); // need to check its _prevent_default
-        defer _ = text_event.releaseRef(frame.page);
-        try frame._event_manager.dispatch(target.asEventTarget(), text_event);
-        return text_event._prevent_default == false;
+        return !try frame._event_manager.dispatchCancelable(target.asEventTarget(), text_event);
     }
 }
 

@@ -772,6 +772,15 @@ fn jsValueToStruct(self: *const Local, comptime T: type, js_val: js.Value) !?T {
             return .{ .values = arr };
         },
         js.BufferSource => {
+            if (v8.v8__Value__IsSharedArrayBuffer(js_val.handle)) {
+                return error.TypeError;
+            }
+            if (js_val.isArrayBufferView()) {
+                const view: *const v8.ArrayBufferView = @ptrCast(js_val.handle);
+                if (js.arrayBufferIsShared(v8.v8__ArrayBufferView__Buffer(view).?)) {
+                    return error.TypeError;
+                }
+            }
             const bytes = (try jsValueToArrayBufferSlice(u8, true, js_val)) orelse return null;
             return .{ .bytes = bytes };
         },
@@ -1497,15 +1506,7 @@ fn finalizerPtrGetter(comptime T: type, comptime FT: type) *const fn (*T) *FT {
 pub fn stackTrace(self: *const Local) !?[]const u8 {
     const isolate = self.isolate.handle;
     const stack_handle = v8.v8__StackTrace__CurrentStackTrace__STATIC(isolate, 30) orelse return null;
-
-    const separator = log.separator();
-
     var buf = std.Io.Writer.Allocating.init(self.call_arena);
-    if (v8.v8__StackTrace__CurrentScriptNameOrSourceURL__STATIC(isolate)) |script| {
-        const stack = js.String{ .local = self, .handle = script };
-        try buf.writer.print("{s}<{f}>", .{ separator, stack });
-    }
-
     try js.writeStackTrace(isolate, stack_handle, &buf.writer);
     return buf.written();
 }
