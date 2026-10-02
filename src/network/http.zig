@@ -136,61 +136,6 @@ pub const Header = struct {
     };
 };
 
-// In normal cases, the header iterator comes from the curl connection.
-// But it's also possible to inject a response, via `transfer.fulfill`. In that
-// case, the response headers are a list, []const Http.Header.
-// This union, is an iterator that exposes the same API for either case.
-pub const HeaderIterator = union(enum) {
-    curl: CurlHeaderIterator,
-    list: ListHeaderIterator,
-
-    pub fn next(self: *HeaderIterator) ?Header {
-        switch (self.*) {
-            inline else => |*it| return it.next(),
-        }
-    }
-
-    pub fn collect(self: *HeaderIterator, allocator: std.mem.Allocator) !std.ArrayList(Header) {
-        var list: std.ArrayList(Header) = .empty;
-
-        while (self.next()) |hdr| {
-            try list.append(allocator, try hdr.normalize(allocator));
-        }
-
-        return list;
-    }
-
-    const CurlHeaderIterator = struct {
-        conn: *const Connection,
-        prev: ?*libcurl.CurlHeader = null,
-
-        pub fn next(self: *CurlHeaderIterator) ?Header {
-            const h = libcurl.curl_easy_nextheader(self.conn._easy, .header, -1, self.prev) orelse return null;
-            self.prev = h;
-
-            const header = h.*;
-            return .{
-                .name = std.mem.span(header.name),
-                .value = std.mem.span(header.value),
-            };
-        }
-    };
-
-    const ListHeaderIterator = struct {
-        index: usize = 0,
-        list: []const Header,
-
-        pub fn next(self: *ListHeaderIterator) ?Header {
-            const idx = self.index;
-            if (idx == self.list.len) {
-                return null;
-            }
-            self.index = idx + 1;
-            return self.list[idx];
-        }
-    };
-};
-
 const HeaderValue = struct {
     value: []const u8,
     amount: usize,
@@ -709,6 +654,21 @@ pub const Connection = struct {
         };
     }
 
+    // Copies the response headers, names lowercased, into `allocator`.
+    pub fn collectResponseHeaders(self: *const Connection, allocator: std.mem.Allocator) ![]const Header {
+        var list: std.ArrayList(Header) = .empty;
+        var prev: ?*libcurl.CurlHeader = null;
+        while (libcurl.curl_easy_nextheader(self._easy, .header, -1, prev)) |h| {
+            prev = h;
+            const hdr: Header = .{
+                .name = std.mem.span(h.name),
+                .value = std.mem.span(h.value),
+            };
+            try list.append(allocator, try hdr.normalize(allocator));
+        }
+        return list.items;
+    }
+
     pub fn getResponseHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
         var hdr: ?*libcurl.CurlHeader = null;
         libcurl.curl_easy_header(self._easy, name, index, .header, -1, &hdr) catch |err| {
@@ -931,6 +891,7 @@ pub const ErrorReason = enum {
     too_large,
     aborted,
     robots_blocked,
+    bot_challenge,
     other,
 };
 
@@ -959,6 +920,7 @@ pub fn errorReason(err: anyerror) ErrorReason {
         error.SyncWaitInterrupted,
         => .aborted,
         error.RobotsBlocked => .robots_blocked,
+        error.BotChallenge => .bot_challenge,
         else => .other,
     };
 }
