@@ -737,13 +737,22 @@ pub fn handleClick(frame: *Frame, target: *Node, event_target: *Node) !void {
             // image button submits its form. The form-data set already gets the
             // submitter's coordinate fields appended via FormData.collectForm
             // (see src/browser/webapi/net/FormData.zig).
+            // A disabled submit button has no activation behavior; isDisabled
+            // also covers an ancestor <fieldset disabled>, which a synthetic
+            // dispatchEvent click does not otherwise check.
             if (input._input_type == .submit or input._input_type == .image) {
+                if (element.isDisabled()) {
+                    return;
+                }
                 return frame.submitForm(element, input.getForm(frame), .{});
             }
         },
         .button => {
             const button = html_element.subtype(Element.Html.Button);
             if (std.mem.eql(u8, button.getType(), "submit")) {
+                if (element.isDisabled()) {
+                    return;
+                }
                 return frame.submitForm(element, button.getForm(frame), .{});
             }
         },
@@ -914,20 +923,40 @@ pub fn typeChar(frame: *Frame, target: *Element, keypress: *KeyboardEvent, text:
 
     if (target.is(Element.Html.Input)) |input| {
         if (is_enter) {
-            return frame.submitForm(input.asElement(), input.getForm(frame), .{});
+            return implicitFormSubmission(frame, input);
         }
-        return insertInto(frame, input, text);
+        _ = try insertInto(frame, input, text);
+        return;
     }
 
     if (target.is(Element.Html.TextArea)) |textarea| {
         if (is_enter) {
-            if (try allowEdit(frame, textarea.asElement(), null, "\n", "insertLineBreak")) {
+            if (acceptsEdit(textarea.asElement()) and try allowEdit(frame, textarea.asElement(), null, "\n", "insertLineBreak")) {
                 try textarea.innerInsert("\n", frame);
             }
             return;
         }
-        return insertInto(frame, textarea, text);
+        _ = try insertInto(frame, textarea, text);
+        return;
     }
+}
+
+/// Enter in a form field. The default button, when there is one, is clicked and
+/// its activation submits the form with it as the submitter; otherwise the
+/// form submits itself (SubmitEvent.submitter is null).
+/// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission
+fn implicitFormSubmission(frame: *Frame, input: *Element.Html.Input) !void {
+    const form = input.getForm(frame) orelse return;
+    if (form.getDefaultButton(frame)) |button| {
+        if (button.isDisabled()) {
+            return;
+        }
+        return dispatchKeyboardClick(frame, button);
+    }
+    if (!form.canSubmitImplicitly(input, frame)) {
+        return;
+    }
+    return frame.submitForm(form.asElement(), form, .{});
 }
 
 fn keypressFor(frame: *Frame, keydown: *const KeyboardEvent) !*KeyboardEvent {
@@ -984,7 +1013,7 @@ fn editKey(frame: *Frame, keyboard_event: *KeyboardEvent, ctl: anytype, key: Key
         return ctl.moveCaret(move, keyboard_event.getShiftKey(), frame);
     }
 
-    if (key == .Backspace or key == .Delete) {
+    if ((key == .Backspace or key == .Delete) and acceptsEdit(ctl.asElement())) {
         const forward = key == .Delete;
         if (!keyboard_event.asEvent().getIsTrusted() or try allowEdit(frame, ctl.asElement(), null, null, deleteInputType(forward))) {
             try ctl.innerDelete(forward, frame);
@@ -992,13 +1021,28 @@ fn editKey(frame: *Frame, keyboard_event: *KeyboardEvent, ctl: anytype, key: Key
     }
 }
 
-fn insertInto(frame: *Frame, ctl: anytype, text: []const u8) !void {
-    if (!ctl.acceptsTextEntry()) {
-        return;
+/// Returns whether the edit happened.
+pub fn insertInto(frame: *Frame, ctl: anytype, text: []const u8) !bool {
+    if (!ctl.acceptsTextEntry() or !acceptsEdit(ctl.asElement())) {
+        return false;
     }
-    if (try allowEdit(frame, ctl.asElement(), text, text, "insertText")) {
-        try ctl.innerInsert(text, frame);
+    if (!try allowEdit(frame, ctl.asElement(), text, text, "insertText")) {
+        return false;
     }
+    try ctl.innerInsert(text, frame);
+    return true;
+}
+
+pub fn acceptsEdit(el: *Element) bool {
+    if (el.isDisabled()) {
+        return false;
+    }
+    if (el.is(Element.Html.Input)) |input| {
+        if (!input.readonlyApplies()) {
+            return true;
+        }
+    }
+    return !el.hasAttributeInterned("readonly");
 }
 
 // Caret movement a key's default action performs on `ctl`, if any. On a
@@ -1194,11 +1238,9 @@ pub fn insertText(frame: *Frame, v: []const u8) !void {
     const html_element = frame.document._active_element orelse return;
 
     if (html_element.is(Element.Html.Input)) |input| {
-        return insertInto(frame, input, v);
-    }
-
-    if (html_element.is(Element.Html.TextArea)) |textarea| {
-        return insertInto(frame, textarea, v);
+        _ = try insertInto(frame, input, v);
+    } else if (html_element.is(Element.Html.TextArea)) |textarea| {
+        _ = try insertInto(frame, textarea, v);
     }
 }
 
