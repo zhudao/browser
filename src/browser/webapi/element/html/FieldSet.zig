@@ -44,7 +44,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLFieldSetElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -52,6 +51,7 @@ pub const JsApi = struct {
 
     pub const disabled = reflect.boolean("disabled");
     pub const name = reflect.string("name");
+    pub const @"type" = bridge.property("fieldset", .{ .template = false, .readonly = true });
 };
 
 const testing = @import("../../../../testing.zig");

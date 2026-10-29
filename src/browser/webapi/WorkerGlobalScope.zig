@@ -84,7 +84,6 @@ origin: ?[]const u8 = null,
 // can outlive it. Always true for a service worker: only a secure context can
 // register one.
 _secure_context: bool,
-buf: [1024]u8 = undefined, // same size as frame.buf
 // Document charset (matches Page.charset). Workers default to UTF-8.
 charset: []const u8 = "UTF-8",
 js: *JS.Context,
@@ -95,6 +94,9 @@ _loader_id: u32,
 
 // Event management for non-DOM targets in worker context
 _event_manager: EventManagerBase,
+
+// Links in page.worker_scopes
+_page_node: std.DoublyLinkedList.Node = .{},
 
 // Handles module imports (static + dynamic). No parser integration since
 // workers don't have <script> tags.
@@ -115,9 +117,6 @@ _navigator: WorkerNavigator = .init,
 _performance: *Performance,
 _idb_factory: ?*idb.IDBFactory = null,
 _caches: ?*CacheStorage = null,
-_on_error: ?JS.Function.Global = null,
-_on_rejection_handled: ?JS.Function.Global = null,
-_on_unhandled_rejection: ?JS.Function.Global = null,
 _reporting_error: bool = false,
 
 _location: WorkerLocation,
@@ -205,6 +204,7 @@ pub fn init(
     // features like BroadcastChannel can reach across the page/worker boundary.
     try self.js.setOrigin(self.origin);
 
+    self.page.worker_scopes.append(&self._page_node);
     return leaf;
 }
 
@@ -213,6 +213,7 @@ pub fn deinit(self: *WorkerGlobalScope) void {
     const session = page.session;
     const browser = session.browser;
 
+    page.worker_scopes.remove(&self._page_node);
     browser.http_client.abortOwner(&self._http_owner);
 
     // Close this worker's MessagePorts before the context dies: this severs
@@ -245,22 +246,13 @@ pub fn dispatch(
     self: *WorkerGlobalScope,
     target: *EventTarget,
     event: *Event,
-    handler: anytype,
     comptime opts: EventManagerBase.DispatchDirectOptions,
 ) !void {
-    try self._event_manager.dispatchDirect(
-        self.call_arena,
-        self.js,
-        target,
-        event,
-        handler,
-        self.page,
-        opts,
-    );
+    try self._event_manager.dispatchDirect(self.js, target, event, self.page, opts);
 }
 
-pub fn hasDirectListeners(self: *WorkerGlobalScope, target: *EventTarget, typ: []const u8, handler: anytype) bool {
-    return self._event_manager.hasDirectListeners(target, typ, handler);
+pub fn hasDirectListeners(self: *WorkerGlobalScope, target: *EventTarget, typ: []const u8) bool {
+    return self._event_manager.hasDirectListeners(target, typ);
 }
 
 // Workers don't have their own Referer; per spec, dedicated worker requests
@@ -328,30 +320,6 @@ pub fn getLocation(self: *WorkerGlobalScope) *WorkerLocation {
     return &self._location;
 }
 
-fn getOnError(self: *const WorkerGlobalScope) ?JS.Function.Global {
-    return self._on_error;
-}
-
-fn setOnError(self: *WorkerGlobalScope, setter: ?FunctionSetter) void {
-    self._on_error = getFunctionFromSetter(setter);
-}
-
-fn getOnRejectionHandled(self: *const WorkerGlobalScope) ?JS.Function.Global {
-    return self._on_rejection_handled;
-}
-
-fn setOnRejectionHandled(self: *WorkerGlobalScope, setter: ?FunctionSetter) void {
-    self._on_rejection_handled = getFunctionFromSetter(setter);
-}
-
-fn getOnUnhandledRejection(self: *const WorkerGlobalScope) ?JS.Function.Global {
-    return self._on_unhandled_rejection;
-}
-
-fn setOnUnhandledRejection(self: *WorkerGlobalScope, setter: ?FunctionSetter) void {
-    self._on_unhandled_rejection = getFunctionFromSetter(setter);
-}
-
 const base64 = @import("encoding/base64.zig");
 fn btoa(_: *const WorkerGlobalScope, input: base64.BinInput, exec: *JS.Execution) ![]const u8 {
     return base64.encode(exec.local_arena, input);
@@ -366,37 +334,29 @@ pub fn structuredClone(_: *const WorkerGlobalScope, value: JS.Value) !JS.Value {
     return value.structuredClone();
 }
 
-pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, rejection: JS.PromiseRejection) !void {
-    if (comptime lp.IS_DEBUG) {
-        log.debug(.js, "unhandled rejection", .{
-            .target = "worker",
-            .value = rejection.reason(),
-            .stack = rejection.local.stackTrace() catch |err| @errorName(err) orelse "???",
-        });
-    }
-
-    const event_name, const attribute_callback = blk: {
-        if (no_handler) {
-            break :blk .{ "unhandledrejection", self._on_unhandled_rejection };
-        }
-        break :blk .{ "rejectionhandled", self._on_rejection_handled };
-    };
-
-    if (no_handler) {
-        self.page.recordJsError(error.JsException);
-    }
+// See Window.unhandledPromiseRejection.
+pub fn unhandledPromiseRejection(self: *WorkerGlobalScope, no_handler: bool, promise: JS.Promise, reason: ?JS.Value) !bool {
+    const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
     const target = self.asEventTarget();
-    if (self._event_manager.hasDirectListeners(target, event_name, attribute_callback)) {
-        const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
-            .reason = if (rejection.reason()) |r| try r.persist() else null,
-            .promise = try rejection.promise().persist(),
-        }, self.page)).asEvent();
-        try self.dispatch(target, event, attribute_callback, .{});
+    if (!self._event_manager.hasDirectListeners(target, event_name)) {
+        return false;
     }
+
+    const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+        .reason = if (reason) |r| try r.persist() else null,
+        .promise = try promise.persist(),
+        .cancelable = no_handler,
+    }, self.page)).asEvent();
+    // Keep the event alive past dispatch so we can read _prevent_default.
+    event.acquireRef();
+    defer event.releaseRef(self.page);
+
+    try self.dispatch(target, event, .{});
+    return event._prevent_default;
 }
 
-fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void {
+fn importScripts(self: *WorkerGlobalScope, urls: JS.Variadic([:0]const u8)) !void {
     if (self._is_module) {
         // not allowed to be called when the worker type is module (scripts should
         // use actual imports).
@@ -408,7 +368,7 @@ fn importScripts(self: *WorkerGlobalScope, urls: []const [:0]const u8) !void {
     const arena = try session.getArena(.small, "importScript");
     defer arena.release();
 
-    for (urls) |url| {
+    for (urls.values) |url| {
         defer arena.resetRetain();
         try self.importScript(arena.allocator(), url);
     }
@@ -460,7 +420,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
     _ = ls.local.eval(response.body.items, url) catch |err| {
         self.page.recordJsError(err);
         const caught = try_catch.caughtOrError(arena, err);
-        log.debug(.browser, "importScript", .{ .url = resolved_url, .caught = caught });
+        log.warn(.page_error, "uncaught exception", .{ .url = resolved_url, .caught = caught });
         return;
     };
 
@@ -473,61 +433,44 @@ pub fn reportError(self: *WorkerGlobalScope, err: JS.Value) !void {
         return;
     }
 
+    // See Window.reportError: keeps the call_arena alive while reporting.
+    const call_depth = self.js.call_depth;
+    self.js.call_depth = call_depth + 1;
+    defer self.js.call_depth = call_depth;
+
     self.page.recordJsError(error.JsException);
+    self.page.status.noteException(err.toStringSlice() catch "");
 
     self._reporting_error = true;
     defer self._reporting_error = false;
 
+    const location = err.errorLocation(err.local.call_arena) catch JS.Value.ErrorLocation{};
+
     const error_event = try ErrorEvent.initTrusted(comptime .wrap("error"), .{
         .@"error" = try err.persist(),
         .message = err.toStringSlice() catch "Unknown error",
+        .filename = location.url,
+        .lineno = location.line,
+        .colno = location.column,
         .bubbles = false,
         .cancelable = true,
     }, self.page);
-
-    // Invoke onerror callback if set (per WHATWG spec, this is called
-    // with 5 arguments: message, source, lineno, colno, error)
-    // If it returns true, the event is cancelled.
-    var prevent_default = false;
-    if (self._on_error) |on_error| {
-        var ls: JS.Local.Scope = undefined;
-        self.js.localScope(&ls);
-        defer ls.deinit();
-
-        const local_func = ls.toLocal(on_error);
-        const result = local_func.call(JS.Value, .{
-            error_event._message,
-            error_event._filename,
-            error_event._line_number,
-            error_event._column_number,
-            err,
-        }) catch null;
-
-        // Per spec: returning true from onerror cancels the event
-        if (result) |r| {
-            prevent_default = r.isTrue();
-        }
-    }
 
     const event = error_event.asEvent();
     // Keep the event alive past dispatch so we can read _prevent_default.
     event.acquireRef();
     defer event.releaseRef(self.page);
 
-    event._prevent_default = prevent_default;
-    // Pass null as handler: onerror was already called above with 5 args.
-    // We still dispatch so that addEventListener('error', ...) listeners fire.
-    try self.dispatch(self.asEventTarget(), event, null, .{});
+    // onerror is called with the event's fields (see Listener.run).
+    try self.dispatch(self.asEventTarget(), event, .{});
 
-    if (comptime lp.IS_TEST == false) {
-        if (!event._prevent_default) {
-            log.debug(.js, "worker.reportError", .{
-                .message = error_event._message,
-                .filename = error_event._filename,
-                .line_number = error_event._line_number,
-                .column_number = error_event._column_number,
-            });
-        }
+    if (!event._prevent_default) {
+        log.warn(.page_error, "uncaught exception", .{
+            .message = error_event._message,
+            .url = error_event._filename,
+            .line = error_event._line_number,
+            .column = error_event._column_number,
+        });
     }
 }
 
@@ -539,11 +482,11 @@ fn queueMicrotask(self: *WorkerGlobalScope, cb: JS.Function) void {
     self.js.queueMicrotaskFunc(cb);
 }
 
-pub fn setTimeout(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []JS.Value.Global, exec: *JS.Execution) !u32 {
+pub fn setTimeout(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: JS.Variadic(JS.Value.Global), exec: *JS.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = false,
-        .params = params,
+        .params = params.values,
         .name = "worker.setTimeout",
     });
 }
@@ -552,11 +495,11 @@ fn clearTimeout(self: *WorkerGlobalScope, id: u32) void {
     self._timers.clear(id);
 }
 
-pub fn setInterval(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []JS.Value.Global, exec: *JS.Execution) !u32 {
+pub fn setInterval(self: *WorkerGlobalScope, handler: Timers.LegacyHandler, delay_ms: ?i32, params: JS.Variadic(JS.Value.Global), exec: *JS.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = true,
-        .params = params,
+        .params = params.values,
         .name = "worker.setInterval",
     });
 }
@@ -591,25 +534,11 @@ fn replaceGlobalProperty(self: *WorkerGlobalScope, value: JS.Value, comptime nam
     _ = global.defineOwnProperty(name, value, 0);
 }
 
-pub const FunctionSetter = union(enum) {
-    func: JS.Function.Global,
-    anything: JS.Value,
-};
-
-pub fn getFunctionFromSetter(setter_: ?FunctionSetter) ?JS.Function.Global {
-    const setter = setter_ orelse return null;
-    return switch (setter) {
-        .func => |func| func,
-        .anything => null,
-    };
-}
-
 pub const JsApi = struct {
     pub const bridge = JS.Bridge(WorkerGlobalScope);
 
     pub const Meta = struct {
         pub const name = "WorkerGlobalScope";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -631,9 +560,9 @@ pub const JsApi = struct {
     pub const indexedDB = bridge.accessor(WorkerGlobalScope.getIndexedDB, null, .{});
     pub const caches = bridge.accessor(WorkerGlobalScope.getCaches, null, .{});
 
-    pub const onerror = bridge.accessor(WorkerGlobalScope.getOnError, WorkerGlobalScope.setOnError, .{});
-    pub const onrejectionhandled = bridge.accessor(WorkerGlobalScope.getOnRejectionHandled, WorkerGlobalScope.setOnRejectionHandled, .{});
-    pub const onunhandledrejection = bridge.accessor(WorkerGlobalScope.getOnUnhandledRejection, WorkerGlobalScope.setOnUnhandledRejection, .{});
+    pub const onerror = EventTarget.handlerAccessor(WorkerGlobalScope, "error");
+    pub const onrejectionhandled = EventTarget.handlerAccessor(WorkerGlobalScope, "rejectionhandled");
+    pub const onunhandledrejection = EventTarget.handlerAccessor(WorkerGlobalScope, "unhandledrejection");
 
     pub const btoa = bridge.function(WorkerGlobalScope.btoa, .{});
     pub const atob = bridge.function(WorkerGlobalScope.atob, .{});

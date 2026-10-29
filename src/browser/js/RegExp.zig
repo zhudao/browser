@@ -39,10 +39,18 @@ pub const Flag = struct {
     pub const unicode_sets: c_int = v8.kRegExpUnicodeSets;
 };
 
-pub fn init(local: *const js.Local, pattern: []const u8, flags: c_int) !RegExp {
-    const pattern_handle = local.isolate.initStringHandle(pattern);
-    const handle = v8.v8__RegExp__New(local.handle, pattern_handle, flags) orelse return error.JsException;
-    return .{ .local = local, .handle = handle };
+pub const InitOpts = struct {
+    flags: c_int = Flag.none,
+    backtrack_limit: ?u32 = 1_000_000,
+};
+
+pub fn init(local: *const js.Local, pattern: []const u8, opts: InitOpts) !RegExp {
+    const pattern_handle = try local.isolate.initStringHandle(pattern);
+    const handle = if (opts.backtrack_limit) |limit|
+        v8.v8__RegExp__NewWithBacktrackLimit(local.handle, pattern_handle, opts.flags, limit)
+    else
+        v8.v8__RegExp__New(local.handle, pattern_handle, opts.flags);
+    return .{ .local = local, .handle = handle orelse return error.JsException };
 }
 
 // Runs the pattern against `subject`. Returns the result Array (as a generic
@@ -50,7 +58,7 @@ pub fn init(local: *const js.Local, pattern: []const u8, flags: c_int) !RegExp {
 // throws — typically when the pattern is malformed for the current flags.
 pub fn exec(self: RegExp, subject: []const u8) !?js.Object {
     const local = self.local;
-    const subject_handle = local.isolate.initStringHandle(subject);
+    const subject_handle = try local.isolate.initStringHandle(subject);
     const handle = v8.v8__RegExp__Exec(self.handle, local.handle, subject_handle) orelse return error.JsException;
     if (v8.v8__Value__IsNullOrUndefined(@ptrCast(handle))) return null;
     return .{ .local = local, .handle = handle };

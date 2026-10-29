@@ -231,11 +231,16 @@ pub const HttpVersion = enum {
     @"1.1",
 };
 
-pub const LoadResources = packed struct(u4) {
+pub const LoadResources = packed struct(u6) {
     image: bool = false,
     iframe: bool = false,
     worker: bool = false,
     stylesheet: bool = false,
+    // navigator.sendBeacon sends its request (otherwise it only validates).
+    beacon: bool = false,
+    // Only marks the option as given, so `--load-resources none` turns off a
+    // mode's default.
+    none: bool = false,
 };
 
 pub const ExperimentalFeatures = packed struct(u2) {
@@ -254,7 +259,7 @@ const CommonOptions = .{
     .{ .name = "cors_store_entry_limit", .type = ?u32, .default = 1000 },
     .{ .name = "proxy_bearer_token", .type = ?[:0]const u8 },
     .{ .name = "http_proxy", .type = ?[:0]const u8 },
-    .{ .name = "http_max_concurrent", .type = ?u8 },
+    .{ .name = "http_max_concurrent", .type = ?u16 },
     .{ .name = "http_max_host_open", .type = ?u8 },
     .{ .name = "http_nav_delay", .type = ?u32 },
     .{ .name = "http_nav_burst", .type = ?u32 },
@@ -270,12 +275,12 @@ const CommonOptions = .{
     .{ .name = "log_filter", .type = log.FilterRule, .multiple = true, .validator = logFilterValidator },
     .{ .name = "log_filter_scopes", .type = log.FilterRule, .multiple = true, .validator = logFilterValidator, .deprecated = "use --log-filter" },
     .{ .name = "user_agent_suffix", .type = ?[]const u8 },
-    .{ .name = "http_cache_dir", .type = ?[]const u8 },
+    .{ .name = "http_cache_dir", .type = ?[]const u8, .path = true },
     .{ .name = "http_cache_entry_limit", .type = ?u32, .default = 1000 },
     .{ .name = "http_debug", .type = bool },
     .{ .name = "http_curves", .type = ?[:0]const u8, .validator = httpCurvesValidator },
-    .{ .name = "render_font", .type = []const u8, .multiple = true },
-    .{ .name = "web_bot_auth_key_file", .type = ?[]const u8 },
+    .{ .name = "render_font", .type = []const u8, .multiple = true, .path = true },
+    .{ .name = "web_bot_auth_key_file", .type = ?[]const u8, .path = true },
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
     .{ .name = "user_agent", .type = ?[]const u8, .validator = userAgentValidator },
@@ -284,9 +289,9 @@ const CommonOptions = .{
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8, .validator = accumulateValidator },
     .{ .name = "block_urls", .type = ?[]const u8, .validator = accumulateValidator },
-    .{ .name = "adblock_lists", .type = ?[]const u8, .validator = accumulateValidator },
-    .{ .name = "cookie", .type = ?[]const u8 },
-    .{ .name = "cookie_jar", .type = ?[]const u8 },
+    .{ .name = "adblock_lists", .type = ?[]const u8, .validator = accumulateValidator, .path = true },
+    .{ .name = "cookie", .type = ?[]const u8, .path = true },
+    .{ .name = "cookie_jar", .type = ?[]const u8, .path = true },
     .{ .name = "disable_subframes", .type = bool, .deprecated = "subframes are now disabled by default, use \"--load-resources iframe\" to enable" },
     .{ .name = "disable_workers", .type = bool, .deprecated = "workers are now disabled by default, use \"--load-resources worker\" to enable" },
     .{ .name = "enable_external_stylesheets", .type = bool, .deprecated = "use \"--load-resources stylesheet\" to enable" },
@@ -305,6 +310,7 @@ const CommonOptions = .{
         },
         .default = Cert{},
         .validator = caCertValidator,
+        .path = true,
     },
     .{
         .name = "ca_path",
@@ -315,6 +321,7 @@ const CommonOptions = .{
         },
         .default = Cert{},
         .validator = caPathValidator,
+        .path = true,
     },
 };
 
@@ -396,12 +403,13 @@ fn injectScriptFileValidator(
 }
 
 /// Definition for all the commands and its arguments. See @cli.zig for further.
-const Commands = cli.Builder(.{
+pub const Commands = cli.Builder(.{
     .{
         .name = "serve",
         .options = .{
-            .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
-            .{ .name = "port", .type = u16, .default = 9222 },
+            .{ .name = "host", .type = ?[]const u8 },
+            .{ .name = "port", .type = ?u16 },
+            .{ .name = "unix_socket", .type = ?[:0]const u8, .path = true },
             .{ .name = "advertise_host", .type = ?[]const u8 },
             // Repeatable; one server can speak several on the same port.
             .{ .name = "protocol", .type = Protocol, .multiple = true },
@@ -410,6 +418,7 @@ const Commands = cli.Builder(.{
             .{ .name = "cdp_max_message_size", .type = u32, .default = 1024 * 1024 },
             .{ .name = "cdp_max_http_message_size", .type = u32, .default = 1024 * 1024 },
             .{ .name = "http_session_timeout", .type = u32, .default = 60 },
+            .{ .name = "remote_allow_origins", .type = []const u8, .multiple = true },
             .{ .name = "disable_metrics", .type = bool },
         },
         .shared_options = CommonOptions,
@@ -426,13 +435,14 @@ const Commands = cli.Builder(.{
             .{ .name = "dump_selector", .type = ?[:0]const u8 },
             .{ .name = "dump_max_bytes", .type = ?u32 },
             .{ .name = "fail_on_http_error", .type = bool },
+            .{ .name = "markdown_alternate", .type = bool },
             .{ .name = "wait_ms", .type = u32, .default = 5_000 },
             .{ .name = "wait_until", .type = ?WaitUntil },
             .{
                 .name = "wait_script",
                 .type = ?[:0]const u8,
                 .variants = .{
-                    .{ .name = "wait_script_file", .validator = waitScriptFileValidator },
+                    .{ .name = "wait_script_file", .validator = waitScriptFileValidator, .path = true },
                 },
             },
             .{ .name = "wait_selector", .type = ?[:0]const u8 },
@@ -441,7 +451,7 @@ const Commands = cli.Builder(.{
                 .type = []const u8,
                 .multiple = true,
                 .variants = .{
-                    .{ .name = "inject_script_file", .validator = injectScriptFileValidator },
+                    .{ .name = "inject_script_file", .validator = injectScriptFileValidator, .path = true },
                 },
             },
             .{ .name = "terminate_ms", .type = ?u32 },
@@ -457,21 +467,23 @@ const Commands = cli.Builder(.{
             .{ .name = "port", .type = ?u16 },
             .{ .name = "host", .type = []const u8, .default = "127.0.0.1" },
             .{ .name = "cdp_port", .type = ?u16 },
+            .{ .name = "http_session_timeout", .type = u32, .default = 0 },
         },
         .shared_options = CommonOptions,
     },
     .{
         .name = "agent",
-        .positional = .{ .name = "script_file", .type = ?[:0]const u8 },
+        .positional = .{ .name = "script_file", .type = ?[:0]const u8, .path = true },
         .options = .{
             .{ .name = "provider", .type = ?AiProvider },
             .{ .name = "model", .type = ?[:0]const u8 },
             .{ .name = "base_url", .type = ?[:0]const u8 },
             .{ .name = "system_prompt", .type = ?[:0]const u8 },
             .{ .name = "task", .type = ?[]const u8 },
-            .{ .name = "trace", .type = ?[]const u8 },
-            .{ .name = "save", .type = ?[]const u8 },
-            .{ .name = "attach", .short = 'a', .type = []const u8, .multiple = true },
+            .{ .name = "trace", .type = ?[]const u8, .path = true },
+            .{ .name = "trace_results", .type = bool },
+            .{ .name = "save", .type = ?[]const u8, .path = true },
+            .{ .name = "attach", .short = 'a', .type = []const u8, .multiple = true, .path = true },
             .{ .name = "verbosity", .type = ?AgentVerbosity },
             .{ .name = "effort", .type = ?Effort },
             .{ .name = "search_engine", .type = ?SearchEngine },
@@ -484,18 +496,24 @@ const Commands = cli.Builder(.{
     .{
         // Normalized to `.agent` in `parseArgs`; intentionally no LLM options.
         .name = "run",
-        .positional = .{ .name = "script_file", .type = ?[:0]const u8 },
+        .positional = .{ .name = "script_file", .type = ?[:0]const u8, .path = true },
         .options = .{},
         .shared_options = CommonOptions,
     },
     .{ .name = "version", .options = .{
         .{ .name = "check", .type = bool },
     } },
+    .{
+        .name = "completion",
+        .positional = .{ .name = "shell", .type = ?Shell },
+        .options = .{},
+    },
 });
 
 const RunMode = Commands.Enum;
 pub const Mode = Commands.Union;
 pub const Agent = @FieldType(Mode, "agent");
+const Serve = @FieldType(Mode, "serve");
 
 mode: Mode,
 // The command as typed. Mirrors `mode`, except `run` normalizes to `.agent`
@@ -528,6 +546,15 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
             if (@hasField(@TypeOf(m.*), "enable_external_stylesheets")) {
                 if (m.enable_external_stylesheets) {
                     // map deprecated property onto updated one
+                    m.load_resources.stylesheet = true;
+                }
+            }
+            // The agent-facing modes read visibility, which is wrong without
+            // external stylesheets: a menu hidden by an author class looks
+            // open. An explicit --load-resources replaces this default.
+            if (@hasField(@TypeOf(m.*), "load_resources")) {
+                const given = m.load_resources != LoadResources{};
+                if (!given and (config.command == .mcp or config.command == .agent)) {
                     m.load_resources.stylesheet = true;
                 }
             }
@@ -656,9 +683,10 @@ fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
     };
 }
 
-pub fn httpMaxConcurrent(self: *const Config) u8 {
+pub fn httpMaxConcurrent(self: *const Config) u16 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
+        .serve => |opts| opts.http_max_concurrent orelse std.math.clamp(opts.cdp_max_connections *| 8, 40, 256),
+        inline .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
         else => unreachable,
     };
 }
@@ -702,8 +730,10 @@ pub fn httpTimeout(self: *const Config) u31 {
     };
 }
 
+// https://fetch.spec.whatwg.org/#http-redirect-fetch
+// "If request’s redirect count is 20, then return a network error."
 pub fn httpMaxRedirects(_: *const Config) u8 {
-    return 10;
+    return 20;
 }
 
 pub fn httpMaxResponseSize(self: *const Config) ?usize {
@@ -815,22 +845,27 @@ pub fn cookieFile(self: *const Config) ?[]const u8 {
 
 pub fn cookieJarFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .fetch, .mcp, .agent => |opts| opts.cookie_jar,
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.cookie_jar,
         else => null,
     };
 }
 
 pub fn port(self: *const Config) u16 {
     return switch (self.mode) {
-        .serve => |opts| opts.port,
+        .serve => |opts| opts.port orelse 9222,
         .mcp => |opts| opts.cdp_port orelse 0,
         else => unreachable,
     };
 }
 
+// Optional in the option table so --unix-socket can reject an explicit one.
+pub fn serveHost(self: *const Config) []const u8 {
+    return self.mode.serve.host orelse "127.0.0.1";
+}
+
 pub fn advertiseHost(self: *const Config) []const u8 {
     return switch (self.mode) {
-        .serve => |opts| opts.advertise_host orelse advertiseHostFallback(opts.host),
+        .serve => |opts| opts.advertise_host orelse advertiseHostFallback(self.serveHost()),
         .mcp => "127.0.0.1",
         else => unreachable,
     };
@@ -846,13 +881,15 @@ pub fn explicitAdvertiseHost(self: *const Config) ?[]const u8 {
     };
 }
 
-// Wildcard bind addresses (0.0.0.0, ::) are not routable for clients
-// resolving /json/version. Fall back to a loopback address so the
-// advertised webSocketDebuggerUrl is at least connectable from the same
-// host (covers the official Docker image, which exposes 9222 via the
-// container's published port, and the WSL localhost bridge).
-// For remote hosts, users can still pin the URL with --advertise-host.
-// See issue #1922.
+// The origins (or `*`) a WebSocket upgrade may carry, as Chrome's flag of
+// the same name. Empty, any Origin is rejected.
+pub fn remoteAllowOrigins(self: *const Config) []const []const u8 {
+    return switch (self.mode) {
+        .serve => |opts| opts.remote_allow_origins.items,
+        else => &.{},
+    };
+}
+
 fn advertiseHostFallback(host: []const u8) []const u8 {
     if (isHostWildcard(host)) {
         return "127.0.0.1";
@@ -866,7 +903,7 @@ fn advertiseHostFallback(host: []const u8) []const u8 {
 // resolvable, but the caller still benefits from emitting a guidance log.
 pub fn bindIsWildcard(self: *const Config) bool {
     return switch (self.mode) {
-        .serve => |opts| opts.advertise_host == null and isHostWildcard(opts.host),
+        .serve => |opts| opts.advertise_host == null and isHostWildcard(self.serveHost()),
         else => false,
     };
 }
@@ -938,11 +975,10 @@ pub fn maxConnections(self: *const Config) u16 {
     };
 }
 
-// Null disables the reaper: sessions then only end on DELETE /session/{id}.
+// Null disables the reaper: sessions then only end on DELETE.
 pub fn httpSessionTimeout(self: *const Config) ?u64 {
     return switch (self.mode) {
-        .serve => |opts| if (opts.http_session_timeout == 0) null else @as(u64, opts.http_session_timeout) * 1000,
-        .mcp => 60_000, // 1 minute
+        inline .serve, .mcp => |opts| if (opts.http_session_timeout == 0) null else @as(u64, opts.http_session_timeout) * 1000,
         else => unreachable,
     };
 }
@@ -1005,7 +1041,10 @@ pub const DumpFormat = enum {
     wpt,
     semantic_tree,
     semantic_tree_text,
+    structured_data,
 };
+
+pub const Shell = enum { bash, fish, zsh };
 
 pub const WaitUntil = enum {
     load,
@@ -1179,8 +1218,8 @@ pub fn printUsageAndExit(self: *const Config, allocator: Allocator, help_for: Ru
             , .{ @field(Help, @tagName(tag)), Help.common_options });
             break :text try allocator.print(template, .{ exec_name, info_or_warn, pretty_or_logfmt });
         },
-        .version => text: {
-            const template = Help.version ++ "\n";
+        inline .version, .completion => |tag| text: {
+            const template = @field(Help, @tagName(tag)) ++ "\n";
             break :text try allocator.print(template, .{exec_name});
         },
     };
@@ -1267,6 +1306,25 @@ pub fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
             @field(agent_opts, field_name) = @field(run, field_name);
         }
         command = .{ .agent = agent_opts };
+    }
+
+    if (command == .serve) {
+        if (command.serve.unix_socket) |path| {
+            const opts = command.serve;
+            if (opts.host != null or opts.port != null or opts.advertise_host != null) {
+                log.fatal(.app, "invalid argument", .{ .arg = "--unix-socket", .hint = "cannot be combined with --host, --port or --advertise-host" });
+                return error.InvalidArgument;
+            }
+            // `:` would end the path in the advertised ws+unix:// URL.
+            if (std.fs.path.isAbsolute(path) == false or std.mem.findScalar(u8, path, ':') != null) {
+                log.fatal(.app, "invalid argument", .{ .arg = "--unix-socket", .value = path, .hint = "must be an absolute path without ':'" });
+                return error.InvalidArgument;
+            }
+            if (path.len >= @sizeOf(@FieldType(std.posix.sockaddr.un, "path"))) {
+                log.fatal(.app, "invalid argument", .{ .arg = "--unix-socket", .value = path, .hint = "path is too long" });
+                return error.InvalidArgument;
+            }
+        }
     }
 
     if (command == .fetch and command.fetch.url.items.len == 0) {
@@ -1404,6 +1462,45 @@ test "Config: parseArgs --http-session-timeout" {
         const proc_args: std.process.Args = .{ .vector = &argv };
         const config = try parseArgs(arena.allocator(), proc_args);
         try std.testing.expectEqual(null, config.httpSessionTimeout());
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "mcp" };
+        const proc_args: std.process.Args = .{ .vector = &argv };
+        const config = try parseArgs(arena.allocator(), proc_args);
+        try std.testing.expectEqual(null, config.httpSessionTimeout());
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "mcp", "--http-session-timeout", "600" };
+        const proc_args: std.process.Args = .{ .vector = &argv };
+        const config = try parseArgs(arena.allocator(), proc_args);
+        try std.testing.expectEqual(600_000, config.httpSessionTimeout());
+    }
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "mcp", "--http-session-timeout", "0" };
+        const proc_args: std.process.Args = .{ .vector = &argv };
+        const config = try parseArgs(arena.allocator(), proc_args);
+        try std.testing.expectEqual(null, config.httpSessionTimeout());
+    }
+}
+
+test "Config: httpMaxConcurrent default scales with --cdp-max-connections on serve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cases = [_]struct { argv: []const [*:0]const u8, expected: u16 }{
+        .{ .argv = &.{ "lightpanda", "serve" }, .expected = 128 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "2" }, .expected = 40 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "100" }, .expected = 256 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "65535" }, .expected = 256 },
+        .{ .argv = &.{ "lightpanda", "serve", "--cdp-max-connections", "100", "--http-max-concurrent", "1000" }, .expected = 1000 },
+        .{ .argv = &.{ "lightpanda", "serve", "--http-max-concurrent", "10" }, .expected = 10 },
+        .{ .argv = &.{ "lightpanda", "fetch", "https://example.com" }, .expected = 40 },
+        .{ .argv = &.{ "lightpanda", "mcp" }, .expected = 40 },
+    };
+    for (cases) |case| {
+        const proc_args: std.process.Args = .{ .vector = case.argv };
+        const config = try parseArgs(arena.allocator(), proc_args);
+        try std.testing.expectEqual(case.expected, config.httpMaxConcurrent());
     }
 }
 
@@ -1771,4 +1868,56 @@ pub fn tagJsonArray(comptime E: type) []const u8 {
         s = s ++ (if (i == 0) "\"" else ",\"") ++ field_name ++ "\"";
     }
     return s ++ "]";
+}
+
+test "Config: parseArgs --load-resources defaults stylesheets on for mcp and agent" {
+    // Parsing agent mode lowers the global log level, which other tests in
+    // this process expect log lines from.
+    const saved_log_opts = log.opts;
+    defer log.opts = saved_log_opts;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cases = [_]struct { argv: []const [*:0]const u8, stylesheet: bool, image: bool, beacon: bool = false }{
+        .{ .argv = &.{ "lightpanda", "mcp" }, .stylesheet = true, .image = false },
+        .{ .argv = &.{ "lightpanda", "agent", "--no-llm" }, .stylesheet = true, .image = false },
+        .{ .argv = &.{ "lightpanda", "fetch", "https://example.com" }, .stylesheet = false, .image = false },
+        .{ .argv = &.{ "lightpanda", "mcp", "--load-resources", "none" }, .stylesheet = false, .image = false },
+        .{ .argv = &.{ "lightpanda", "mcp", "--load-resources", "image" }, .stylesheet = false, .image = true },
+        .{ .argv = &.{ "lightpanda", "fetch", "--load-resources", "beacon", "https://example.com" }, .stylesheet = false, .image = false, .beacon = true },
+    };
+    for (cases) |case| {
+        const config = try parseArgs(arena.allocator(), .{ .vector = case.argv });
+        const resources = config.loadResources();
+        try std.testing.expectEqual(case.stylesheet, resources.stylesheet);
+        try std.testing.expectEqual(case.image, resources.image);
+        try std.testing.expectEqual(case.beacon, resources.beacon);
+    }
+}
+
+test "Config: --unix-socket rejects TCP flags and bad paths" {
+    log.expectLog(&.{ .app, .app, .app, .app, .app });
+    var long: [120:0]u8 = @splat('a');
+    long[0] = '/';
+    const cases = [_][]const [*:0]const u8{
+        &.{ "lightpanda", "serve", "--unix-socket", "/tmp/lp.sock", "--port", "9322" },
+        &.{ "lightpanda", "serve", "--unix-socket", "/tmp/lp.sock", "--host", "127.0.0.1" },
+        &.{ "lightpanda", "serve", "--unix-socket", "lp.sock" },
+        &.{ "lightpanda", "serve", "--unix-socket", "/tmp/lp:1.sock" },
+        &.{ "lightpanda", "serve", "--unix-socket", &long },
+    };
+    for (cases) |vector| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(error.InvalidArgument, parseArgs(arena.allocator(), .{ .vector = vector }));
+    }
+}
+
+test "Config: --unix-socket" {
+    const vector = [_][*:0]const u8{ "lightpanda", "serve", "--unix-socket", "/tmp/lp.sock", "--protocol", "webdriver" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const config = try parseArgs(arena.allocator(), .{ .vector = &vector });
+    try std.testing.expectEqualStrings("/tmp/lp.sock", config.mode.serve.unix_socket.?);
 }

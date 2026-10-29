@@ -38,10 +38,13 @@ pub fn write(self: *WritableStreamDefaultWriter, chunk: js.Value, exec: *const E
     };
 
     if (stream._state != .writable) {
-        return local.typeError("Stream is not writable");
+        return rejectNotWritable(stream, local);
     }
 
-    try stream.writeChunk(chunk, exec);
+    stream.writeChunk(chunk, exec) catch |err| switch (err) {
+        error.StreamError => return rejectNotWritable(stream, local),
+        else => return err,
+    };
 
     return local.resolvePromise(.{});
 }
@@ -52,13 +55,29 @@ pub fn close(self: *WritableStreamDefaultWriter, exec: *const Execution) !js.Pro
         return local.typeError("Writer has been released");
     };
 
+    // Unlike write(), an errored stream rejects with a new TypeError.
     if (stream._state != .writable) {
         return local.typeError("Stream is not writable");
     }
 
-    try stream.closeStream(exec);
+    stream.closeStream(exec) catch |err| switch (err) {
+        error.StreamError => return rejectNotWritable(stream, local),
+        else => return err,
+    };
 
     return local.resolvePromise(.{});
+}
+
+/// An errored stream rejects with what it errored with; a closed one with a TypeError.
+fn rejectNotWritable(stream: *const WritableStream, local: *const js.Local) !js.Promise {
+    switch (stream._state) {
+        .writable, .closed => return local.typeError("Stream is not writable"),
+        .errored => {
+            const resolver = local.createPromiseResolver();
+            resolver.reject("WritableStreamDefaultWriter", stream._stored_error.?);
+            return resolver.promise();
+        },
+    }
 }
 
 pub fn releaseLock(self: *WritableStreamDefaultWriter) void {
@@ -74,8 +93,10 @@ pub fn getClosed(self: *WritableStreamDefaultWriter, exec: *const Execution) !js
         return local.typeError("Writer has been released");
     };
 
-    if (stream._state == .closed) {
-        return local.resolvePromise(.{});
+    if (stream._state == .errored) {
+        const resolver = local.createPromiseResolver();
+        resolver.reject("WritableStreamDefaultWriter.closed", stream._stored_error.?);
+        return resolver.promise();
     }
 
     return local.resolvePromise(.{});
@@ -100,7 +121,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "WritableStreamDefaultWriter";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

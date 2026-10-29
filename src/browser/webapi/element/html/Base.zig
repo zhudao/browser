@@ -99,7 +99,7 @@ fn updateBaseURL(self: *Base, frame: *Frame) !void {
             return;
         }
     }
-    owner.base_url = try owner.arena.dupeSentinel(u8, resolved, 0);
+    owner.base_url = try owner.page_arena.dupeSentinel(u8, resolved, 0);
 }
 
 pub const JsApi = struct {
@@ -107,7 +107,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLBaseElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

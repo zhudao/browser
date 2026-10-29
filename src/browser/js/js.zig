@@ -182,6 +182,12 @@ pub const BufferSource = struct {
     bytes: []const u8,
 };
 
+// An ArrayBuffer or any typed array kind or a DataView, exposed as its raw bytes.
+// The underlaying value *can* be a SharedBuffer
+pub const AllowSharedBufferSource = struct {
+    bytes: []u8,
+};
+
 pub const ArrayType = enum(u8) {
     int8,
     uint8,
@@ -325,6 +331,42 @@ pub fn Nullable(comptime T: type) type {
     };
 }
 
+pub fn Variadic(comptime T: type) type {
+    return struct {
+        values: []const T,
+
+        pub const js_variadic = T;
+
+        pub fn init(values: []const T) @This() {
+            return .{ .values = values };
+        }
+    };
+}
+
+// A WebIDL [EnforceRange] integer. NaN, +/i infinity and values outside of T's
+// range are a TypeError.
+pub fn EnforceRange(comptime T: type) type {
+    return struct {
+        value: T = 0,
+
+        pub const js_enforce_range = T;
+    };
+}
+
+pub fn enforceRange(comptime T: type, value: f64) !T {
+    if (std.math.isFinite(value) == false) {
+        return error.TypeError;
+    }
+    // [EnforceRange] long long is limited to the safe integer range.
+    const min: f64 = @floatFromInt(@max(std.math.minInt(T), -9007199254740991));
+    const max: f64 = @floatFromInt(@min(std.math.maxInt(T), 9007199254740991));
+    const truncated = @trunc(value);
+    if (truncated < min or truncated > max) {
+        return error.TypeError;
+    }
+    return @intFromFloat(truncated);
+}
+
 pub const Exception = struct {
     local: *const Local,
     handle: *const v8.Value,
@@ -333,7 +375,8 @@ pub const Exception = struct {
 // These are simple types that we can convert to JS with only an isolate. This
 // is separated from the Caller's zigValueToJs to make it available when we
 // don't have a caller (i.e., when setting static attributes on types)
-pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool, comptime null_as_undefined: bool) if (fail) *const v8.Value else ?*const v8.Value {
+// Fails only for a string longer than V8 accepts (see Isolate.newString).
+pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool, comptime null_as_undefined: bool) error{InvalidStringLength}!(if (fail) *const v8.Value else ?*const v8.Value) {
     switch (@typeInfo(@TypeOf(value))) {
         .void => return isolate.initUndefined(),
         .null => if (comptime null_as_undefined) return isolate.initUndefined() else return isolate.initNull(),
@@ -360,12 +403,12 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
         .float, .comptime_float => return @ptrCast(isolate.initNumber(value).handle),
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                return @ptrCast(isolate.initStringHandle(value));
+                return @ptrCast(try isolate.initStringHandle(value));
             }
             if (ptr.size == .one) {
                 const one_info = @typeInfo(ptr.child);
                 if (one_info == .array and one_info.array.child == u8) {
-                    return @ptrCast(isolate.initStringHandle(value));
+                    return @ptrCast(try isolate.initStringHandle(value));
                 }
             }
         },
@@ -381,8 +424,8 @@ pub fn simpleZigValueToJs(isolate: Isolate, value: anytype, comptime fail: bool,
         },
         .@"struct" => {
             switch (@TypeOf(value)) {
-                string.String => return isolate.initStringHandle(value.str()),
-                String.OneByte => return @ptrCast(isolate.initOneByteStringHandle(value.bytes)),
+                string.String => return @ptrCast(try isolate.initStringHandle(value.str())),
+                String.OneByte => return @ptrCast(try isolate.initOneByteStringHandle(value.bytes)),
                 ArrayBuffer => {
                     const values = value.values;
                     const len = values.len;
@@ -480,8 +523,8 @@ pub export fn v8_inspector__Client__IMPL__valueSubtype(
     _: *v8.InspectorClientImpl,
     c_value: *const v8.Value,
 ) callconv(.c) [*c]const u8 {
-    const external_entry = Inspector.getTaggedOpaque(c_value) orelse return null;
-    return if (external_entry.subtype) |st| @tagName(st) else null;
+    const tao = Inspector.getTaggedOpaque(c_value) orelse return null;
+    return if (inspectorSubtype(tao)) |st| @tagName(st) else null;
 }
 
 // Same as valueSubType above, but for the optional description field.
@@ -497,17 +540,30 @@ pub export fn v8_inspector__Client__IMPL__descriptionForValueSubtype(
 
     // Without a description, V8 drops the subtype, except for "error": it
     // then describes the value itself ("name: message", plus the stack).
-    const external_entry = Inspector.getTaggedOpaque(c_value) orelse return null;
-    const subtype = external_entry.subtype orelse return null;
+    const tao = Inspector.getTaggedOpaque(c_value) orelse return null;
+    const subtype = inspectorSubtype(tao) orelse return null;
     if (subtype == .@"error") {
         return null;
     }
     return "";
 }
 
+// The subtype the inspector reports for one of our objects, as Chrome does:
+// "node" for Nodes, "error" for DOMExceptions, none for everything else.
+fn inspectorSubtype(tao: TaggedOpaque) ?bridge.SubType {
+    if (tao.is(@import("../webapi/Node.zig"))) {
+        return .node;
+    }
+    if (tao.is(@import("../webapi/DOMException.zig"))) {
+        return .@"error";
+    }
+    return null;
+}
+
 test "TaggedAnyOpaque" {
     // If we grow this, fine, but it should be a conscious decision
-    try std.testing.expectEqual(24, @sizeOf(TaggedOpaque));
+    // It used to be 24, and that worked ok.
+    try testing.expectEqual(16, @sizeOf(TaggedOpaque));
 }
 
 test "js: ArrayBuffers crossing Zig don't keep a reference to their backing store" {
@@ -526,16 +582,65 @@ test "js: ArrayBuffers crossing Zig don't keep a reference to their backing stor
     _ = created.slice();
     try testing.expectEqual(1, backingStoreRefs(created.handle));
 
-    const typed = simpleZigValueToJs(local.isolate, TypedArray(u8){ .values = "abc" }, true, false);
+    const typed = try simpleZigValueToJs(local.isolate, TypedArray(u8){ .values = "abc" }, true, false);
     try testing.expectEqual(1, backingStoreRefs(typed));
 
-    const buffer = simpleZigValueToJs(local.isolate, ArrayBuffer{ .values = "abc" }, true, false);
+    const buffer = try simpleZigValueToJs(local.isolate, ArrayBuffer{ .values = "abc" }, true, false);
     try testing.expectEqual(1, backingStoreRefs(buffer));
 
     const from_js = try local.exec("new Uint8Array(8)", null);
     _ = try from_js.toStringSmart();
     _ = try from_js.toZig(TypedArray(u8));
     try testing.expectEqual(1, backingStoreRefs(from_js.handle));
+}
+
+// A slice claiming `len` bytes over a 1-byte buffer. Only valid for code that
+// rejects it on its length before reading any byte: V8 compares the length
+// against String::kMaxLength before touching the data, and lengths that don't
+// fit a c_int never reach V8.
+fn overlongString(len: usize) []const u8 {
+    const byte: *const [1]u8 = "a";
+    const base: [*]const u8 = byte;
+    return base[0..len];
+}
+
+test "js: a string longer than V8 accepts fails with RangeError instead of crashing" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const State = struct {
+        len: usize,
+
+        fn text(self: *@This()) []const u8 {
+            return overlongString(self.len);
+        }
+    };
+    const driver = try local.exec("(function(text) { try { text(); } catch (e) { return String(e); } })", null);
+    const driver_fn = Function{ .local = local, .handle = @ptrCast(driver.handle) };
+
+    // Just above v8::String::kMaxLength on 64-bit builds, then past c_int.
+    for ([_]usize{ 1 << 29, 1 << 31 }) |len| {
+        const str = overlongString(len);
+        try testing.expectError(error.InvalidStringLength, local.zigValueToJs(str, .{}));
+        try testing.expectError(error.InvalidStringLength, local.zigValueToJs(String.OneByte{ .bytes = str }, .{}));
+        try testing.expectError(error.InvalidStringLength, local.parseJSON(str));
+        try testing.expectError(error.InvalidStringLength, local.compile(str, null));
+
+        var state = State{ .len = len };
+        const res = try driver_fn.call([]const u8, .{local.newCallback(State.text, &state)});
+        try testing.expectEqual("RangeError: Invalid string length", res);
+
+        // Nothing handles the rejection.
+        testing.expectLog(&.{.page_error});
+        const promise = try local.resolvePromise(str);
+        try testing.expectEqual(.rejected, promise.state());
+        try testing.expectEqual("RangeError: Invalid string length", try promise.result().toStringSmart());
+    }
 }
 
 // References held on an ArrayBuffer's (or a view's) backing store, not
@@ -634,4 +739,16 @@ pub fn writeStackTrace(isolate: *v8.Isolate, stack_handle: *const v8.StackTrace,
             v8.v8__StackFrame__GetColumn(frame_handle),
         });
     }
+}
+
+test "js: enforceRange" {
+    try testing.expectEqual(@as(u32, 5), try enforceRange(u32, 5.9));
+    try testing.expectEqual(@as(i64, -10), try enforceRange(i64, -10));
+    try testing.expectError(error.TypeError, enforceRange(u32, -1));
+    try testing.expectError(error.TypeError, enforceRange(u32, 4294967296));
+    try testing.expectError(error.TypeError, enforceRange(i64, std.math.nan(f64)));
+    try testing.expectError(error.TypeError, enforceRange(u64, std.math.inf(f64)));
+    try testing.expectError(error.TypeError, enforceRange(u64, 9007199254740992));
+    try testing.expectEqual(@as(u16, 65535), try enforceRange(u16, 65535.5));
+    try testing.expectError(error.TypeError, enforceRange(u16, 65536));
 }

@@ -69,7 +69,7 @@ fn getCookies(cmd: *CDP.Command) !void {
         }
     }
     bc.session.cookie_jar.removeExpired(null);
-    const writer = CookieWriter{ .cookies = bc.session.cookie_jar.cookies.items };
+    const writer = CookieWriter{ .jar = &bc.session.cookie_jar };
     try cmd.sendResult(.{ .cookies = writer }, .{});
 }
 
@@ -207,7 +207,8 @@ fn buildCdpCookie(allocator: Allocator, param: CdpCookie) !Cookie {
         .value = param.value,
         .domain = if (dotted) domain else null,
         .path = param.path,
-        .expires = param.expires,
+        // As Chrome's MakeCookieFromProtocolValues, a negative expires is a session cookie.
+        .expires = if (param.expires) |e| (if (e < 0) null else e) else null,
         .secure = secure,
         .http_only = param.httpOnly,
         .same_site = parseSameSite(param.sameSite),
@@ -233,7 +234,7 @@ fn parseSameSite(value: ?[]const u8) ?Cookie.SameSite {
 }
 
 pub const CookieWriter = struct {
-    cookies: []const Cookie,
+    jar: *const Cookie.Jar,
     urls: ?[]const PreparedUri = null,
 
     pub fn jsonStringify(self: *const CookieWriter, w: anytype) !void {
@@ -246,8 +247,9 @@ pub const CookieWriter = struct {
 
     fn writeCookies(self: CookieWriter, w: anytype) !void {
         try w.beginArray();
+        var it = self.jar.iterator();
         if (self.urls) |urls| {
-            for (self.cookies) |*cookie| {
+            while (it.next()) |cookie| {
                 for (urls) |*url| {
                     if (cookie.appliesTo(url, .{ .same_site = true, .is_http = true, .kind = .navigation })) { // TBD same_site, should we compare to the pages url?
                         try writeCookie(cookie, w);
@@ -256,7 +258,7 @@ pub const CookieWriter = struct {
                 }
             }
         } else {
-            for (self.cookies) |*cookie| {
+            while (it.next()) |cookie| {
                 try writeCookie(cookie, w);
             }
         }
@@ -322,13 +324,23 @@ test "cdp.Storage: setCookies takes back the cookies getCookies gave" {
     const cookie: CdpCookie = .{ .name = "a", .value = "v", .domain = "example.com", .secure = true, .priority = "High", .sourceScheme = .Secure, .sourcePort = 443 };
     try ctx.processMessage(.{ .id = 1, .method = "Storage.setCookies", .params = .{ .cookies = &[_]CdpCookie{cookie} } });
     try ctx.expectSentResult(null, .{ .id = 1 });
-    try testing.expectEqual(1, ctx.cdp().browser_context.?.session.cookie_jar.cookies.items.len);
+    try testing.expectEqual(1, ctx.cdp().browser_context.?.session.cookie_jar.len);
 
     var expired = cookie;
     expired.expires = 1;
     try ctx.processMessage(.{ .id = 2, .method = "Storage.setCookies", .params = .{ .cookies = &[_]CdpCookie{expired} } });
     try ctx.expectSentResult(null, .{ .id = 2 });
-    try testing.expectEqual(0, ctx.cdp().browser_context.?.session.cookie_jar.cookies.items.len);
+    try testing.expectEqual(0, ctx.cdp().browser_context.?.session.cookie_jar.len);
+
+    // getCookies reports a session cookie with expires: -1.
+    var session = cookie;
+    session.expires = -1;
+    try ctx.processMessage(.{ .id = 5, .method = "Storage.setCookies", .params = .{ .cookies = &[_]CdpCookie{session} } });
+    try ctx.expectSentResult(null, .{ .id = 5 });
+    const jar = &ctx.cdp().browser_context.?.session.cookie_jar;
+    try testing.expectEqual(1, jar.len);
+    var it = jar.iterator();
+    try testing.expectEqual(null, it.next().?.expires);
 
     // What Chrome refuses among those fields.
     var bad_port = cookie;

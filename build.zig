@@ -43,6 +43,7 @@ pub fn build(b: *Build) !void {
     const enable_csan = b.option(std.zig.SanitizeC, "csan", "Enable C Sanitizers");
 
     const prebuilt_v8_path_option = b.option([]const u8, "prebuilt_v8_path", "Path to a prebuilt libc_v8.a or libc_v8.so");
+    const prebuilt_rust_path = b.option([]const u8, "prebuilt_rust_path", "Path to a prebuilt liblightpanda_ffi.a (skips invoking cargo)");
 
     const dev_fast = b.option(bool, "dev_fast", "Linux debug builds: shared V8 + self-hosted backend. Implies -Dshared_v8, -Duse_llvm=false and a bundled-CRT target") orelse
         (builtin.target.os.tag == .linux and builtin.target.cpu.arch == .x86_64 and
@@ -131,7 +132,7 @@ pub fn build(b: *Build) !void {
     const v8_for_link = if (orderfile != null and v8_archive != null and !shared_v8) markHotSections(b, v8_archive.?) else v8_archive;
     linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8);
     linkCurl(b, lightpanda_module, deps, enable_tsan, orderfile != null);
-    linkRust(b, lightpanda_module, deps);
+    linkRust(b, lightpanda_module, deps, prebuilt_rust_path);
     linkZenai(b, lightpanda_module);
     linkIsocline(b, lightpanda_module);
     linkSqlite(b, lightpanda_module, deps, enable_csan, enable_tsan, orderfile != null);
@@ -190,19 +191,17 @@ pub fn build(b: *Build) !void {
     }
 
     {
-        // skills generator
-        const exe = addExe(b, exe_config, "lightpanda-skills", "skills_check", "src/main_skills.zig");
-
+        // fixture server, for opening src/browser/tests in another browser
+        const exe = addExe(b, exe_config, "lightpanda-test-server", "test_server_check", "src/main_test_server.zig");
         const run_cmd = b.addRunArtifact(exe);
-        const out_dir = run_cmd.addOutputDirectoryArg2("skills", .{});
-        const install = b.addInstallDirectory(.{
-            .source_dir = out_dir,
-            .install_dir = .prefix,
-            .install_subdir = "skills",
-        });
-        const skills_step = b.step("skills", "Generate LLM skill docs (zig-out/skills/<name>/SKILL.md)");
-        skills_step.dependOn(&install.step);
+        // fixtures are served relative to the cwd
+        run_cmd.setCwd(b.path("."));
+        const run_step = b.step("test-server", "Serve the test fixtures on 127.0.0.1:9582 (WebSocket 9584)");
+        run_step.dependOn(&run_cmd.step);
     }
+
+    addGenerator(b, exe_config, "skills", "Generate LLM skill docs (zig-out/skills/<name>/SKILL.md)");
+    addGenerator(b, exe_config, "docs", "Generate reference partials for the docs site (zig-out/docs/*.mdx)");
 
     {
         // test
@@ -214,6 +213,29 @@ pub fn build(b: *Build) !void {
         const run_tests = b.addRunArtifact(tests);
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_tests.step);
+    }
+
+    {
+        // kcov can't read line info from the self-hosted backend's DWARF.
+        const cov_tests = b.addTest(.{
+            .root_module = lightpanda_module,
+            .use_llvm = true,
+            .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .simple },
+        });
+        const kcov = b.addSystemCommand(&.{ "kcov", "--clean" });
+        // Otherwise stdio is checked and the runner's stderr summary fails the step.
+        kcov.has_side_effects = true;
+        kcov.addPrefixedDirectoryArg("--include-path=", b.path("src"));
+        const report = kcov.addOutputDirectoryArg("coverage");
+        kcov.addArtifactArg(cov_tests);
+        // Shards are separate processes, each with its own report.
+        kcov.setEnvironmentVariable("TEST_JOBS", "1");
+        // Part of the cache key, so each filter gets a fresh report directory.
+        kcov.setEnvironmentVariable("TEST_FILTER", b.graph.environ_map.get("TEST_FILTER") orelse "");
+
+        const install = b.addInstallDirectory(.{ .source_dir = report, .install_dir = .prefix, .install_subdir = "coverage" });
+        const coverage_step = b.step("coverage", "Run unit tests under kcov (zig-out/coverage/index.html)");
+        coverage_step.dependOn(&install.step);
     }
 }
 
@@ -232,6 +254,20 @@ const ExeConfig = struct {
     sanitize_c: ?std.zig.SanitizeC,
     sanitize_thread: bool,
 };
+
+/// A `zig build <name>` step that runs `src/main_<name>.zig` with an output
+/// directory and installs what it writes to `zig-out/<name>`.
+fn addGenerator(b: *Build, config: ExeConfig, comptime name: []const u8, description: []const u8) void {
+    const exe = addExe(b, config, "lightpanda-" ++ name, name ++ "_check", "src/main_" ++ name ++ ".zig");
+    const run_cmd = b.addRunArtifact(exe);
+    const out_dir = run_cmd.addOutputDirectoryArg2(name, .{});
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_dir,
+        .install_dir = .prefix,
+        .install_subdir = name,
+    });
+    b.step(name, description).dependOn(&install.step);
+}
 
 fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8, root_source_file: []const u8) *Build.Step.Compile {
     const exe = b.addExecutable(.{
@@ -397,7 +433,12 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
+fn linkRust(b: *Build, mod: *Build.Module, deps: Deps, prebuilt_rust_path: ?[]const u8) void {
+    if (prebuilt_rust_path) |path| {
+        mod.addObjectFile(.{ .cwd_relative = path });
+        return;
+    }
+
     // Cargo's "dev" profile writes to target/debug.
     const profile, const out_subdir = if (deps.optimize == .debug) .{ "dev", "debug" } else .{ "release", "release" };
 
@@ -893,6 +934,7 @@ fn buildCurl(
         .HAVE_CLOSESOCKET = is_windows,
         .HAVE_DECL_FSEEKO = !is_windows,
         .HAVE_EVENTFD = is_linux or is_freebsd or is_netbsd,
+        .HAVE_FCHMOD = !is_windows,
         .HAVE_FCNTL = !is_windows,
         .HAVE_FCNTL_O_NONBLOCK = !is_windows,
         .HAVE_FNMATCH = !is_windows,
@@ -963,56 +1005,55 @@ fn buildCurl(
         },
         .files = &.{
             // You can include all files from lib, libcurl uses #ifdef-guards to exclude code for disabled functions
-            "altsvc.c",                "amigaos.c",              "api.c",               "bufq.c",
-            "bufref.c",                "cf-h1-proxy.c",          "cf-h2-proxy.c",       "cf-haproxy.c",
-            "cf-https-connect.c",      "cf-ip-happy.c",          "cf-recvbuf.c",        "cf-setup.c",
-            "cf-socket.c",             "cfilters.c",             "conncache.c",         "connect.c",
-            "content_encoding.c",      "cookie.c",               "creds.c",             "cshutdn.c",
-            "curl_addrinfo.c",         "curl_ed25519.c",         "curl_endian.c",       "curl_fnmatch.c",
-            "curl_fopen.c",            "curl_get_line.c",        "curl_gethostname.c",  "curl_gssapi.c",
-            "curl_memrchr.c",          "curl_ntlm_core.c",       "curl_range.c",        "curl_sasl.c",
-            "curl_sha512_256.c",       "curl_share.c",           "curl_sspi.c",         "curl_threads.c",
-            "curl_trc.c",              "curlx/base64.c",         "curlx/basename.c",    "curlx/dynbuf.c",
-            "curlx/fopen.c",           "curlx/inet_ntop.c",      "curlx/inet_pton.c",   "curlx/multibyte.c",
-            "curlx/nonblock.c",        "curlx/snprintf.c",       "curlx/strcopy.c",     "curlx/strdup.c",
-            "curlx/strerr.c",          "curlx/strparse.c",       "curlx/timediff.c",    "curlx/timeval.c",
-            "curlx/version_win32.c",   "curlx/wait.c",           "curlx/warnless.c",    "curlx/winapi.c",
-            "cw-out.c",                "cw-pause.c",             "dict.c",              "dllmain.c",
-            "dynhds.c",                "easy.c",                 "easygetopt.c",        "easyoptions.c",
-            "escape.c",                "fake_addrinfo.c",        "file.c",              "fileinfo.c",
-            "formdata.c",              "ftp.c",                  "ftplistparser.c",     "getenv.c",
-            "getinfo.c",               "gopher.c",               "hash.c",              "headers.c",
-            "hmac.c",                  "hsts.c",                 "http.c",              "http1.c",
-            "http2.c",                 "http_aws_sigv4.c",       "http_chunks.c",       "http_digest.c",
-            "http_httpsig.c",          "http_negotiate.c",       "http_ntlm.c",         "http_proxy.c",
-            "idn.c",                   "if2ip.c",                "imap.c",              "ldap.c",
-            "llist.c",                 "macos.c",                "md4.c",               "md5.c",
-            "memdebug.c",              "mime.c",                 "mprintf.c",           "mqtt.c",
-            "multi.c",                 "multi_ev.c",             "multi_ntfy.c",        "netrc.c",
-            "openldap.c",              "parsedate.c",            "peer.c",              "pingpong.c",
-            "pop3.c",                  "progress.c",             "protocol.c",          "proxy.c",
-            "psl.c",                   "rand.c",                 "ratelimit.c",         "request.c",
-            "rtsp.c",                  "select.c",               "sendf.c",             "setopt.c",
-            "sha256.c",                "slist.c",                "smb.c",               "smtp.c",
-            "socketpair.c",            "socks.c",                "socks_gssapi.c",      "socks_sspi.c",
-            "splay.c",                 "strcase.c",              "strequal.c",          "strerror.c",
-            "system_win32.c",          "telnet.c",               "tftp.c",              "thrdpool.c",
-            "thrdqueue.c",             "transfer.c",             "uint-bset.c",         "uint-hash.c",
-            "uint-hashset.c",          "uint-spbset.c",          "uint-table.c",        "url.c",
-            "urlapi.c",                "vauth/cleartext.c",      "vauth/cram.c",        "vauth/digest.c",
-            "vauth/digest_sspi.c",     "vauth/gsasl.c",          "vauth/krb5_gssapi.c", "vauth/krb5_sspi.c",
-            "vauth/ntlm.c",            "vauth/ntlm_sspi.c",      "vauth/oauth2.c",      "vauth/spnego_gssapi.c",
-            "vauth/spnego_sspi.c",     "vauth/vauth.c",          "vdns/asyn-ares.c",    "vdns/asyn-base.c",
-            "vdns/asyn-thrdd.c",       "vdns/cf-dns.c",          "vdns/dnscache.c",     "vdns/doh.c",
-            "vdns/hostip.c",           "vdns/hostip4.c",         "vdns/hostip6.c",      "vdns/httpsrr.c",
-            "version.c",               "vquic/capsule.c",        "vquic/cf-capsule.c",  "vquic/cf-ngtcp2-cmn.c",
-            "vquic/cf-ngtcp2-proxy.c", "vquic/cf-ngtcp2.c",      "vquic/cf-quiche.c",   "vquic/vquic-tls.c",
-            "vquic/vquic.c",           "vssh/libssh.c",          "vssh/libssh2.c",      "vssh/vssh.c",
-            "vtls/apple.c",            "vtls/cipher_suite.c",    "vtls/gtls.c",         "vtls/hostcheck.c",
-            "vtls/keylog.c",           "vtls/mbedtls.c",         "vtls/openssl.c",      "vtls/rustls.c",
-            "vtls/schannel.c",         "vtls/schannel_verify.c", "vtls/vtls.c",         "vtls/vtls_config.c",
-            "vtls/vtls_scache.c",      "vtls/vtls_spack.c",      "vtls/wolfssl.c",      "vtls/x509asn1.c",
-            "ws.c",
+            "altsvc.c",                "amigaos.c",           "api.c",                 "bufq.c",
+            "bufref.c",                "cf-h1-proxy.c",       "cf-h2-proxy.c",         "cf-haproxy.c",
+            "cf-https-connect.c",      "cfilters.c",          "cf-ip-happy.c",         "cf-recvbuf.c",
+            "cf-setup.c",              "cf-socket.c",         "conncache.c",           "connect.c",
+            "content_encoding.c",      "cookie.c",            "creds.c",               "cshutdn.c",
+            "curl_addrinfo.c",         "curl_ed25519.c",      "curl_endian.c",         "curl_fnmatch.c",
+            "curl_fopen.c",            "curl_gethostname.c",  "curl_get_line.c",       "curl_gssapi.c",
+            "curl_memrchr.c",          "curl_ntlm_core.c",    "curl_range.c",          "curl_sasl.c",
+            "curl_sha512_256.c",       "curl_share.c",        "curl_sspi.c",           "curl_threads.c",
+            "curl_trc.c",              "curlx/base64.c",      "curlx/basename.c",      "curlx/dynbuf.c",
+            "curlx/inet_ntop.c",       "curlx/inet_pton.c",   "curlx/multibyte.c",     "curlx/nonblock.c",
+            "curlx/snprintf.c",        "curlx/strcopy.c",     "curlx/strdup.c",        "curlx/strerr.c",
+            "curlx/strparse.c",        "curlx/timediff.c",    "curlx/timeval.c",       "curlx/version_win32.c",
+            "curlx/wait.c",            "curlx/warnless.c",    "curlx/win32-fopen.c",   "curlx/winapi.c",
+            "cw-out.c",                "cw-pause.c",          "dict.c",                "dllmain.c",
+            "dynhds.c",                "easy.c",              "easygetopt.c",          "easyoptions.c",
+            "escape.c",                "fake_addrinfo.c",     "file.c",                "fileinfo.c",
+            "formdata.c",              "ftp.c",               "ftplistparser.c",       "getenv.c",
+            "getinfo.c",               "gopher.c",            "hash.c",                "headers.c",
+            "hmac.c",                  "hsts.c",              "http1.c",               "http2.c",
+            "http_aws_sigv4.c",        "http.c",              "http_chunks.c",         "http_digest.c",
+            "http_httpsig.c",          "http_negotiate.c",    "http_ntlm.c",           "http_proxy.c",
+            "idn.c",                   "if2ip.c",             "imap.c",                "ldap.c",
+            "llist.c",                 "macos.c",             "md4.c",                 "md5.c",
+            "memdebug.c",              "mime.c",              "mprintf.c",             "mqtt.c",
+            "multi.c",                 "multi_ev.c",          "multi_ntfy.c",          "netrc.c",
+            "openldap.c",              "parsedate.c",         "peer.c",                "pingpong.c",
+            "pop3.c",                  "progress.c",          "protocol.c",            "proxy.c",
+            "psl.c",                   "ptrarray.c",          "rand.c",                "ratelimit.c",
+            "request.c",               "rtsp.c",              "select.c",              "sendf.c",
+            "setopt.c",                "sha256.c",            "slist.c",               "smtp.c",
+            "socketpair.c",            "socks.c",             "socks_gssapi.c",        "socks_sspi.c",
+            "splay.c",                 "strcase.c",           "strequal.c",            "strerror.c",
+            "telnet.c",                "tftp.c",              "thrdpool.c",            "thrdqueue.c",
+            "transfer.c",              "u32_ptrset.c",        "u8_strset.c",           "uint-bset.c",
+            "uint-spbset.c",           "uint-table.c",        "urlapi.c",              "url.c",
+            "vauth/cleartext.c",       "vauth/cram.c",        "vauth/digest.c",        "vauth/digest_sspi.c",
+            "vauth/gsasl.c",           "vauth/krb5_gssapi.c", "vauth/krb5_sspi.c",     "vauth/ntlm.c",
+            "vauth/ntlm_sspi.c",       "vauth/oauth2.c",      "vauth/spnego_gssapi.c", "vauth/spnego_sspi.c",
+            "vauth/vauth.c",           "vdns/asyn-ares.c",    "vdns/asyn-base.c",      "vdns/asyn-thrdd.c",
+            "vdns/cf-dns.c",           "vdns/dnscache.c",     "vdns/doh.c",            "vdns/hostip4.c",
+            "vdns/hostip6.c",          "vdns/hostip.c",       "vdns/httpsrr.c",        "version.c",
+            "vquic/capsule.c",         "vquic/cf-capsule.c",  "vquic/cf-ngtcp2.c",     "vquic/cf-ngtcp2-cmn.c",
+            "vquic/cf-ngtcp2-proxy.c", "vquic/cf-quiche.c",   "vquic/vquic.c",         "vquic/vquic-tls.c",
+            "vssh/libssh2.c",          "vssh/libssh.c",       "vssh/vssh.c",           "vtls/apple.c",
+            "vtls/cipher_suite.c",     "vtls/gtls.c",         "vtls/hostcheck.c",      "vtls/keylog.c",
+            "vtls/mbedtls.c",          "vtls/openssl.c",      "vtls/rustls.c",         "vtls/schannel.c",
+            "vtls/schannel_verify.c",  "vtls/vtls.c",         "vtls/vtls_config.c",    "vtls/vtls_scache.c",
+            "vtls/vtls_spack.c",       "vtls/wolfssl.c",      "vtls/x509asn1.c",       "ws.c",
         },
     });
 

@@ -22,7 +22,9 @@ const lp = @import("lightpanda");
 const idna = @import("../../sys/idna.zig");
 const public_suffix_list = @import("../../data/public_suffix_list.zig");
 
+const EventTarget = @import("EventTarget.zig");
 const URL = @import("../URL.zig");
+const IdMap = @import("../IdMap.zig");
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
 const Frame = @import("../Frame.zig");
@@ -35,6 +37,7 @@ const Location = @import("Location.zig");
 const collections = @import("collections.zig");
 const Selector = @import("selector/Selector.zig");
 const DOMTreeWalker = @import("DOMTreeWalker.zig");
+const TreeWalker = @import("TreeWalker.zig");
 const DOMNodeIterator = @import("DOMNodeIterator.zig");
 const DOMImplementation = @import("DOMImplementation.zig");
 const StyleSheetList = @import("css/StyleSheetList.zig");
@@ -43,6 +46,7 @@ const Selection = @import("Selection.zig");
 const Sanitizer = @import("Sanitizer.zig");
 const XPathResult = @import("XPathResult.zig");
 const XPathExpression = @import("XPathExpression.zig");
+const exec_command = @import("../frame/exec_command.zig");
 
 pub const XMLDocument = @import("XMLDocument.zig");
 pub const HTMLDocument = @import("HTMLDocument.zig");
@@ -70,10 +74,14 @@ _ready_state: ReadyState = .loading,
 _load_aborted: bool = false,
 // HTML's "active parser was aborted" flag also makes open/write no-ops.
 _active_parser_aborted: bool = false,
+// Its frame navigated to another document: open/write are no-ops.
+_navigated_away: bool = false,
+// The iframe load event steps' flags: a document.open() while the element's
+// load event fires for this document mutes its later ones.
+_iframe_load_in_progress: bool = false,
+_mute_iframe_load: bool = false,
 _current_script: ?*Element.Html.Script = null,
-_elements_by_id: std.StringHashMapUnmanaged(*Element) = .empty,
-// Track IDs that were removed from the map - they might have duplicates in the tree
-_removed_ids: std.StringHashMapUnmanaged(void) = .empty,
+_ids: IdMap = .{},
 _active_element: ?*Element = null,
 _style_sheets: ?*StyleSheetList = null,
 _implementation: ?*DOMImplementation = null,
@@ -81,6 +89,8 @@ _fonts: ?*FontFaceSet = null,
 _write_insertion_point: ?*Node = null,
 _script_created_parser: ?Parser.Streaming = null,
 _close_requested: bool = false,
+// an execCommand is running: a nested one is refused
+_exec_command_running: bool = false,
 _adopted_style_sheets: ?js.Object.Global = null,
 _selection: Selection = .{ ._rc = .init(1) },
 // extent() cache, keyed on style version and viewport.
@@ -92,41 +102,14 @@ _extent: ?struct {
 } = null,
 // Ordered stack of currently-showing popovers
 _open_popovers: std.ArrayList(*Element) = .empty,
+// Ordered stack of dialogs opened with showModal(), topmost last. Stands in
+// for the top layer and the close watchers those dialogs establish.
+_modal_dialogs: std.ArrayList(*Element.Html.Dialog) = .empty,
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#throw-on-dynamic-markup-insertion-counter
 // Incremented during custom element reactions when parsing. When > 0,
 // document.open/close/write/writeln must throw InvalidStateError.
 _throw_on_dynamic_markup_insertion_counter: u32 = 0,
-
-_on_selectionchange: ?js.Function.Global = null,
-
-fn getOnSelectionChange(self: *Document) ?js.Function.Global {
-    return self._on_selectionchange;
-}
-
-fn setOnSelectionChange(self: *Document, listener: ?js.Function) !void {
-    if (listener) |listen| {
-        self._on_selectionchange = try listen.persistWithThis(self);
-    } else {
-        self._on_selectionchange = null;
-    }
-}
-
-// Stored in the frame's attribute-listener map (like element and ShadowRoot
-// property handlers), which the dispatch propagation path consults for any
-// event target.
-fn getOnClick(self: *Document, frame: *Frame) ?js.Function.Global {
-    return (self._frame orelse frame)._event_target_attr_listeners.get(.{ .target = self.asEventTarget(), .handler = .onclick });
-}
-
-fn setOnClick(self: *Document, setter: ?Window.FunctionSetter, frame: *Frame) !void {
-    const owner = self._frame orelse frame;
-    if (Window.getFunctionFromSetter(setter)) |cb| {
-        try owner._event_target_attr_listeners.put(owner.arena, .{ .target = self.asEventTarget(), .handler = .onclick }, cb);
-    } else {
-        _ = owner._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = .onclick });
-    }
-}
 
 pub const Type = union(enum) {
     generic,
@@ -159,7 +142,7 @@ pub fn asNode(self: *Document) *Node {
     return self._proto;
 }
 
-pub fn asEventTarget(self: *Document) *@import("EventTarget.zig") {
+pub fn asEventTarget(self: *Document) *EventTarget {
     return self._proto.asEventTarget();
 }
 
@@ -176,7 +159,7 @@ pub fn getLocation(self: *const Document) ?*Location {
 fn setLocation(self: *Document, url: [:0]const u8) !void {
     if (self._type != .html) return;
     const frame = self._frame orelse return;
-    return frame.scheduleNavigation(url, .{ .reason = .script, .kind = .{ .push = null } }, .{ .script = frame });
+    return frame.scheduleNavigation(url, .{ .reason = .script, .kind = Location.historyHandling(frame) }, .{ .script = frame });
 }
 
 // Approximation of quirks mode: an HTML document without a doctype is in quirks mode.
@@ -335,7 +318,7 @@ pub fn setCookie(self: *Document, cookie_str: []const u8, frame: *Frame) ![]cons
         c.deinit();
         return ""; // SameSite cookies cannot be set from a cross-site context.
     }
-    try frame._session.cookie_jar.add(c, lp.datetime.timestamp(.real), false);
+    try frame._session.cookie_jar.addFromUrl(frame.url, c, lp.datetime.timestamp(.real), false);
     return cookie_str;
 }
 
@@ -381,7 +364,11 @@ pub fn createElement(self: *Document, name: []const u8, options_: ?CreateElement
     try validateElementName(name);
     const ns: Element.Namespace, const normalized_name = blk: {
         if (self._type == .html) {
-            break :blk .{ .html, std.ascii.lowerString(&frame.buf, name) };
+            const lower = if (Element.Attribute.needsLowerCasing(name))
+                try std.ascii.allocLowerString(frame.local_arena, name)
+            else
+                name;
+            break :blk .{ .html, lower };
         }
         // Generic and XML documents create elements with null namespace
         break :blk .{ .null, name };
@@ -410,7 +397,7 @@ pub fn createElementNS(self: *Document, namespace: ?[]const u8, name: []const u8
     if (ns == .unknown) {
         if (namespace) |uri| {
             const duped = try frame.dupeString(uri);
-            try self._page.element_namespace_uris.put(self._page.frame_arena, node.as(Element), duped);
+            try self._page.element_namespace_uris.put(self._page.arena, node.as(Element), duped);
         }
     }
     return node.as(Element);
@@ -442,32 +429,11 @@ pub fn createAttributeNS(self: *const Document, namespace: []const u8, name: Str
     });
 }
 
-pub fn getElementById(self: *Document, id: []const u8, frame: *Frame) ?*Element {
+pub fn getElementById(self: *Document, id: []const u8) ?*Element {
     if (id.len == 0) {
         return null;
     }
-
-    if (self._elements_by_id.get(id)) |element| {
-        return element;
-    }
-
-    //ID was removed but might have duplicates
-    if (self._removed_ids.remove(id)) {
-        var tw = @import("TreeWalker.zig").Full.Elements.init(self.asNode(), .{});
-        while (tw.next()) |el| {
-            const element_id = el.getId() orelse continue;
-            if (std.mem.eql(u8, element_id, id)) {
-                // we ignore this error to keep getElementById easy to call
-                // if it really failed, then we're out of memory and nothing's
-                // going to work like it should anyways.
-                const owned_id = frame.dupeString(id) catch return null;
-                self._elements_by_id.put(frame.arena, owned_id, el) catch return null;
-                return el;
-            }
-        }
-    }
-
-    return null;
+    return self._ids.get(self.asNode(), id);
 }
 
 pub fn getElementsByTagName(self: *Document, tag_name: []const u8, frame: *Frame) !Node.GetElementsByTagNameResult {
@@ -483,7 +449,7 @@ pub fn getElementsByClassName(self: *Document, class_name: []const u8, frame: *F
 }
 
 fn getElementsByName(self: *Document, name: []const u8, frame: *Frame) !collections.NodeLive(.name) {
-    const arena = frame.arena;
+    const arena = frame.page_arena;
     const filter = try arena.dupe(u8, name);
     return collections.NodeLive(.name).init(self.asNode(), filter, frame);
 }
@@ -527,11 +493,12 @@ pub fn extent(self: *Document) Extent {
     // its auto-height ancestors count as 5px each. Body's own children are
     // stacked below instead. Only inline heights: virtualizers set theirs
     // inline, and the cascade per element is too slow on every mutation.
+    // Walks the flat tree, the order Element positions are numbered in.
     var index: f64 = 0;
-    var tw = @import("TreeWalker.zig").Full.init(self.asNode(), .{});
+    var tw: TreeWalker.Flat = .init(self.asNode(), .{ .frame = frame });
     while (tw.next()) |node| : (index += 1) {
         const el = node.is(Element) orelse continue;
-        const parent = el.parentElement() orelse continue;
+        const parent = el.asNode().flatTreeParentElement(frame) orelse continue;
         if (parent.isRootContainer()) {
             continue;
         }
@@ -546,8 +513,8 @@ pub fn extent(self: *Document) Extent {
             const body = html_body.asElement();
             size.height = @max(size.height, body.contentAxis(frame, .height), style_manager.inlineSize(body, .height) orelse 0);
             size.width = style_manager.inlineSize(body, .width) orelse 0;
-            var child = body.asNode().firstChild();
-            while (child) |node| : (child = node.nextSibling()) {
+            var children: TreeWalker.FlatChildren = .init(body.asNode(), .{ .frame = frame });
+            while (children.next()) |node| {
                 const el = node.is(Element) orelse continue;
                 if (!style_manager.hasDisplayNone(el)) {
                     size.width = @max(size.width, el.getElementAxis(frame, .width).value);
@@ -656,7 +623,7 @@ fn createEvent(_: *const Document, event_type: []const u8, frame: *Frame) !*@imp
     if (event_type.len > 100) {
         return error.NotSupported;
     }
-    const normalized = std.ascii.lowerString(&frame.buf, event_type);
+    const normalized = try std.ascii.allocLowerString(frame.local_arena, event_type);
 
     const event: *Event = blk: {
         if (std.mem.eql(u8, normalized, "event") or std.mem.eql(u8, normalized, "events") or std.mem.eql(u8, normalized, "htmlevents") or std.mem.eql(u8, normalized, "svgevents")) {
@@ -898,13 +865,13 @@ fn importNode(self: *const Document, node: *Node, deep_: ?bool, frame: *Frame) !
     return node.cloneNodeInto(deep_ orelse false, self, frame);
 }
 
-pub fn append(self: *Document, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    try validateDocumentNodes(self, nodes, false);
+pub fn append(self: *Document, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    try validateDocumentNodes(self, nodes.values);
 
     const parent = self.asNode();
     frame.domChanged();
 
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(self);
 
         // DocumentFragments are special - append all their children
@@ -922,16 +889,16 @@ pub fn append(self: *Document, nodes: []const Node.NodeOrText, frame: *Frame) !v
     }
 }
 
-pub fn prepend(self: *Document, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    try validateDocumentNodes(self, nodes, false);
+pub fn prepend(self: *Document, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    try validateDocumentNodes(self, nodes.values);
 
     const parent = self.asNode();
     frame.domChanged();
 
-    var i = nodes.len;
+    var i = nodes.values.len;
     while (i > 0) {
         i -= 1;
-        const child = try nodes[i].toNode(self);
+        const child = try nodes.values[i].toNode(self);
 
         // DocumentFragments are special - need to insert all their children
         if (child.is(Node.DocumentFragment)) |frag| {
@@ -965,28 +932,74 @@ pub fn prepend(self: *Document, nodes: []const Node.NodeOrText, frame: *Frame) !
     }
 }
 
-pub fn replaceChildren(self: *Document, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    try validateDocumentNodes(self, nodes, false);
-    return self.asNode().replaceChildren(nodes, frame);
+pub fn replaceChildren(self: *Document, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceChildren(nodes.values, frame);
 }
 
 pub fn moveBefore(self: *Document, node: js.Value, child: js.Value, frame: *Frame) !void {
     return self.asNode().moveBefore(node, child, frame);
 }
 
-pub fn elementFromPoint(self: *Document, x: f64, y: f64, frame: *Frame) !?*Element {
-    return self.elementFromPointImpl(x, y, false, frame);
+/// The deepest element at the point, shadow trees included
+pub fn hitTest(self: *Document, x: f64, y: f64, frame: *Frame) !?*Element {
+    return self.hitTestImpl(x, y, false, frame);
+}
+
+// document.elementFromPoint only sees the document's tree: a hit inside a
+// shadow tree reports its outermost host, as in Chrome.
+fn elementFromPoint(self: *Document, x: f64, y: f64, frame: *Frame) !?*Element {
+    return self.elementFromPointIn(self.asNode(), x, y, frame);
+}
+
+/// DocumentOrShadowRoot.elementFromPoint for `scope`, this document or one of
+/// its shadow roots.
+pub fn elementFromPointIn(self: *Document, scope: *Node, x: f64, y: f64, frame: *Frame) !?*Element {
+    const point = viewportPoint(x, y, frame) orelse return null;
+    const hit = (try self.hitTest(point.x, point.y, frame)) orelse return null;
+    return retarget(hit, scope);
+}
+
+const ViewportPoint = struct { x: f64, y: f64 };
+
+// elementFromPoint/elementsFromPoint find nothing outside the viewport
+fn viewportPoint(x: f64, y: f64, frame: *Frame) ?ViewportPoint {
+    const viewport = frame.page.getViewport();
+    const rx = @round(x);
+    const ry = @round(y);
+    const inside = rx >= 0 and ry >= 0 and
+        rx < @as(f64, @floatFromInt(viewport.width)) and
+        ry < @as(f64, @floatFromInt(viewport.height));
+    if (inside == false) {
+        return null;
+    }
+    return .{ .x = rx, .y = ry };
+}
+
+// The spec's retarget: climbs out of shadow trees until `element` is in a tree
+// that `scope` is in or inside of. A hit in a shadow tree nested in `scope`'s
+// reports its host in `scope`'s tree; a hit outside it is returned as is.
+fn retarget(element: *Element, scope: *Node) *Element {
+    var current = element;
+    while (current.asNode().containingShadowRoot()) |shadow| {
+        if (shadow.asNode().isHostIncludingInclusiveAncestorOf(scope)) {
+            break;
+        }
+        current = shadow._host;
+    }
+    return current;
 }
 
 // The faux layout gives most elements no useful horizontal extent, so
 // viewport-relative hit-testing (WebDriver scroll actions) matches on the
 // vertical axis only.
-pub fn elementFromVerticalPoint(self: *Document, y: f64, frame: *Frame) !?*Element {
-    return self.elementFromPointImpl(0, y, true, frame);
+pub fn hitTestVertical(self: *Document, y: f64, frame: *Frame) !?*Element {
+    return self.hitTestImpl(0, y, true, frame);
 }
 
-fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: *Frame) !?*Element {
-    // DFS in document order; topmost = last visited element whose rect contains (x, y).
+fn hitTestImpl(self: *Document, viewport_x: f64, viewport_y: f64, ignore_x: bool, frame: *Frame) !?*Element {
+    // DFS in flat-tree order (shadow content inside its host, slotted nodes
+    // inside their slot, as Element.calculateDocumentPosition lays them out);
+    // topmost = last visited element whose rect contains (x, y).
     //
     // Faux-layout shortcut: rect.top is calculateDocumentPosition × 5, which is
     // monotonically increasing in document order. So we maintain a running
@@ -999,7 +1012,13 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
     var topmost: ?*Element = null;
 
     const root = self.asNode();
-    const style_manager = &(root.ownerFrame(frame) orelse return null)._style_manager;
+    const owner = root.ownerFrame(frame) orelse return null;
+    const style_manager = &owner._style_manager;
+
+    // (x, y) is viewport-relative; the faux layout is in document coordinates.
+    const x = viewport_x + @as(f64, @floatFromInt(owner.window.getScrollX()));
+    const y = viewport_y + @as(f64, @floatFromInt(owner.window.getScrollY()));
+
     const Entry = struct { node: *Node, hidden: bool };
     var stack: std.ArrayList(Entry) = .empty;
     try stack.append(frame.local_arena, .{ .node = root, .hidden = false });
@@ -1020,7 +1039,9 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
         preorder_index += 1;
         if (node.is(Element)) |element| {
             hidden = hidden or style_manager.hasDisplayNone(element);
-            if (!hidden) {
+            // Unlike display:none, a child can opt back in, so the subtree is
+            // still walked.
+            if (!hidden and style_manager.isHitTestable(element)) {
                 if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
                     if (ignore_x) {
                         topmost = element;
@@ -1036,30 +1057,52 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
             }
         }
 
-        // Add children to stack in reverse order so we process them in document order
-        var child = node.lastChild();
-        while (child) |c| {
+        // Push the children, then reverse them so they pop in flat-tree order
+        const first = stack.items.len;
+        var children: TreeWalker.FlatChildren = .init(node, .{ .frame = frame });
+        while (children.next()) |c| {
             try stack.append(frame.local_arena, .{ .node = c, .hidden = hidden });
-            child = c.previousSibling();
         }
+        std.mem.reverse(Entry, stack.items[first..]);
     }
 
     return topmost;
 }
 
 fn elementsFromPoint(self: *Document, x: f64, y: f64, frame: *Frame) ![]const *Element {
-    // Get topmost element
-    var current: ?*Element = (try self.elementFromPoint(x, y, frame)) orelse return &.{};
+    return self.elementsFromPointIn(self.asNode(), x, y, frame);
+}
+
+/// DocumentOrShadowRoot.elementsFromPoint for `scope`, as Blink builds it: the
+/// hit and its flat-tree ancestors that can be hit, each retargeted against
+/// `scope` with repeats dropped, then the root element.
+pub fn elementsFromPointIn(self: *Document, scope: *Node, x: f64, y: f64, frame: *Frame) ![]const *Element {
+    const point = viewportPoint(x, y, frame) orelse return &.{};
+    const hit = (try self.hitTest(point.x, point.y, frame)) orelse return &.{};
+    const style_manager = &(self.asNode().ownerFrame(frame) orelse return &.{})._style_manager;
     var result: std.ArrayList(*Element) = .empty;
-    while (current) |el| {
-        try result.append(frame.local_arena, el);
-        current = el.parentElement();
+    var current: ?*Element = hit;
+    while (current) |el| : (current = el.asNode().flatTreeParentElement(frame)) {
+        if (style_manager.isHitTestable(el) == false) {
+            continue;
+        }
+        const target = retarget(el, scope);
+        if (result.items.len > 0 and result.items[result.items.len - 1] == target) {
+            continue;
+        }
+        try result.append(frame.local_arena, target);
+    }
+    // Chrome always ends the list with the root element.
+    if (self.getDocumentElement()) |root| {
+        if (result.items.len == 0 or result.items[result.items.len - 1] != root) {
+            try result.append(frame.local_arena, root);
+        }
     }
     return result.items;
 }
 
 fn getDocType(self: *Document) ?*Node {
-    var tw = @import("TreeWalker.zig").Full.init(self.asNode(), .{});
+    var tw = TreeWalker.Full.init(self.asNode(), .{});
     while (tw.next()) |node| {
         if (node._type == .document_type) {
             return node;
@@ -1083,15 +1126,15 @@ fn looksLikeNewDocument(html: []const u8) bool {
         std.ascii.startsWithIgnoreCase(trimmed, "<html");
 }
 
-pub fn write(self: *Document, text: []const []const u8, frame: *Frame) !void {
-    return self.writeInternal(text, false, frame);
+pub fn write(self: *Document, text: js.Variadic([]const u8), frame: *Frame) !void {
+    return self.writeInternal(text.values, false, frame);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-writeln
 // `writeln(...text)` runs the document write steps with `text` followed by a
 // U+000A LINE FEED character.
-fn writeln(self: *Document, text: []const []const u8, frame: *Frame) !void {
-    return self.writeInternal(text, true, frame);
+fn writeln(self: *Document, text: js.Variadic([]const u8), frame: *Frame) !void {
+    return self.writeInternal(text.values, true, frame);
 }
 
 fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool, call_frame: *Frame) !void {
@@ -1109,7 +1152,7 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
         return error.InvalidStateError;
     }
 
-    if (self._active_parser_aborted) return;
+    if (self._active_parser_aborted or self._navigated_away) return;
 
     const html = blk: {
         var joined: std.ArrayList(u8) = .empty;
@@ -1237,7 +1280,7 @@ pub fn open(self: *Document, call_frame: *Frame) !*Document {
         return error.InvalidStateError;
     }
 
-    if (self._active_parser_aborted or frame._load_state == .parsing) {
+    if (self._active_parser_aborted or self._navigated_away or frame._load_state == .parsing) {
         return self;
     }
 
@@ -1245,8 +1288,20 @@ pub fn open(self: *Document, call_frame: *Frame) !*Document {
         return self;
     }
 
+    if (self._iframe_load_in_progress) {
+        self._mute_iframe_load = true;
+    }
+
     // If we aren't parsing, then open clears the document.
     const doc_node = self.asNode();
+
+    {
+        // Erase all event listeners and handlers of the document
+        try frame._event_manager.removeShadowIncludingDescendants(call_frame.local_arena, doc_node);
+        if (frame.document == self) {
+            frame.page.event_listeners.removeTarget(frame.window.asEventTarget());
+        }
+    }
 
     {
         // Remove all children from document
@@ -1257,9 +1312,10 @@ pub fn open(self: *Document, call_frame: *Frame) !*Document {
     }
 
     // reset the document
-    self._elements_by_id.clearAndFree(frame.arena);
+    self._ids.clear(frame.page_arena);
     self.setActiveElement(null, frame);
     self._open_popovers = .empty;
+    self._modal_dialogs = .empty;
     self._style_sheets = null;
     self._implementation = null;
     self._ready_state = .loading;
@@ -1270,9 +1326,9 @@ pub fn open(self: *Document, call_frame: *Frame) !*Document {
     if (std.mem.findScalar(*Document, frame._script_created_parser_docs.items, self) == null) {
         // have the page track this document (if it isn't already)
         // so that, on shutdown, it can close the parser if needed.
-        try frame._script_created_parser_docs.append(frame.arena, self);
+        try frame._script_created_parser_docs.append(frame.page_arena, self);
     }
-    self._script_created_parser = Parser.Streaming.init(frame.arena, doc_node, frame, .{ .allow_declarative_shadow = true });
+    self._script_created_parser = Parser.Streaming.init(frame.page_arena, doc_node, frame, .{ .allow_declarative_shadow = true });
     // on start() failure the internal `handle` isn't yet create. So we can't
     // call done() and we don't want any subsequent cleanup to call done().
     errdefer self._script_created_parser = null;
@@ -1314,8 +1370,12 @@ fn finishScriptCreatedParser(self: *Document, frame: *Frame) !void {
     // Even if flushPendingText errors, the handle is already finished and we
     // must not retain the Streaming — defer so the error path also drops it.
     // (Streaming.done nulls its own handle, so dropping the struct is safe.)
-    defer self._script_created_parser = null;
-    try self._script_created_parser.?.done();
+    // Dropped before the load steps below: a load handler can write() again,
+    // which must open a fresh parser rather than feed this finished one.
+    {
+        defer self._script_created_parser = null;
+        try self._script_created_parser.?.done();
+    }
 
     // The write'd markup is fully parsed; run any deferred scripts it produced
     // (e.g. inline modules) before firing the load event. This frame's initial
@@ -1323,7 +1383,7 @@ fn finishScriptCreatedParser(self: *Document, frame: *Frame) !void {
     // iframe written into via document.write), so we can't rely on it.
     frame._script_manager.base.scriptCreatedParseDone();
 
-    frame.documentIsComplete();
+    frame.scriptCreatedParserDone();
 }
 
 fn getFirstElementChild(self: *Document) ?*Element {
@@ -1377,9 +1437,44 @@ fn exitFullscreen(_: *Document, frame: *Frame) js.Promise {
     return frame.js.local.?.rejectPromise(.{ .type_error = "Document not in fullscreen" });
 }
 
-pub fn hasFocus(_: *Document) bool {
-    log.debug(.not_implemented, "Document.hasFocus", .{});
-    return true;
+// See frame/exec_command.zig. A null value is "" rather than "null".
+fn execCommand(self: *Document, command: []const u8, _: ?bool, value: ?[]const u8) !bool {
+    return exec_command.exec(self, command, value orelse "");
+}
+
+fn queryCommandSupported(self: *const Document, command: []const u8) bool {
+    return exec_command.isSupported(self, command);
+}
+
+fn queryCommandEnabled(self: *Document, command: []const u8) bool {
+    return exec_command.isEnabled(self, command);
+}
+
+// No supported command has a state or value yet.
+fn queryCommandState(_: *const Document, _: []const u8) bool {
+    return false;
+}
+
+fn queryCommandValue(_: *const Document, _: []const u8) []const u8 {
+    return "";
+}
+
+pub fn hasFocus(self: *Document) bool {
+    var top = self._frame orelse return false;
+    while (top.parent) |parent| {
+        top = parent;
+    }
+
+    var candidate = top;
+    while (true) {
+        if (candidate.document == self) {
+            return true;
+        }
+        const active = candidate.document._active_element orelse return false;
+        const iframe = active.is(Element.Html.IFrame) orelse return false;
+        const window = iframe._window orelse return false;
+        candidate = window._frame;
+    }
 }
 
 fn setAdoptedStyleSheets(self: *Document, sheets: js.Object) !void {
@@ -1391,22 +1486,17 @@ fn setAdoptedStyleSheets(self: *Document, sheets: js.Object) !void {
 // - At most one DocumentType child
 // - No Document, Attribute, or Text nodes
 // - Only Element, DocumentType, Comment, and ProcessingInstruction are allowed
-// When replacing=true, existing children are not counted (for replaceChildren)
-fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, comptime replacing: bool) !void {
+fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText) !void {
     const parent = self.asNode();
 
-    // Check existing elements and doctypes (unless we're replacing all children)
     var has_element = false;
     var has_doctype = false;
-
-    if (!replacing) {
-        var it = parent.childrenIterator();
-        while (it.next()) |child| {
-            if (child._type == .element) {
-                has_element = true;
-            } else if (child._type == .document_type) {
-                has_doctype = true;
-            }
+    var it = parent.childrenIterator();
+    while (it.next()) |child| {
+        if (child._type == .element) {
+            has_element = true;
+        } else if (child._type == .document_type) {
+            has_doctype = true;
         }
     }
 
@@ -1634,7 +1724,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Document";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1653,14 +1742,108 @@ pub const JsApi = struct {
         return Sanitizer.parseHTML(html, options, false, frame);
     }
 
-    pub const onselectionchange = bridge.accessor(Document.getOnSelectionChange, Document.setOnSelectionChange, .{});
-    pub const onclick = bridge.accessor(Document.getOnClick, Document.setOnClick, .{});
-    pub const ontouchstart = bridge.accessor(handlerAccessor(.ontouchstart).get, handlerAccessor(.ontouchstart).set, .{});
-    pub const ontouchend = bridge.accessor(handlerAccessor(.ontouchend).get, handlerAccessor(.ontouchend).set, .{});
-    pub const ontouchmove = bridge.accessor(handlerAccessor(.ontouchmove).get, handlerAccessor(.ontouchmove).set, .{});
-    pub const ontouchcancel = bridge.accessor(handlerAccessor(.ontouchcancel).get, handlerAccessor(.ontouchcancel).set, .{});
+    // GlobalEventHandlers and DocumentAndElementEventHandlers: the same on*
+    // set as HTMLElement.
+    pub const onabort = EventTarget.handlerAccessor(Document, "abort");
+    pub const onanimationcancel = EventTarget.handlerAccessor(Document, "animationcancel");
+    pub const onanimationend = EventTarget.handlerAccessor(Document, "animationend");
+    pub const onanimationiteration = EventTarget.handlerAccessor(Document, "animationiteration");
+    pub const onanimationstart = EventTarget.handlerAccessor(Document, "animationstart");
+    pub const onauxclick = EventTarget.handlerAccessor(Document, "auxclick");
+    pub const onbeforeinput = EventTarget.handlerAccessor(Document, "beforeinput");
+    pub const onbeforematch = EventTarget.handlerAccessor(Document, "beforematch");
+    pub const onbeforetoggle = EventTarget.handlerAccessor(Document, "beforetoggle");
+    pub const onblur = EventTarget.handlerAccessor(Document, "blur");
+    pub const oncancel = EventTarget.handlerAccessor(Document, "cancel");
+    pub const oncanplay = EventTarget.handlerAccessor(Document, "canplay");
+    pub const oncanplaythrough = EventTarget.handlerAccessor(Document, "canplaythrough");
+    pub const onchange = EventTarget.handlerAccessor(Document, "change");
+    pub const onclick = EventTarget.handlerAccessor(Document, "click");
+    pub const onclose = EventTarget.handlerAccessor(Document, "close");
+    pub const oncommand = EventTarget.handlerAccessor(Document, "command");
+    pub const oncontentvisibilityautostatechange = EventTarget.handlerAccessor(Document, "contentvisibilityautostatechange");
+    pub const oncontextlost = EventTarget.handlerAccessor(Document, "contextlost");
+    pub const oncontextmenu = EventTarget.handlerAccessor(Document, "contextmenu");
+    pub const oncontextrestored = EventTarget.handlerAccessor(Document, "contextrestored");
+    pub const oncopy = EventTarget.handlerAccessor(Document, "copy");
+    pub const oncuechange = EventTarget.handlerAccessor(Document, "cuechange");
+    pub const oncut = EventTarget.handlerAccessor(Document, "cut");
+    pub const ondblclick = EventTarget.handlerAccessor(Document, "dblclick");
+    pub const ondrag = EventTarget.handlerAccessor(Document, "drag");
+    pub const ondragend = EventTarget.handlerAccessor(Document, "dragend");
+    pub const ondragenter = EventTarget.handlerAccessor(Document, "dragenter");
+    pub const ondragleave = EventTarget.handlerAccessor(Document, "dragleave");
+    pub const ondragover = EventTarget.handlerAccessor(Document, "dragover");
+    pub const ondragstart = EventTarget.handlerAccessor(Document, "dragstart");
+    pub const ondrop = EventTarget.handlerAccessor(Document, "drop");
+    pub const ondurationchange = EventTarget.handlerAccessor(Document, "durationchange");
+    pub const onemptied = EventTarget.handlerAccessor(Document, "emptied");
+    pub const onended = EventTarget.handlerAccessor(Document, "ended");
+    pub const onerror = EventTarget.handlerAccessor(Document, "error");
+    pub const onfocus = EventTarget.handlerAccessor(Document, "focus");
+    pub const onformdata = EventTarget.handlerAccessor(Document, "formdata");
+    pub const onfullscreenchange = EventTarget.handlerAccessor(Document, "fullscreenchange");
+    pub const onfullscreenerror = EventTarget.handlerAccessor(Document, "fullscreenerror");
+    pub const ongotpointercapture = EventTarget.handlerAccessor(Document, "gotpointercapture");
+    pub const oninput = EventTarget.handlerAccessor(Document, "input");
+    pub const oninvalid = EventTarget.handlerAccessor(Document, "invalid");
+    pub const onkeydown = EventTarget.handlerAccessor(Document, "keydown");
+    pub const onkeypress = EventTarget.handlerAccessor(Document, "keypress");
+    pub const onkeyup = EventTarget.handlerAccessor(Document, "keyup");
+    pub const onload = EventTarget.handlerAccessor(Document, "load");
+    pub const onloadeddata = EventTarget.handlerAccessor(Document, "loadeddata");
+    pub const onloadedmetadata = EventTarget.handlerAccessor(Document, "loadedmetadata");
+    pub const onloadstart = EventTarget.handlerAccessor(Document, "loadstart");
+    pub const onlostpointercapture = EventTarget.handlerAccessor(Document, "lostpointercapture");
+    pub const onmousedown = EventTarget.handlerAccessor(Document, "mousedown");
+    pub const onmouseenter = EventTarget.handlerAccessor(Document, "mouseenter");
+    pub const onmouseleave = EventTarget.handlerAccessor(Document, "mouseleave");
+    pub const onmousemove = EventTarget.handlerAccessor(Document, "mousemove");
+    pub const onmouseout = EventTarget.handlerAccessor(Document, "mouseout");
+    pub const onmouseover = EventTarget.handlerAccessor(Document, "mouseover");
+    pub const onmouseup = EventTarget.handlerAccessor(Document, "mouseup");
+    pub const onpaste = EventTarget.handlerAccessor(Document, "paste");
+    pub const onpause = EventTarget.handlerAccessor(Document, "pause");
+    pub const onplay = EventTarget.handlerAccessor(Document, "play");
+    pub const onplaying = EventTarget.handlerAccessor(Document, "playing");
+    pub const onpointercancel = EventTarget.handlerAccessor(Document, "pointercancel");
+    pub const onpointerdown = EventTarget.handlerAccessor(Document, "pointerdown");
+    pub const onpointerenter = EventTarget.handlerAccessor(Document, "pointerenter");
+    pub const onpointerleave = EventTarget.handlerAccessor(Document, "pointerleave");
+    pub const onpointermove = EventTarget.handlerAccessor(Document, "pointermove");
+    pub const onpointerout = EventTarget.handlerAccessor(Document, "pointerout");
+    pub const onpointerover = EventTarget.handlerAccessor(Document, "pointerover");
+    pub const onpointerrawupdate = EventTarget.handlerAccessor(Document, "pointerrawupdate");
+    pub const onpointerup = EventTarget.handlerAccessor(Document, "pointerup");
+    pub const onprogress = EventTarget.handlerAccessor(Document, "progress");
+    pub const onratechange = EventTarget.handlerAccessor(Document, "ratechange");
+    pub const onreset = EventTarget.handlerAccessor(Document, "reset");
+    pub const onresize = EventTarget.handlerAccessor(Document, "resize");
+    pub const onscroll = EventTarget.handlerAccessor(Document, "scroll");
+    pub const onscrollend = EventTarget.handlerAccessor(Document, "scrollend");
+    pub const onsecuritypolicyviolation = EventTarget.handlerAccessor(Document, "securitypolicyviolation");
+    pub const onseeked = EventTarget.handlerAccessor(Document, "seeked");
+    pub const onseeking = EventTarget.handlerAccessor(Document, "seeking");
+    pub const onselect = EventTarget.handlerAccessor(Document, "select");
+    pub const onselectionchange = EventTarget.handlerAccessor(Document, "selectionchange");
+    pub const onselectstart = EventTarget.handlerAccessor(Document, "selectstart");
+    pub const onslotchange = EventTarget.handlerAccessor(Document, "slotchange");
+    pub const onstalled = EventTarget.handlerAccessor(Document, "stalled");
+    pub const onsubmit = EventTarget.handlerAccessor(Document, "submit");
+    pub const onsuspend = EventTarget.handlerAccessor(Document, "suspend");
+    pub const ontimeupdate = EventTarget.handlerAccessor(Document, "timeupdate");
+    pub const ontoggle = EventTarget.handlerAccessor(Document, "toggle");
+    pub const ontransitioncancel = EventTarget.handlerAccessor(Document, "transitioncancel");
+    pub const ontransitionend = EventTarget.handlerAccessor(Document, "transitionend");
+    pub const ontransitionrun = EventTarget.handlerAccessor(Document, "transitionrun");
+    pub const ontransitionstart = EventTarget.handlerAccessor(Document, "transitionstart");
+    pub const onvolumechange = EventTarget.handlerAccessor(Document, "volumechange");
+    pub const onwaiting = EventTarget.handlerAccessor(Document, "waiting");
+    pub const onwheel = EventTarget.handlerAccessor(Document, "wheel");
+    pub const onreadystatechange = EventTarget.handlerAccessor(Document, "readystatechange");
+    pub const onvisibilitychange = EventTarget.handlerAccessor(Document, "visibilitychange");
     pub const URL = bridge.accessor(Document.getURL, null, .{});
-    pub const location = bridge.accessor(Document.getLocation, Document.setLocation, .{});
+    pub const location = bridge.accessor(Document.getLocation, Document.setLocation, .{ .unforgeable = true, .deletable = false });
     pub const documentURI = bridge.accessor(Document.getURL, null, .{});
     pub const documentElement = bridge.accessor(Document.getDocumentElement, null, .{});
     pub const scrollingElement = bridge.accessor(Document.getDocumentElement, null, .{});
@@ -1690,15 +1873,15 @@ pub const JsApi = struct {
     pub const createExpression = bridge.function(Document.createExpression, .{});
     pub const createNSResolver = bridge.function(Document.createNSResolver, .{});
     pub const getElementById = bridge.function(_getElementById, .{});
-    fn _getElementById(self: *Document, value_: ?js.Value, frame: *Frame) !?*Element {
+    fn _getElementById(self: *Document, value_: ?js.Value) !?*Element {
         const value = value_ orelse return null;
         if (value.isNull()) {
-            return self.getElementById("null", frame);
+            return self.getElementById("null");
         }
         if (value.isUndefined()) {
-            return self.getElementById("undefined", frame);
+            return self.getElementById("undefined");
         }
-        return self.getElementById(try value.toZig([]const u8), frame);
+        return self.getElementById(try value.toZig([]const u8));
     }
     pub const querySelector = bridge.function(Document.querySelector, .{});
     pub const querySelectorAll = bridge.function(Document.querySelectorAll, .{});
@@ -1729,6 +1912,9 @@ pub const JsApi = struct {
     pub const defaultView = bridge.accessor(struct {
         fn defaultView(self: *const Document) ?*@import("Window.zig") {
             const frame = self._frame orelse return null;
+            if (frame.window._closed) {
+                return null;
+            }
             return frame.window;
         }
     }.defaultView, null, .{});
@@ -1737,6 +1923,12 @@ pub const JsApi = struct {
     pub const fullscreen = bridge.property(false, .{ .template = false, .readonly = true });
     pub const fullscreenElement = bridge.accessor(Document.getFullscreenElement, null, .{});
     pub const exitFullscreen = bridge.function(Document.exitFullscreen, .{});
+    pub const execCommand = bridge.function(Document.execCommand, .{});
+    pub const queryCommandEnabled = bridge.function(Document.queryCommandEnabled, .{});
+    pub const queryCommandIndeterm = bridge.function(Document.queryCommandState, .{});
+    pub const queryCommandState = bridge.function(Document.queryCommandState, .{});
+    pub const queryCommandSupported = bridge.function(Document.queryCommandSupported, .{});
+    pub const queryCommandValue = bridge.function(Document.queryCommandValue, .{});
 
     pub const prerendering = bridge.property(false, .{ .template = false });
     pub const characterSet = bridge.accessor(Document.getCharset, null, .{});
@@ -1745,26 +1937,6 @@ pub const JsApi = struct {
     pub const compatMode = bridge.accessor(Document.getCompatMode, null, .{});
     pub const lastModified = bridge.accessor(Document.getLastModified, null, .{});
     pub const referrer = bridge.accessor(Document.getReferrer, null, .{});
-
-    // Generates a getter/setter pair backed by the frame's attribute-listener
-    // map, like onclick above, for other document event handler properties.
-    fn handlerAccessor(comptime handler: @import("global_event_handlers.zig").Handler) type {
-        return struct {
-            pub fn get(self: *Document, frame: *Frame) ?js.Function.Global {
-                const owner = self._frame orelse frame;
-                return owner._event_target_attr_listeners.get(.{ .target = self.asEventTarget(), .handler = handler });
-            }
-
-            pub fn set(self: *Document, setter: ?Window.FunctionSetter, frame: *Frame) !void {
-                const owner = self._frame orelse frame;
-                if (Window.getFunctionFromSetter(setter)) |cb| {
-                    try owner._event_target_attr_listeners.put(owner.arena, .{ .target = self.asEventTarget(), .handler = handler }, cb);
-                } else {
-                    _ = owner._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = handler });
-                }
-            }
-        };
-    }
 };
 
 const testing = @import("../../testing.zig");
@@ -1824,6 +1996,23 @@ test "Document: cookie access from a cross-site frame" {
     // same visibility rules.
     top_url = "https://attacker.example/";
     try testing.expectEqual("none=4; set_none=8", try doc.getCookie(frame));
+}
+
+test "Document: a non-secure document can't set or overwrite a Secure cookie" {
+    defer testing.test_session.closeAllPages();
+    const frame = try testing.createFrame();
+    const doc = frame.document;
+    const jar = &frame._session.cookie_jar;
+    defer jar.clearRetainingCapacity();
+
+    frame.url = "http://victim.example/";
+    _ = try doc.setCookie("s=1; Secure", frame);
+    try testing.expectEqual(0, jar.len);
+
+    try jar.populateFromResponse("https://victim.example/", "s=1; Secure");
+    _ = try doc.setCookie("s=2", frame);
+    var it = jar.iterator();
+    try testing.expectEqual("1", it.next().?.value);
 }
 
 test "Document: isRelaxableTo" {

@@ -96,10 +96,6 @@ _close_reason: []const u8 = "",
 _protocol: []const u8 = "",
 
 // Event handlers
-_on_open: ?js.Function.Global = null,
-_on_message: ?js.Function.Global = null,
-_on_error: ?js.Function.Global = null,
-_on_close: ?js.Function.Global = null,
 
 const ReadyState = enum(u8) {
     connecting = 0,
@@ -136,7 +132,22 @@ const BinaryType = enum {
     arraybuffer,
 };
 
-pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*WebSocket {
+// WebIDL: `optional (DOMString or sequence<DOMString>) protocols = []`
+const Protocols = union(enum) {
+    list: []const []const u8,
+    one: []const u8,
+};
+
+pub fn init(url: []const u8, protocols_: ?Protocols, exec: *const Execution) !*WebSocket {
+    var one: [1][]const u8 = undefined;
+    const protocols: []const []const u8 = if (protocols_) |p| switch (p) {
+        .list => |list| list,
+        .one => |protocol| blk: {
+            one[0] = protocol;
+            break :blk &one;
+        },
+    } else &.{};
+
     {
         if (std.mem.findScalar(u8, url, '#') != null) {
             // Fragments are not allowed in WebSocket URLs.
@@ -213,7 +224,7 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
     return self;
 }
 
-fn connect(self: *WebSocket, protocols: [][]const u8) !void {
+fn connect(self: *WebSocket, protocols: []const []const u8) !void {
     const exec = self._exec;
     const arena = self._arena;
     const resolved_url = self._url;
@@ -231,6 +242,9 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
 
     try conn.setURL(resolved_url);
     try conn.setConnectOnly(false);
+    // receivedHeaderCallback reads the first status line as the upgrade's,
+    // so a proxy's CONNECT response must not reach it.
+    try conn.setSuppressConnectHeaders();
 
     try conn.setReadCallback(sendDataCallback, true);
     try conn.setWriteCallback(receivedDataCallback);
@@ -288,19 +302,6 @@ fn isBlockedPort(url: [:0]const u8) bool {
 pub fn deinit(self: *WebSocket, page: *Page) void {
     self.releaseTransport();
 
-    if (self._on_open) |func| {
-        func.release();
-    }
-    if (self._on_message) |func| {
-        func.release();
-    }
-    if (self._on_error) |func| {
-        func.release();
-    }
-    if (self._on_close) |func| {
-        func.release();
-    }
-
     for (self._send_queue.items) |msg| {
         msg.deinit(page);
     }
@@ -309,6 +310,7 @@ pub fn deinit(self: *WebSocket, page: *Page) void {
         arena.release();
     }
 
+    page.removeTarget(self.asEventTarget());
     self._arena.release();
 }
 
@@ -320,7 +322,7 @@ pub fn acquireRef(self: *WebSocket) void {
     self._rc.acquire();
 }
 
-fn asEventTarget(self: *WebSocket) *EventTarget {
+pub fn asEventTarget(self: *WebSocket) *EventTarget {
     return self._proto;
 }
 
@@ -555,31 +557,6 @@ const SendData = union(enum) {
     js_val: js.Value,
 };
 
-/// Union for extracting bytes from ArrayBuffer/TypedArray
-const BinaryData = union(enum) {
-    int8: []i8,
-    uint8: []u8,
-    int16: []i16,
-    uint16: []u16,
-    int32: []i32,
-    uint32: []u32,
-    int64: []i64,
-    uint64: []u64,
-    float16: []f16,
-    float32: []f32,
-    float64: []f64,
-
-    fn asBuffer(self: BinaryData) []u8 {
-        return switch (self) {
-            .int8 => |b| @as([*]u8, @ptrCast(b.ptr))[0..b.len],
-            .uint8 => |b| b,
-            inline .int16, .uint16, .float16 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 2],
-            inline .int32, .uint32, .float32 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 4],
-            inline .int64, .uint64, .float64 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 8],
-        };
-    }
-};
-
 pub fn send(self: *WebSocket, data: SendData) !void {
     if (self._ready_state != .open) {
         return error.InvalidStateError;
@@ -595,7 +572,9 @@ pub fn send(self: *WebSocket, data: SendData) !void {
             } });
         },
         .js_val => |js_val| {
-            if (js_val.isString()) |str| {
+            if (js_val.isArrayBuffer() == false and js_val.isArrayBufferView() == false) {
+                // Anything that isn't a buffer is sent as its string, as in Chrome
+                const str = try js_val.toString();
                 const arena = try self._exec.getArena(str.len(), "WebSocket.message");
                 errdefer arena.release();
                 try self.queueMessage(.{ .text = .{
@@ -603,8 +582,7 @@ pub fn send(self: *WebSocket, data: SendData) !void {
                     .data = try str.toSliceWithAlloc(arena.allocator()),
                 } });
             } else {
-                const binary = try js_val.toZig(BinaryData);
-                const buffer = binary.asBuffer();
+                const buffer = (try js_val.toZig(js.BufferSource)).bytes;
 
                 const arena = try self._exec.getArena(buffer.len, "WebSocket.message");
                 errdefer arena.release();
@@ -687,65 +665,13 @@ fn setBinaryType(self: *WebSocket, value: []const u8) void {
     }
 }
 
-fn getOnOpen(self: *const WebSocket) ?js.Function.Global {
-    return self._on_open;
-}
-
-fn setOnOpen(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_open) |old| old.release();
-    if (cb_) |cb| {
-        self._on_open = try cb.persistWithThis(self);
-    } else {
-        self._on_open = null;
-    }
-}
-
-fn getOnMessage(self: *const WebSocket) ?js.Function.Global {
-    return self._on_message;
-}
-
-fn setOnMessage(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_message) |old| old.release();
-    if (cb_) |cb| {
-        self._on_message = try cb.persistWithThis(self);
-    } else {
-        self._on_message = null;
-    }
-}
-
-fn getOnError(self: *const WebSocket) ?js.Function.Global {
-    return self._on_error;
-}
-
-fn setOnError(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_error) |old| old.release();
-    if (cb_) |cb| {
-        self._on_error = try cb.persistWithThis(self);
-    } else {
-        self._on_error = null;
-    }
-}
-
-fn getOnClose(self: *const WebSocket) ?js.Function.Global {
-    return self._on_close;
-}
-
-fn setOnClose(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_close) |old| old.release();
-    if (cb_) |cb| {
-        self._on_close = try cb.persistWithThis(self);
-    } else {
-        self._on_close = null;
-    }
-}
-
 fn dispatchOpenEvent(self: *WebSocket) !void {
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "open", self._on_open)) {
+    if (exec.hasDirectListeners(target, "open")) {
         const event = try Event.initTrusted(comptime .wrap("open"), .{}, exec.page);
-        try exec.dispatch(target, event, self._on_open, .{ .context = "WebSocket open" });
+        try exec.dispatch(target, event, .{ .context = "WebSocket open" });
     }
 }
 
@@ -753,7 +679,7 @@ fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsF
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "message", self._on_message)) {
+    if (exec.hasDirectListeners(target, "message")) {
         const msg_data: MessageEvent.Data = if (frame_type == .binary)
             switch (self._binary_type) {
                 .arraybuffer => .{ .arraybuffer = .{ .values = data } },
@@ -770,7 +696,7 @@ fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsF
             .data = msg_data,
             .origin = "",
         }, exec.page);
-        try exec.dispatch(target, event.asEvent(), self._on_message, .{ .context = "WebSocket message" });
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket message" });
     }
 }
 
@@ -778,9 +704,9 @@ fn dispatchErrorEvent(self: *WebSocket) !void {
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "error", self._on_error)) {
+    if (exec.hasDirectListeners(target, "error")) {
         const event = try Event.initTrusted(comptime .wrap("error"), .{}, exec.page);
-        try exec.dispatch(target, event, self._on_error, .{ .context = "WebSocket error" });
+        try exec.dispatch(target, event, .{ .context = "WebSocket error" });
     }
 }
 
@@ -788,13 +714,13 @@ fn dispatchCloseEvent(self: *WebSocket, code: u16, reason: []const u8, was_clean
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "close", self._on_close)) {
+    if (exec.hasDirectListeners(target, "close")) {
         const event = try CloseEvent.initTrusted(comptime .wrap("close"), .{
             .code = code,
             .reason = reason,
             .wasClean = was_clean,
         }, exec.page);
-        try exec.dispatch(target, event.asEvent(), self._on_close, .{ .context = "WebSocket close" });
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket close" });
     }
 }
 
@@ -1025,7 +951,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "WebSocket";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1044,10 +969,10 @@ pub const JsApi = struct {
     pub const protocol = bridge.accessor(WebSocket.getProtocol, null, .{});
     pub const extensions = bridge.property("", .{ .template = false });
 
-    pub const onopen = bridge.accessor(WebSocket.getOnOpen, WebSocket.setOnOpen, .{});
-    pub const onmessage = bridge.accessor(WebSocket.getOnMessage, WebSocket.setOnMessage, .{});
-    pub const onerror = bridge.accessor(WebSocket.getOnError, WebSocket.setOnError, .{});
-    pub const onclose = bridge.accessor(WebSocket.getOnClose, WebSocket.setOnClose, .{});
+    pub const onopen = EventTarget.handlerAccessor(WebSocket, "open");
+    pub const onmessage = EventTarget.handlerAccessor(WebSocket, "message");
+    pub const onerror = EventTarget.handlerAccessor(WebSocket, "error");
+    pub const onclose = EventTarget.handlerAccessor(WebSocket, "close");
 
     pub const send = bridge.function(WebSocket.send, .{});
     pub const close = bridge.function(WebSocket.close, .{});
@@ -1073,8 +998,7 @@ test "WebApi: WebSocket send owns its message arena once when the unpause fails"
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    var protocols: [0][]const u8 = .{};
-    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", &protocols, &frame.js.execution);
+    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", null, &frame.js.execution);
     try testing.expect(ws._conn != null);
 
     // connect() tracked the easy handle but no tick has performed it, so

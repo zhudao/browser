@@ -65,7 +65,7 @@ pub fn init(callback: js.Function.Global, exec: *const Execution) !*PerformanceO
         ._entries = .empty,
         ._performance = exec.performance(),
         ._js = exec.js,
-        ._arena = exec.arena,
+        ._arena = exec.page_arena,
     });
 }
 
@@ -170,7 +170,7 @@ pub fn takeRecords(self: *PerformanceObserver) ![]*Performance.Entry {
 }
 
 fn getSupportedEntryTypes() []const []const u8 {
-    return &.{ "mark", "measure", "resource" };
+    return &.{ "mark", "measure", "navigation", "resource" };
 }
 
 /// Returns true if observer interested with given entry.
@@ -198,9 +198,8 @@ pub fn dispatch(self: *PerformanceObserver) !void {
     self._js.localScope(&ls);
     defer ls.deinit();
 
-    var caught: js.TryCatch.Caught = .{};
-    ls.toLocal(self._callback).tryCall(void, .{ EntryList{ ._entries = records }, self }, &caught) catch |err| {
-        log.debug(.frame, "PerfObserver.dispatch", .{ .err = err, .caught = caught });
+    ls.toLocal(self._callback).callWithThisReport(self, .{ EntryList{ ._entries = records }, self }) catch |err| {
+        log.debug(.frame, "PerfObserver.dispatch", .{ .err = err });
         return err;
     };
 }
@@ -210,7 +209,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "PerformanceObserver";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -247,7 +245,6 @@ const EntryList = struct {
 
         pub const Meta = struct {
             pub const name = "PerformanceObserverEntryList";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 

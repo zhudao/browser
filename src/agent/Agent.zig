@@ -193,6 +193,7 @@ synthetic_tool_call_id: u32 = 0,
 /// and the navigation a read tool's `url` made.
 save_calls: std.ArrayList(SavedCall) = .empty,
 capturing_for_save: bool = false,
+prompt_target: ?PromptTarget = null,
 /// Aggregate Anthropic/OpenAI/Gemini token usage across every model call.
 /// Printed as a structured `$usage ...` line on stderr at the end of `--task`
 /// (one-shot) mode so wrappers can capture per-task cost.
@@ -245,6 +246,12 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
             });
             return error.InvalidFilename;
         }
+    }
+    if (opts.trace_results and opts.trace == null) {
+        log.fatal(.app, "conflicting flags", .{
+            .hint = "--trace-results adds result text to the --trace file; pass --trace too",
+        });
+        return error.ConflictingFlags;
     }
     if (opts.no_llm and opts.provider != null) {
         log.warn(.app, "ignoring --provider", .{ .reason = "--no-llm takes precedence" });
@@ -382,7 +389,7 @@ pub fn init(allocator: std.mem.Allocator, app: *App, opts: Config.Agent) !*Agent
     errdefer if (self.ai_client) |c| c.deinit(allocator);
 
     if (opts.trace) |path| {
-        self.trace = Trace.create(allocator, path) catch |err| {
+        self.trace = Trace.create(allocator, path, opts.trace_results) catch |err| {
             log.fatal(.app, "cannot write trace", .{ .path = path, .err = err });
             return err;
         };
@@ -616,7 +623,7 @@ fn gotoStart(self: *Agent, url: [:0]const u8) bool {
     var object: std.json.ObjectMap = .empty;
     object.put(a, "url", .{ .string = url }) catch return false;
     const args: std.json.Value = .{ .object = object };
-    const result = browser_tools.call(a, self.ts.session, &self.ts.registry, "goto", args, .{}) catch |err| {
+    const result = browser_tools.call(a, self.ts.session, &self.ts.registry, "goto", args, .{ .source = .user }) catch |err| {
         self.terminal.printError("could not open {s}: {s}", .{ url, browser_tools.errorMessage(err) });
         return false;
     };
@@ -664,6 +671,9 @@ fn runTurn(self: *Agent, input: TurnInput) bool {
             self.terminal.printInfo("(model declined to respond — safety refusal)", .{})
         else
             self.terminal.printInfo("(no response from model)", .{});
+    }
+    if (self.prompt_target) |target| {
+        if (target.data) |d| self.printData(target.cmd.tool, d);
     }
     self.conversation.prune();
     return true;
@@ -763,6 +773,18 @@ fn runRepl(self: *Agent) void {
                 const label = std.mem.print(&label_buf, "/{s}", .{@tagName(lc)}) catch "/?";
                 if (!self.requireLlm(label)) continue :repl;
                 _ = self.runTurn(.{ .prompt = lc.prompt(), .record_comment = line, .capture_for_save = true, .label = label });
+            },
+            .prompt => |p| {
+                var label_buf: [32]u8 = undefined;
+                const label = std.mem.print(&label_buf, "/{s}", .{@tagName(p.tool)}) catch "/?";
+                if (self.credential == null) {
+                    self.terminal.printError("{s}: text without key=value is a prompt and needs an LLM. Pass the fields as key=value (/help {s}), or " ++ llm_setup_hint ++ ".", .{ label, @tagName(p.tool) });
+                    continue :repl;
+                }
+                const prompt = promptCommandText(aa, p) catch continue :repl;
+                self.prompt_target = .{ .cmd = p, .arena = aa };
+                defer self.prompt_target = null;
+                _ = self.runTurn(.{ .prompt = prompt, .record_comment = line, .capture_for_save = true, .label = label });
             },
             .tool_call => |tc| {
                 self.terminal.beginTool(tc.name(), slash_split.?.rest);
@@ -1165,7 +1187,53 @@ const PathAndMode = struct { path: []const u8, mode: save.Mode };
 const SavedCall = struct {
     selector: ?[]const u8 = null,
     navigated: bool = false,
+    /// Pinned prompt args as the call ran (conversation arena).
+    args: ?std.json.Value = null,
 };
+
+/// Active `/click the sign in…`-style turn: one target call, read-only tools only.
+const PromptTarget = struct {
+    cmd: Command.Prompt,
+    /// REPL line arena; outlives the turn.
+    arena: std.mem.Allocator,
+    done: bool = false,
+    data: ?[]const u8 = null,
+};
+
+fn urlArg(args: ?std.json.Value) ?std.json.Value {
+    const a = args orelse return null;
+    if (a != .object) return null;
+    const url = a.object.get("url") orelse return null;
+    if (url != .string or url.string.len == 0) return null;
+    return url;
+}
+
+/// A deep copy into `arena`: the model's args live in zenai's per-call arena,
+/// freed before the turn records the call.
+fn pinArgs(arena: std.mem.Allocator, args: ?std.json.Value, pinned: ?std.json.Value) error{OutOfMemory}!?std.json.Value {
+    const p = pinned orelse return args;
+    var obj: std.json.ObjectMap = if (args) |a| (if (a == .object) (try zenai.json.dupeValue(arena, a)).object else .empty) else .empty;
+    var it = p.object.iterator();
+    while (it.next()) |entry| try obj.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+    return .{ .object = obj };
+}
+
+/// User turn for a prompt command. Names pinned fields but not their values
+/// (a `fill` value may be a literal secret).
+fn promptCommandText(arena: std.mem.Allocator, p: Command.Prompt) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    const name = @tagName(p.tool);
+    try w.print("Make exactly one successful `{s}` call for this request:\n\n{s}\n\n", .{ name, p.text });
+    if (p.args) |args| {
+        try w.writeAll("These fields are fixed and filled in for you, so leave them out:");
+        var it = args.object.iterator();
+        while (it.next()) |entry| try w.print(" `{s}`", .{entry.key_ptr.*});
+        try w.writeAll(".\n");
+    }
+    try w.print("Inspect the current page with the read-only tools if you need to; do not navigate. Once `{s}` succeeds, reply in one short sentence.", .{name});
+    return aw.written();
+}
 
 fn resolveSavePathAndMode(self: *Agent, arena: std.mem.Allocator, filename: ?[]const u8) ?PathAndMode {
     if (self.save_path) |saved| {
@@ -1269,10 +1337,11 @@ fn abortSave(self: *Agent, baseline: usize, reason: []const u8) void {
     self.failSave(reason);
 }
 
-/// Save synthesis warrants more reasoning than a normal turn. `.none` stays off
-/// so users can opt out on models that reject `reasoning_effort` (e.g. Mistral).
+/// Save synthesis warrants more reasoning than a normal turn. `.null` and
+/// `.none` are kept as chosen.
 fn bumpedEffort(effort: Config.Effort) Config.Effort {
     return switch (effort) {
+        .null => .null,
         .none => .none,
         .minimal => .low,
         .low => .medium,
@@ -1468,10 +1537,7 @@ fn recordSaveCommand(self: *Agent, cmd: Command) void {
 /// `args`/`arena` — record it before either is freed.
 fn navigationGoto(arena: std.mem.Allocator, tool: BrowserTool, args: ?std.json.Value, navigated: bool) ?Command {
     if (!navigated or !tool.navigatesToUrl()) return null;
-    const a = args orelse return null;
-    if (a != .object) return null;
-    const url = a.object.get("url") orelse return null;
-    if (url != .string or url.string.len == 0) return null;
+    const url = urlArg(args) orelse return null;
     var obj: std.json.ObjectMap = .empty;
     obj.put(arena, "url", url) catch return null;
     return Command.fromToolCall(.goto, .{ .object = obj });
@@ -1575,7 +1641,7 @@ fn printSlashHelp(self: *Agent, arena: std.mem.Allocator, target: []const u8) vo
 
 fn runCommand(self: *Agent, arena: std.mem.Allocator, tc: Command.ToolCall) browser_tools.ToolResult {
     // The terminal can't show an image, but the conversation can.
-    return browser_tools.call(arena, self.ts.session, &self.ts.registry, tc.name(), tc.args, .{ .inline_image = self.ai_client != null, .record = true, .nav_note = true }) catch |err| .{
+    return browser_tools.call(arena, self.ts.session, &self.ts.registry, tc.name(), tc.args, .{ .inline_image = self.ai_client != null, .record = true, .nav_note = true, .source = .user }) catch |err| .{
         .text = switch (err) {
             error.OutOfMemory => "out of memory",
             error.FrameNotLoaded => "no page loaded — run /goto <url> first",
@@ -1816,6 +1882,8 @@ fn processUserMessage(self: *Agent, input: TurnInput) !?[]const u8 {
         ma,
         .{ .context = @ptrCast(self), .callFn = handleToolCall },
         .{
+            // The full list even in a prompt turn: a narrower one would change
+            // the cached prefix; `toolOutcome` refuses the rest.
             .tools = globalTools(),
             .before_request = .{ .context = @ptrCast(self), .callFn = beforeTurnRequest },
             .after_response = .{ .context = @ptrCast(self), .callFn = afterResponse },
@@ -1867,10 +1935,11 @@ fn processUserMessage(self: *Agent, input: TurnInput) !?[]const u8 {
                 if (tool == .extract and idx != i) continue;
             }
             const ca = self.conversation.arena.allocator();
-            const args = browser_tools.normalizeArgKeys(ca, tool, tc.arguments) catch tc.arguments;
+            const saved: SavedCall = if (i < self.save_calls.items.len) self.save_calls.items[i] else .{};
+            const call_args = saved.args orelse tc.arguments;
+            const args = browser_tools.normalizeArgs(ca, tool, call_args) catch call_args;
             // Fall back to the navigation a read tool performed, so a
             // markdown/tree-driven turn isn't lost from `/save`.
-            const saved: SavedCall = if (i < self.save_calls.items.len) self.save_calls.items[i] else .{};
             const replayable = withSelector(ca, args, saved.selector);
             const cmd = Command.fromToolCall(tool, replayable);
             const to_record = if (cmd.isRecorded())
@@ -1920,8 +1989,11 @@ fn processUserMessage(self: *Agent, input: TurnInput) !?[]const u8 {
                 .max_tokens = 4096,
                 .tool_choice = .none,
                 // .low caps thinking so reasoning models still emit an answer;
-                // `.none` stays off to opt out on models that reject it.
-                .effort = if (self.effort == .none) .none else .low,
+                // `.null` and `.none` are kept as chosen.
+                .effort = switch (self.effort) {
+                    .null, .none => self.effort,
+                    else => .low,
+                },
                 .cancel = .{ .context = @ptrCast(self), .checkFn = checkCancel },
                 .before_request = .{ .context = @ptrCast(self), .callFn = beforeRequest },
                 .after_response = .{ .context = @ptrCast(self), .callFn = afterResponse },
@@ -2046,7 +2118,7 @@ fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []co
         // turn that reads them; `allocator` here is zenai's per-call arena.
         const ca = self.conversation.arena.allocator();
         const kept = if (saved.selector) |sel| ca.dupe(u8, sel) catch null else null;
-        self.save_calls.append(self.allocator, .{ .selector = kept, .navigated = saved.navigated }) catch {};
+        self.save_calls.append(self.allocator, .{ .selector = kept, .navigated = saved.navigated, .args = saved.args }) catch {};
     }
 
     self.terminal.agentToolDone(tool_name, args_str, !outcome.is_error);
@@ -2056,12 +2128,37 @@ fn handleToolCall(ctx: *anyopaque, allocator: std.mem.Allocator, tool_name: []co
 
 /// The text plus the rendered PNG, for backends that can show the model an image.
 fn toolOutcome(self: *Agent, allocator: std.mem.Allocator, tool_name: []const u8, arguments: ?std.json.Value, saved: *SavedCall) browser_tools.ToolError!zenai.provider.Client.ToolHandler.Result {
-    const result = try browser_tools.call(allocator, self.ts.session, &self.ts.registry, tool_name, arguments, .{
+    var args = arguments;
+    var is_target = false;
+    if (self.prompt_target) |t| {
+        if (t.done) return .{ .content = "Error: the request is already done. Reply without calling more tools.", .is_error = true };
+        const tool = std.meta.stringToEnum(BrowserTool, tool_name);
+        is_target = tool == t.cmd.tool;
+        if (is_target) {
+            if (t.cmd.args != null) {
+                args = try pinArgs(self.conversation.arena.allocator(), args, t.cmd.args);
+                saved.args = args;
+            }
+        } else if (tool == null or tool.?.group() != .reading) {
+            return .{ .content = allocator.print("Error: only {s} and the read-only tools are available for this request.", .{@tagName(t.cmd.tool)}) catch "Error: tool not available", .is_error = true };
+        } else if (tool.?.navigatesToUrl() and urlArg(args) != null) {
+            return .{ .content = "Error: read the current page; this request must not navigate.", .is_error = true };
+        }
+    }
+
+    const result = try browser_tools.call(allocator, self.ts.session, &self.ts.registry, tool_name, args, .{
         .inline_image = true,
         .record = self.capturing_for_save,
         .nav_note = true,
+        .source = .llm,
     });
-    saved.* = .{ .selector = result.selector, .navigated = result.navigated };
+    saved.selector = result.selector;
+    saved.navigated = result.navigated;
+    if (is_target and !result.is_error) {
+        const t = &self.prompt_target.?;
+        t.done = true;
+        if (t.cmd.tool.producesData()) t.data = try t.arena.dupe(u8, result.text);
+    }
     const content = capToolOutput(allocator, tool_name, result.text);
     return .{
         .content = content,
@@ -2254,4 +2351,25 @@ test "capToolOutput: extract is exempt from the default cap" {
 
     try std.testing.expectEqual(extract_output_max_bytes, toolOutputCap("extract"));
     try std.testing.expectEqual(tool_output_max_bytes, toolOutputCap("html"));
+}
+
+test "pinArgs: the result outlives the model's args" {
+    var dst: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer dst.deinit();
+    const da = dst.allocator();
+
+    var src: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    const sa = src.allocator();
+    var model: std.json.ObjectMap = .empty;
+    try model.put(sa, try sa.dupe(u8, "selector"), .{ .string = try sa.dupe(u8, "#email") });
+    try model.put(sa, try sa.dupe(u8, "value"), .{ .string = try sa.dupe(u8, "guess") });
+
+    var pinned: std.json.ObjectMap = .empty;
+    try pinned.put(da, "value", .{ .string = "$LP_EMAIL" });
+
+    const out = (try pinArgs(da, .{ .object = model }, .{ .object = pinned })).?;
+    src.deinit();
+
+    try std.testing.expectEqualStrings("#email", out.object.get("selector").?.string);
+    try std.testing.expectEqualStrings("$LP_EMAIL", out.object.get("value").?.string);
 }

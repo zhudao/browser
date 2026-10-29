@@ -60,6 +60,35 @@ pub fn isNativeError(self: Value) bool {
     return v8.v8__Value__IsNativeError(self.handle);
 }
 
+pub const ErrorLocation = struct {
+    url: []const u8 = "",
+    line: u32 = 0,
+    column: u32 = 0,
+};
+
+pub fn errorLocation(self: Value, allocator: Allocator) !ErrorLocation {
+    const l = self.local;
+    const message = v8.v8__Exception__CreateMessage(l.isolate.handle, self.handle) orelse return .{};
+
+    var location: ErrorLocation = .{};
+    const line = v8.v8__Message__GetLineNumber(message, l.handle);
+    if (line > 0) {
+        location.line = @intCast(line);
+    }
+    // V8's column is 0-based.
+    const column = v8.v8__Message__GetStartColumn(message);
+    if (column >= 0) {
+        location.column = @intCast(column + 1);
+    }
+    if (v8.v8__Message__GetScriptResourceName(message)) |handle| {
+        const name: Value = .{ .local = l, .handle = handle };
+        if (name.isString()) |str| {
+            location.url = try str.toSliceWithAlloc(allocator);
+        }
+    }
+    return location;
+}
+
 pub fn isNull(self: Value) bool {
     return v8.v8__Value__IsNull(self.handle);
 }
@@ -124,7 +153,25 @@ pub fn isArrayBuffer(self: Value) bool {
     return v8.v8__Value__IsArrayBuffer(self.handle);
 }
 
-pub fn taggedOpaque(self: Value) ?*const TaggedOpaque {
+pub fn isSharedArrayBuffer(self: Value) bool {
+    return v8.v8__Value__IsSharedArrayBuffer(self.handle);
+}
+
+/// Whether this converts to a WebIDL BufferSource: an ArrayBuffer, or a view
+/// onto one. Without [AllowShared], a SharedArrayBuffer, or a view onto one,
+/// doesn't.
+pub fn isBufferSource(self: Value) bool {
+    if (self.isArrayBuffer()) {
+        return true;
+    }
+    if (!self.isArrayBufferView()) {
+        return false;
+    }
+    const view: *const v8.ArrayBufferView = @ptrCast(self.handle);
+    return !js.arrayBufferIsShared(v8.v8__ArrayBufferView__Buffer(view).?);
+}
+
+pub fn taggedOpaque(self: Value) ?TaggedOpaque {
     // caller must ensure self.isObject()
     return TaggedOpaque.fromObject(@ptrCast(self.handle));
 }
@@ -381,8 +428,8 @@ pub fn jsonStringify(self: Value, jws: anytype) !void {
 }
 
 // Clones host objects listed in cloneable_types; throws a DataCloneError for
-// any other. Does not support transferables which require additional delegate
-// callbacks.
+// any other. Transferring MessagePorts goes through serializeTransfer /
+// deserializeTransfer (see MessagePort.cloneMessage).
 pub fn structuredClone(self: Value) !Value {
     return self.structuredCloneTo(self.local);
 }
@@ -413,9 +460,17 @@ pub const Serialized = struct {
 // Serialize `self` into a V8-owned buffer. The caller must call deinit on the
 // result. Raises a JS exception (DataCloneError) for unserializable values.
 pub fn serialize(self: Value) !Serialized {
+    return self.serializeTransfer(&.{});
+}
+
+// Like serialize, but each MessagePort in `transfer` is written as its index
+// in that list, for deserializeTransfer to swap in the moved port. A port not
+// in `transfer` is still a DataCloneError.
+pub fn serializeTransfer(self: Value, transfer: []const *MessagePort) !Serialized {
     var delegate_ctx = CloneDelegate.SerializeContext{
         .local = self.local,
         .serializer = undefined,
+        .transfer = transfer,
     };
     const serializer = v8.v8__ValueSerializer__New(self.local.isolate.handle, &.{
         .data = &delegate_ctx,
@@ -443,9 +498,16 @@ pub fn serialize(self: Value) !Serialized {
 // Deserialize a structured-serialized buffer (from `serialize`) into a value in
 // `local`'s context. A malformed buffer surfaces as error.JsException.
 pub fn deserialize(local: *const js.Local, bytes: []const u8) !Value {
+    return deserializeTransfer(local, bytes, &.{});
+}
+
+// `ports` are the transferred ports, already moved into `local`'s context, in
+// the order of the `transfer` list given to serializeTransfer.
+pub fn deserializeTransfer(local: *const js.Local, bytes: []const u8, ports: []const *MessagePort) !Value {
     var delegate_ctx = CloneDelegate.DeserializeContext{
         .local = local,
         .deserializer = undefined,
+        .ports = ports,
     };
     const deserializer = v8.v8__ValueDeserializer__New(local.isolate.handle, bytes.ptr, bytes.len, &.{
         .data = &delegate_ctx,
@@ -477,7 +539,29 @@ const cloneable_types = .{
     @import("../webapi/DOMPoint.zig"),
     @import("../webapi/DOMRectReadOnly.zig"),
     @import("../webapi/DOMRect.zig"),
+    @import("../webapi/DOMException.zig"),
+    @import("../webapi/webcodecs/encoded_chunk.zig").EncodedAudioChunk,
+    @import("../webapi/webcodecs/encoded_chunk.zig").EncodedVideoChunk,
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/CryptoKey.zig"),
 };
+
+const MessagePort = @import("../webapi/MessagePort.zig");
+
+// Tag for a transferred MessagePort, after the cloneable_types tags.
+const transferred_port_tag: u32 = cloneable_types.len;
+
+comptime {
+    // writeHostObject relies on subtypes coming after their prototypes.
+    for (0..cloneable_types.len) |i| {
+        for (i + 1..cloneable_types.len) |j| {
+            if (bridge.inheritsOrIs(cloneable_types[i].JsApi, cloneable_types[j].JsApi)) {
+                @compileError(@typeName(cloneable_types[i]) ++ " must come after " ++ @typeName(cloneable_types[j]));
+            }
+        }
+    }
+}
 
 // Passed to a type's structuredSerialize hook to write its payload into the
 // V8 serialization buffer.
@@ -542,11 +626,13 @@ const CloneDelegate = struct {
     const SerializeContext = struct {
         local: *const js.Local,
         serializer: *v8.ValueSerializer,
+        transfer: []const *MessagePort,
     };
 
     const DeserializeContext = struct {
         local: *const js.Local,
         deserializer: *v8.ValueDeserializer,
+        ports: []const *MessagePort,
     };
 
     // Called when V8 encounters an object with embedder fields, i.e. one of
@@ -560,18 +646,19 @@ const CloneDelegate = struct {
             const obj = object orelse break :blk;
             const tao = TaggedOpaque.fromObject(obj) orelse break :blk;
 
-            const prototype_chain = tao.prototype_chain[0..tao.prototype_len];
-            if (writeCloneable(ctx, prototype_chain[0].index, tao.value)) |result| {
-                return result;
+            if (tao.as(MessagePort)) |port| {
+                const index = std.mem.findScalar(*MessagePort, ctx.transfer, port) orelse break :blk;
+                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, transferred_port_tag);
+                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, @intCast(index));
+                return .{ .has_value = true, .value = true };
             }
 
-            // Walk up the prototype chain so a subtype serializes as its
-            // closest cloneable supertype (mirrors TaggedOpaque.fromJS).
-            var ptr = @intFromPtr(tao.value);
-            for (prototype_chain[1..]) |proto| {
-                ptr -= proto.offset;
-                if (writeCloneable(ctx, proto.index, @ptrFromInt(ptr))) |result| {
-                    return result;
+            // Serialize as the closest cloneable type: subtypes are listed
+            // after their prototypes, so the last match is the closest.
+            inline for (0..cloneable_types.len) |i| {
+                const tag = cloneable_types.len - 1 - i;
+                if (tao.as(cloneable_types[tag])) |instance| {
+                    return writeCloneable(ctx, tag, instance);
                 }
             }
         }
@@ -580,24 +667,14 @@ const CloneDelegate = struct {
         return .{ .has_value = true, .value = false };
     }
 
-    fn writeCloneable(
-        ctx: *SerializeContext,
-        type_index: bridge.JsApiLookup.BackingInt,
-        value_ptr: *anyopaque,
-    ) ?v8.MaybeBool {
-        inline for (cloneable_types, 0..) |T, tag| {
-            if (type_index == bridge.JsApiLookup.getId(T.JsApi)) {
-                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
-                var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
-                const instance: *const T = @ptrCast(@alignCast(value_ptr));
-                instance.structuredSerialize(&writer) catch {
-                    throwDataCloneException(ctx.local, null);
-                    return .{ .has_value = true, .value = false };
-                };
-                return .{ .has_value = true, .value = true };
-            }
-        }
-        return null;
+    fn writeCloneable(ctx: *SerializeContext, tag: u32, instance: anytype) v8.MaybeBool {
+        v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
+        var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
+        instance.structuredSerialize(&writer) catch {
+            throwDataCloneException(ctx.local, null);
+            return .{ .has_value = true, .value = false };
+        };
+        return .{ .has_value = true, .value = true };
     }
 
     // Called by V8 to read back what writeHostObject wrote. Returning null
@@ -608,6 +685,12 @@ const CloneDelegate = struct {
 
         var tag: u32 = undefined;
         if (v8.v8__ValueDeserializer__ReadUint32(ctx.deserializer, &tag)) {
+            if (tag == transferred_port_tag) {
+                return readTransferredPort(ctx) orelse {
+                    throwDataCloneException(local, null);
+                    return null;
+                };
+            }
             var reader = StructuredReader{ .local = local, .deserializer = ctx.deserializer };
             inline for (cloneable_types, 0..) |T, i| {
                 if (tag == i) {
@@ -621,6 +704,18 @@ const CloneDelegate = struct {
 
         throwDataCloneException(local, null);
         return null;
+    }
+
+    fn readTransferredPort(ctx: *DeserializeContext) ?*const v8.Object {
+        var index: u32 = undefined;
+        if (!v8.v8__ValueDeserializer__ReadUint32(ctx.deserializer, &index)) {
+            return null;
+        }
+        if (index >= ctx.ports.len) {
+            return null;
+        }
+        const js_obj = ctx.local.mapZigInstanceToJs(null, ctx.ports[index]) catch return null;
+        return js_obj.handle;
     }
 
     fn readCloneable(comptime T: type, reader: *StructuredReader) ?*const v8.Object {
@@ -869,13 +964,14 @@ const Inert = struct {
 
         fn ownDataProperty(self: *State, object: *const v8.Object, key: []const u8) ?*const v8.Value {
             const local = self.local;
-            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(object, local.handle, local.isolate.initStringHandle(key)) orelse return null;
+            const key_handle = local.isolate.initStringHandle(key) catch return null;
+            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(object, local.handle, key_handle) orelse return null;
             if (v8.v8__Value__IsObject(descriptor) == false) {
                 return null;
             }
 
             // An accessor descriptor has no own `value`, and a Get would then reach Object.prototype.
-            const value_key = local.isolate.initStringHandle("value");
+            const value_key = local.isolate.initStringHandle("value") catch return null;
             var has: v8.MaybeBool = undefined;
             v8.v8__Object__HasOwnProperty(@ptrCast(descriptor), local.handle, value_key, &has);
             if (has.has_value == false or has.value == false) {

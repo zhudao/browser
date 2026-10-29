@@ -23,7 +23,9 @@ const HttpClient = @import("../network/HttpClient.zig");
 
 const js = @import("js/js.zig");
 const Frame = @import("Frame.zig");
+const Mime = @import("Mime.zig");
 const ImportMap = @import("ImportMap.zig");
+const h5e = @import("parser/html5ever.zig");
 
 const Element = @import("webapi/Element.zig");
 const WorkerGlobalScope = @import("webapi/WorkerGlobalScope.zig");
@@ -602,6 +604,12 @@ pub const Script = struct {
     // limited .large arena pool
     source_arena: ?*lp.Arena = null,
 
+    // The encoding a remote script's Content-Type charset names.
+    encoding: ?h5e.EncodingInfo = null,
+
+    // Set when the body is an http cache entry. Only classic scripts use it (for now).
+    script_cache: ?HttpClient.ScriptCache = null,
+
     extra: Extra,
     node: std.DoublyLinkedList.Node,
     manager: *ScriptManagerBase,
@@ -690,6 +698,32 @@ pub const Script = struct {
         return (self.source_arena orelse self.arena).allocator();
     }
 
+    pub fn setContentType(self: *Script, content_type: ?[]const u8) void {
+        const mime = Mime.parse(content_type orelse return) catch return;
+        self.encoding = .forLabel(mime.explicitCharset());
+    }
+
+    /// A classic script's text. Remote bytes are decoded with the
+    /// Content-Type charset, else the element's charset attribute, else the
+    /// document's encoding; a BOM overrides all three.
+    /// https://html.spec.whatwg.org/#fetch-a-classic-script
+    fn classicText(self: *Script, fe: Extra.FrameExtra) ![]const u8 {
+        if (self.source != .remote) {
+            return self.source.content();
+        }
+        const bytes = self.source.content();
+        const encoding = self.encoding orelse
+            h5e.EncodingInfo.forLabel(fe.script_element.asElement().getAttributeSafe(comptime .wrap("charset"))) orelse
+            h5e.EncodingInfo.forLabel(fe.frame.charset) orelse
+            h5e.EncodingInfo.utf8();
+        // V8 reads UTF-8 itself, replacing malformed sequences as decoding
+        // would, so only a UTF-16 BOM needs the decoder.
+        if (encoding.isUtf8() and !std.mem.startsWith(u8, bytes, "\xFE\xFF") and !std.mem.startsWith(u8, bytes, "\xFF\xFE")) {
+            return bytes;
+        }
+        return h5e.decodeToUtf8(self.sourceAllocator(), encoding.handle.?, bytes);
+    }
+
     pub fn startCallback(transfer: *HttpClient.Transfer) !void {
         log.debug(.http, "script fetch start", .{ .req = transfer });
     }
@@ -698,6 +732,7 @@ pub const Script = struct {
         const self: *Script = @ptrCast(@alignCast(transfer.req.ctx));
 
         self.status = transfer.responseStatus().?;
+        self.manager.owner.pageStatus().noteResponse(.script, transfer);
         if (transfer.responseStatus() != 200) {
             log.info(.http, "script header", .{
                 .req = transfer,
@@ -747,6 +782,8 @@ pub const Script = struct {
             self.debug_transfer_easy_id = if (transfer._conn) |c| @intFromPtr(c._easy) else 0;
         }
 
+        self.setContentType(transfer.contentType());
+
         lp.assert(self.source.remote.capacity == 0, "ScriptManagerBase.Header buffer", .{ .capacity = self.source.remote.capacity });
 
         const body_len = transfer.bodyLen();
@@ -758,6 +795,14 @@ pub const Script = struct {
         var buffer: std.ArrayList(u8) = .empty;
         try buffer.ensureTotalCapacityPrecise(self.sourceAllocator(), body_len);
         self.source = .{ .remote = buffer };
+
+        if (transfer.script_cache) |sc| {
+            const allocator = self.sourceAllocator();
+            self.script_cache = .{
+                .key = try allocator.dupe(u8, sc.key),
+                .bytes = if (sc.bytes) |b| try allocator.dupe(u8, b) else null,
+            };
+        }
         return .proceed;
     }
 
@@ -808,6 +853,9 @@ pub const Script = struct {
 
     pub fn errorCallback(ctx: *anyopaque, err: anyerror) void {
         const self: *Script = @ptrCast(@alignCast(ctx));
+        if (self.status == 0) {
+            self.manager.owner.pageStatus().noteError(.script, err);
+        }
         if (self.status == 404) {
             log.info(.http, "script 404", .{
                 .req = self.url,
@@ -904,8 +952,10 @@ pub const Script = struct {
             .kind = fe.kind,
         });
 
+        // A script runs in the main world, even when an isolated world
+        // inserted it (e.g. Playwright's setContent uses document.write).
         var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
+        frame.main_js.localScope(&ls);
         defer ls.deinit();
 
         const local = &ls.local;
@@ -922,7 +972,7 @@ pub const Script = struct {
         // Handle importmap special case here: the content is a JSON containing imports.
         // Multiple <script type="importmap"> elements merge with first-wins semantics.
         if (fe.kind == .importmap) {
-            self.manager.importmap.merge(frame.arena, frame.base(), self.source.content()) catch |err| {
+            self.manager.importmap.merge(frame.page_arena, frame.base(), self.source.content()) catch |err| {
                 log.debug(.browser, "parse importmap script", .{
                     .err = err,
                     .src = url,
@@ -947,12 +997,14 @@ pub const Script = struct {
         defer frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
 
         const success = blk: {
-            const content = self.source.content();
             switch (fe.kind) {
-                .javascript => _ = local.eval(content, url) catch break :blk false,
+                .javascript => {
+                    const text = self.classicText(fe) catch break :blk false;
+                    self.runClassic(local, text) catch break :blk false;
+                },
                 .module => {
                     // We don't care about waiting for the evaluation here.
-                    frame.js.module(false, local, content, url, cacheable) catch break :blk false;
+                    frame.main_js.module(false, local, self.source.content(), url, cacheable) catch break :blk false;
                 },
                 .importmap => unreachable, // handled before the try/catch.
             }
@@ -968,10 +1020,7 @@ pub const Script = struct {
         }
 
         defer if (frame.js.call_depth == 0) {
-            local.runMacrotasks(); // also runs microtasks
-            _ = frame.js.scheduler.run() catch |err| {
-                log.err(.frame, "scheduler", .{ .err = err });
-            };
+            local.runMacrotasks();
         };
 
         if (success) {
@@ -979,17 +1028,21 @@ pub const Script = struct {
             return;
         }
 
-        const caught = try_catch.caughtOrError(frame.local_arena, error.Unknown);
         lp.metrics.script_errors.incr();
-        log.debug(.js, "eval script", .{
-            .url = url,
-            .caught = caught,
-        });
 
+        // Report before caughtOrError: reading the exception's stack drops
+        // the frames reportError needs for the error's location.
         if (try_catch.exceptionValue()) |exc| {
             frame.window.reportError(exc, frame) catch |err| {
                 log.debug(.js, "eval script report error", .{ .url = url, .err = err });
             };
+        }
+
+        if (log.enabled(.js, .debug)) {
+            log.debug(.js, "eval script", .{
+                .url = url,
+                .caught = try_catch.caughtOrError(frame.local_arena, error.Unknown),
+            });
         }
 
         // a classic script that throws is still "loaded". For a module, we can't
@@ -999,6 +1052,50 @@ pub const Script = struct {
             .javascript => comptime .wrap("load"),
             else => comptime .wrap("error"),
         });
+    }
+
+    // currently only classic scripts participate in script caching
+    fn runClassic(self: *Script, local: *const js.Local, text: []const u8) !void {
+        const sc = self.script_cache orelse {
+            // wasn't in the cache and isn't cacheable
+            return local.eval(text, self.url);
+        };
+
+        if (text.ptr != self.source.content().ptr) {
+            // Cacheable from a pure HTTP point of view, but classicText()
+            // decoded the content (it wasn't UTF-8). You might think: the
+            // cached body will go through the same classicText() next time, so
+            // wouldn't bytes we generate now still apply? In most cases, yes.
+            // But when the response doesn't name its charset (BOM or
+            // Content-Type), classicText() falls back to <script charset="...">
+            // and then the document's encoding. If either differs next time,
+            // the text changes without the cache entry being invalidated.
+            // That's unlikely, but treating the script as uncacheable avoids
+            // the complexity for a rare edge case.
+            return local.eval(text, self.url);
+        }
+
+        const result = try local.compileWithCache(text, self.url, sc.bytes);
+        _ = try result.script.run();
+
+        if (sc.bytes != null) {
+            log.debug(.browser, "script cache", .{ .url = self.url, .rejected = result.cache_rejected });
+            if (result.cache_rejected == false) {
+                // We already have cached bytes and v8 didn't rectect them.
+                // Nothing else to do
+                return;
+            }
+        }
+
+        // Created after the run so it includes the functions compiled lazily
+        // while running.
+        const bytes = result.script.getUnboundScript().createCodeCache(self.sourceAllocator()) catch |err| {
+            log.debug(.browser, "create script cache", .{ .url = self.url, .err = err });
+            return;
+        };
+        self.manager.client.cache.putScriptCache(sc.key, text, bytes) catch |err| {
+            log.warn(.cache, "put script cache", .{ .url = self.url, .err = err });
+        };
     }
 
     // Frame-only: fires load/error on the <script> element itself,

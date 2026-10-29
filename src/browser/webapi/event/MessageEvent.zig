@@ -102,15 +102,6 @@ pub fn deinit(self: *MessageEvent, page: *Page) void {
             .string, .arraybuffer => {},
         }
     }
-    self._proto.deinit(page);
-}
-
-pub fn acquireRef(self: *MessageEvent) void {
-    self._proto.acquireRef();
-}
-
-pub fn releaseRef(self: *MessageEvent, page: *Page) void {
-    self._proto._rc.release(self, page);
 }
 
 pub fn asEvent(self: *MessageEvent) *Event {
@@ -160,7 +151,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "MessageEvent";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

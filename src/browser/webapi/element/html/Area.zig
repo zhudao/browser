@@ -140,7 +140,7 @@ pub fn getPort(self: *Area, frame: *Frame) ![]const u8 {
     return port;
 }
 
-fn setPort(self: *Area, value: ?[]const u8, frame: *Frame) !void {
+fn setPort(self: *Area, value: []const u8, frame: *Frame) !void {
     const href = try getResolvedHref(self, frame) orelse return;
     const new_href = try URL.setPort(href, value, frame.call_arena);
     try setHref(self, new_href, frame);
@@ -222,7 +222,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLAreaElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

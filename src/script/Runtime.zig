@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const Schema = @import("Schema.zig");
 const NodeRegistry = @import("../NodeRegistry.zig");
+const TelemetryOutcome = @import("../telemetry/telemetry.zig").Event.Tool.Outcome;
 
 const v8 = lp.js.v8;
 const browser_tools = lp.tools;
@@ -74,8 +75,9 @@ const PendingGoto = struct {
     receiver: v8.Global,
     /// `run_timer` reading (ms) past which the navigation is abandoned.
     deadline_ms: u64,
-    started_ms: u64,
     until: lp.Config.WaitUntil,
+    /// `datetime.milliTimestamp(.awake)` at start, for telemetry.
+    started_ms: u64,
 
     fn reset(self: *PendingGoto) void {
         v8.v8__Global__Reset(&self.resolver);
@@ -83,14 +85,14 @@ const PendingGoto = struct {
     }
 };
 
-const ConsoleMethod = enum {
+pub const ConsoleMethod = enum {
     debug,
     @"error",
     info,
     log,
     warn,
 
-    fn writesStderr(self: ConsoleMethod) bool {
+    pub fn writesStderr(self: ConsoleMethod) bool {
         return switch (self) {
             .@"error", .warn => true,
             .debug, .info, .log => false,
@@ -259,7 +261,7 @@ fn setObjectProperty(
     v8.v8__Object__Set(
         object,
         context,
-        @ptrCast(self.env.isolate.initStringHandle(name)),
+        @ptrCast(self.env.isolate.initStringHandle(name) catch return error.RuntimeInitFailed),
         value,
         &out,
     );
@@ -286,7 +288,8 @@ pub fn runSource(self: *Runtime, source: []const u8, name: []const u8) RunError!
     v8.v8__TryCatch__CONSTRUCT(&try_catch, self.env.isolate.handle);
     defer v8.v8__TryCatch__DESTRUCT(&try_catch);
 
-    const script_name = self.env.isolate.initStringHandle(name);
+    const script_name = self.env.isolate.initStringHandle(name) catch
+        return try self.dupeError("RangeError: Invalid string length");
     // Wrap in an async IIFE so the source can use top-level `await` (e.g.
     // `await page.goto(...)`). The wrapper evaluates to a Promise; a top-level
     // `return <expr>` becomes that Promise's value, which we echo. (A bare
@@ -294,7 +297,8 @@ pub fn runSource(self: *Runtime, source: []const u8, name: []const u8) RunError!
     // completion value are mutually exclusive in JS.)
     const wrapped = self.call_arena.allocator().print("(async () => {{\n{s}\n}})()", .{source}) catch
         return try self.dupeError("out of memory");
-    const script_source = self.env.isolate.initStringHandle(wrapped);
+    const script_source = self.env.isolate.initStringHandle(wrapped) catch
+        return try self.dupeError("RangeError: Invalid string length");
 
     var origin: v8.ScriptOrigin = undefined;
     v8.v8__ScriptOrigin__CONSTRUCT(&origin, script_name);
@@ -351,7 +355,7 @@ fn formatRejection(self: *Runtime, context: *const v8.Context, reason: *const v8
 /// Error-like object — in which case the caller stringifies the value itself.
 fn errorMessage(self: *Runtime, context: *const v8.Context, reason: *const v8.Value) ?*const v8.Value {
     if (!v8.v8__Value__IsObject(reason)) return null;
-    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle("message"));
+    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle("message") catch return null);
     const message = v8.v8__Object__Get(@ptrCast(reason), context, key) orelse return null;
     return if (v8.v8__Value__IsString(message)) message else null;
 }
@@ -413,9 +417,23 @@ fn construct(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
         self.installFunction(context, this, @tagName(data.tool), primitiveCallback, data) catch
             return self.throwError("failed to construct page");
     }
-    self.installFunction(context, this, "close", closeCallback, self) catch
-        return self.throwError("failed to construct page");
+    for (page_methods) |m| {
+        self.installFunction(context, this, m.name, m.callback, self) catch
+            return self.throwError("failed to construct page");
+    }
 }
+
+pub const PageMethod = struct {
+    name: []const u8,
+    callback: Callback,
+    /// Rendered by `zig build docs`.
+    summary: []const u8,
+};
+
+/// The page methods besides the recorded tools.
+pub const page_methods = [_]PageMethod{
+    .{ .name = "close", .callback = closeCallback, .summary = "Stales the handle, so later calls on it fail. The page itself is reclaimed on the next `goto` or at script end." },
+};
 
 /// Property carrying a page handle's claim on a live frame. Numeric while the
 /// page is navigated; absent/undefined once never-navigated or closed.
@@ -502,22 +520,24 @@ fn invokeGoto(
     // startGoto is browser-side work; run it under the browser's isolate.
     // Settle the resolver only after the block: a `return` inside it runs
     // script-isolate work before the deferred exit.
-    const started_ms = lp.datetime.milliTimestamp(.boot);
-    const maybe_started: ?browser_tools.StartedGoto = blk: {
+    const started_ms = lp.datetime.milliTimestamp(.awake);
+    const maybe_started: browser_tools.ToolError!browser_tools.StartedGoto = blk: {
         self.session.browser.env.isolate.enter();
         defer self.session.browser.env.isolate.exit();
-        break :blk browser_tools.startGoto(arena, self.session, self.registry, args, receiver_frame_id) catch null;
+        break :blk browser_tools.startGoto(arena, self.session, self.registry, args, receiver_frame_id);
     };
-    const started = maybe_started orelse
+    const started = maybe_started catch |err| {
+        self.recordGoto(browser_tools.errorOutcome(err), started_ms);
         return self.rejectResolver(context, resolver, "navigation failed");
+    };
 
     var pending: PendingGoto = .{
         .frame_id = started.frame_id,
         .resolver = undefined,
         .receiver = undefined,
         .deadline_ms = @as(u64, @intCast(self.run_timer.untilNow(lp.io, .boot).toMilliseconds())) + started.timeout_ms,
-        .started_ms = started_ms,
         .until = started.until,
+        .started_ms = started_ms,
     };
     v8.v8__Global__New(self.env.isolate.handle, resolver, &pending.resolver);
     v8.v8__Global__New(self.env.isolate.handle, this, &pending.receiver);
@@ -609,16 +629,23 @@ const Outcome = enum { loaded, failed, timed_out };
 /// Resolve or reject one pending goto's Promise and free its Globals.
 fn settlePending(self: *Runtime, context: *const v8.Context, pending: *PendingGoto, outcome: Outcome) void {
     const resolver: *const v8.PromiseResolver = @ptrCast(v8.v8__Global__Get(&pending.resolver, self.env.isolate.handle));
+    var result: TelemetryOutcome = switch (outcome) {
+        .loaded => .ok,
+        .failed => .navigation_failed,
+        .timed_out => .navigation_timeout,
+    };
     switch (outcome) {
         .loaded => done: {
             const frame = self.session.findFrameByFrameId(pending.frame_id);
             if (frame == null or frame.?._last_navigate_error != null) {
                 self.rejectResolver(context, resolver, "navigation failed");
+                result = .navigation_failed;
                 break :done;
             }
             const this: *const v8.Object = @ptrCast(v8.v8__Global__Get(&pending.receiver, self.env.isolate.handle));
             self.bindFrameId(context, this, pending.frame_id) catch {
                 self.rejectResolver(context, resolver, "internal: page bind failed");
+                result = .internal;
                 break :done;
             };
             self.resolveResolver(context, resolver, @ptrCast(this));
@@ -626,12 +653,17 @@ fn settlePending(self: *Runtime, context: *const v8.Context, pending: *PendingGo
         .failed => self.rejectResolver(context, resolver, "navigation failed"),
         .timed_out => self.rejectResolver(context, resolver, "navigation timed out"),
     }
+    self.recordGoto(result, pending.started_ms);
     // Async gotos settle here, outside `browser_tools.call`.
     if (self.session.tool_observer) |observer| {
         const reported: browser_tools.ToolResult = .{ .text = @tagName(outcome), .is_error = outcome != .loaded, .navigated = true };
-        observer.onCall(observer.context, "goto", null, &reported, lp.datetime.milliTimestamp(.boot) - pending.started_ms, self.session.findFrameByFrameId(pending.frame_id));
+        observer.onCall(observer.context, "goto", null, &reported, lp.datetime.milliTimestamp(.awake) -| pending.started_ms, self.session.findFrameByFrameId(pending.frame_id));
     }
     pending.reset();
+}
+
+fn recordGoto(self: *Runtime, outcome: TelemetryOutcome, started_ms: u64) void {
+    self.app.telemetry.recordTool(BrowserTool.goto.telemetryId(), .script, outcome, started_ms);
 }
 
 /// Reject every still-pending goto and clear the list, freeing all Globals.
@@ -639,6 +671,7 @@ fn failAllPending(self: *Runtime, context: *const v8.Context, message: []const u
     for (self.pending_gotos.items) |*pending| {
         const resolver: *const v8.PromiseResolver = @ptrCast(v8.v8__Global__Get(&pending.resolver, self.env.isolate.handle));
         self.rejectResolver(context, resolver, message);
+        self.recordGoto(.cancelled, pending.started_ms);
         pending.reset();
     }
     self.pending_gotos.clearRetainingCapacity();
@@ -666,7 +699,7 @@ fn bindFrameId(self: *Runtime, context: *const v8.Context, this: *const v8.Objec
 /// the page was never navigated or has been closed.
 fn receiverFrameId(self: *Runtime, context: *const v8.Context, info: *const v8.FunctionCallbackInfo) ?u32 {
     const this = v8.v8__FunctionCallbackInfo__This(info) orelse return null;
-    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle(frame_id_key));
+    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle(frame_id_key) catch return null);
     const prop = v8.v8__Object__Get(this, context, key) orelse return null;
     if (!v8.v8__Value__IsNumber(prop)) return null;
     var out: v8.MaybeU32 = undefined;
@@ -722,7 +755,7 @@ fn callTool(
     self.session.browser.env.isolate.enter();
     defer self.session.browser.env.isolate.exit();
 
-    const result = browser_tools.call(arena, self.session, self.registry, @tagName(tool), args, .{}) catch |err| switch (err) {
+    const result = browser_tools.call(arena, self.session, self.registry, @tagName(tool), args, .{ .source = .script }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FrameNotLoaded => return .{ .fail = "no page loaded - run page.goto(url) first" },
         else => return .{ .fail = arena.print("{s} failed: {s}", .{ @tagName(tool), @errorName(err) }) catch return error.OutOfMemory },
@@ -880,7 +913,11 @@ fn normalizeExtractReturnJson(_: *Runtime, arena: std.mem.Allocator, value: []co
 }
 
 fn setReturnString(self: *Runtime, info: *const v8.FunctionCallbackInfo, value: []const u8) void {
-    self.setReturnValue(info, @ptrCast(self.env.isolate.initStringHandle(value)));
+    const str = self.env.isolate.initStringHandle(value) catch {
+        self.throwRangeError("Invalid string length");
+        return;
+    };
+    self.setReturnValue(info, @ptrCast(str));
 }
 
 fn setReturnJson(self: *Runtime, context: *const v8.Context, info: *const v8.FunctionCallbackInfo, value: []const u8) void {
@@ -888,7 +925,10 @@ fn setReturnJson(self: *Runtime, context: *const v8.Context, info: *const v8.Fun
         self.setReturnValue(info, self.env.isolate.initUndefined());
         return;
     }
-    const json = self.env.isolate.initStringHandle(value);
+    const json = self.env.isolate.initStringHandle(value) catch {
+        self.throwRangeError("Invalid string length");
+        return;
+    };
     const parsed = v8.v8__JSON__Parse(context, json) orelse {
         self.throwError("extract returned invalid JSON");
         return;
@@ -904,6 +944,10 @@ fn setReturnValue(_: *Runtime, info: *const v8.FunctionCallbackInfo, value: *con
 
 fn throwError(self: *Runtime, message: []const u8) void {
     _ = v8.v8__Isolate__ThrowException(self.env.isolate.handle, self.env.isolate.createError(message));
+}
+
+fn throwRangeError(self: *Runtime, message: []const u8) void {
+    _ = v8.v8__Isolate__ThrowException(self.env.isolate.handle, self.env.isolate.createRangeError(message));
 }
 
 fn throwTypeError(self: *Runtime, message: []const u8) void {

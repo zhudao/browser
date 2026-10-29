@@ -114,7 +114,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLIFrameElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -152,6 +151,15 @@ pub const Build = struct {
     /// change; src is ignored while srcdoc is present.
     pub fn attributeChange(element: *Element, name: String, _: String, frame: *Frame) !void {
         if (reprocesses(element, name)) try reload(element, frame);
+    }
+
+    /// Removing the iframe destroys its browsing context
+    pub fn disconnected(element: *Element, _: *Frame) !void {
+        const self = element.as(IFrame);
+        self._executed = false;
+        const window = self._window orelse return;
+        self._window = null;
+        try window._frame.discard();
     }
 
     /// Removing srcdoc falls back to src, removing src to about:blank.

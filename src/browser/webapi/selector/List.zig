@@ -23,6 +23,7 @@ const Page = @import("../../Page.zig");
 const Frame = @import("../../Frame.zig");
 
 const Node = @import("../Node.zig");
+const ValidityState = @import("../element/html/ValidityState.zig");
 const Part = @import("Selector.zig").Part;
 const Selector = @import("Selector.zig");
 const TreeWalker = @import("../TreeWalker.zig").Full;
@@ -103,12 +104,37 @@ fn optimizeSelector(root: *Node, selector: *const Selector.Selector, nth: *NthCa
     const id = anchor.id;
     const segment_index = anchor.segment_index;
 
-    // Look up the element by ID (O(1) hash map lookup)
-    const id_element = frame.getElementByIdFromNode(root, id) orelse return null;
+    // id fast-path (O(1) hash map lookup). That's the common case, but
+    // if the id actually isn't unique (it happens) or isn't under the root,
+    // we need to walk
+    const id_element = switch (Frame.getUniqueElementByIdFromNode(root, id)) {
+        .none => return null,
+        .one => |el| el,
+        .many => {
+            // multiple elements with the same id, can't be optimized
+            return .{
+                .root = root,
+                .selector = selector.*,
+                .exclude_root = true,
+            };
+        },
+    };
     const id_node = id_element.asNode();
 
-    if (!root.contains(id_node)) {
-        return null;
+    if (id_node == root or !root.contains(id_node)) {
+        // When the id is in the rightmost compound, the only possible match
+        // is id_node itself, and it isn't a descendant of root.
+        const id_is_subject = if (segment_index) |i| i + 1 == selector.segments.len else selector.segments.len == 0;
+        if (id_is_subject) {
+            return null;
+        }
+        // Otherwise matches can still be below root (`#outer p` with #outer
+        // an ancestor of root), so walk it.
+        return .{
+            .root = root,
+            .selector = selector.*,
+            .exclude_root = true,
+        };
     }
 
     // If the ID is in the first compound
@@ -278,7 +304,19 @@ fn matchSegments(node: *Node, selector: Selector.Selector, segment_index: usize,
         .child => matchChild(node, target_compound, root, scope, nth, frame),
         .next_sibling => matchNextSibling(node, target_compound, scope, nth, frame),
         .subsequent_sibling => {
-            // For subsequent_sibling, try all matching siblings with backtracking
+            // For subsequent_sibling, try all matching siblings with backtracking.
+            const first_decides = blk: {
+                // Given #c > .a ~ .b
+                // We don't have to visit each of .b's siblings if the parent
+                // of the first matching .a sibling isn't `#c`..because every
+                // sibling shares the same parent, so if it isn't true for one
+                // it isn't true for any of them. Only a `+`, checking each
+                // candidate's own neighbour, needs every candidate tried.
+                if (segment_index == 0) {
+                    break :blk true;
+                }
+                break :blk selector.segments[segment_index - 1].combinator != .next_sibling;
+            };
             var sibling = node.previousSibling();
             while (sibling) |s| {
                 const sibling_el = s.is(Node.Element) orelse {
@@ -294,6 +332,9 @@ fn matchSegments(node: *Node, selector: Selector.Selector, segment_index: usize,
                     // Try to match remaining segments from this sibling
                     if (matchSegments(s, selector, segment_index - 1, root, scope, nth, frame)) {
                         return true;
+                    }
+                    if (first_decides) {
+                        return false;
                     }
                     // This sibling didn't work, try the next one
                 }
@@ -422,6 +463,7 @@ fn matchesPart(el: *Node.Element, part: Part, scope: *Node, nth: ?*NthCache, fra
         .universal => return true,
         .pseudo_class => |pseudo| return matchesPseudoClass(el, pseudo, scope, nth, frame),
         .attribute => |attr| return matchesAttribute(el, attr),
+        .pseudo_element => return false,
     }
 }
 
@@ -443,28 +485,37 @@ fn matchesAttribute(el: *Node.Element, attr: Selector.Attribute) bool {
         return false;
     };
 
+    const case_insensitive = switch (attr.value_case) {
+        .sensitive => false,
+        .insensitive => true,
+        .html_legacy => el._namespace == .html,
+    };
+
     switch (attr.matcher) {
         .presence => return true,
         .exact => |expected| {
-            return if (attr.case_insensitive)
+            return if (case_insensitive)
                 std.ascii.eqlIgnoreCase(value, expected)
             else
                 std.mem.eql(u8, value, expected);
         },
         .substring => |expected| {
-            return if (attr.case_insensitive)
+            if (expected.len == 0) return false;
+            return if (case_insensitive)
                 std.ascii.findIgnoreCase(value, expected) != null
             else
                 std.mem.find(u8, value, expected) != null;
         },
         .starts_with => |expected| {
-            return if (attr.case_insensitive)
+            if (expected.len == 0) return false;
+            return if (case_insensitive)
                 std.ascii.startsWithIgnoreCase(value, expected)
             else
                 std.mem.startsWith(u8, value, expected);
         },
         .ends_with => |expected| {
-            return if (attr.case_insensitive)
+            if (expected.len == 0) return false;
+            return if (case_insensitive)
                 std.ascii.endsWithIgnoreCase(value, expected)
             else
                 std.mem.endsWith(u8, value, expected);
@@ -473,7 +524,7 @@ fn matchesAttribute(el: *Node.Element, attr: Selector.Attribute) bool {
             // Space-separated word match (like class names)
             var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
             while (it.next()) |word| {
-                const same = if (attr.case_insensitive)
+                const same = if (case_insensitive)
                     std.ascii.eqlIgnoreCase(word, expected)
                 else
                     std.mem.eql(u8, word, expected);
@@ -484,7 +535,7 @@ fn matchesAttribute(el: *Node.Element, attr: Selector.Attribute) bool {
         },
         .prefix_dash => |expected| {
             // Matches value or value- prefix (for language codes like en, en-US)
-            if (attr.case_insensitive) {
+            if (case_insensitive) {
                 if (std.ascii.eqlIgnoreCase(value, expected)) return true;
                 if (value.len > expected.len and value[expected.len] == '-') {
                     return std.ascii.eqlIgnoreCase(value[0..expected.len], expected);
@@ -530,6 +581,46 @@ fn isReadWrite(el: *Node.Element) bool {
     return el.isEditable();
 }
 
+// Only input, select and textarea can be required, and an input only for the
+// types the required attribute applies to.
+fn isRequired(el: *Node.Element) bool {
+    if (el.hasAttributeInterned("required") == false) {
+        return false;
+    }
+    if (el.is(Node.Element.Html.Input)) |input| {
+        return input.requiredApplies();
+    }
+    return el.is(Node.Element.Html.Select) != null or el.is(Node.Element.Html.TextArea) != null;
+}
+
+fn isOptional(el: *Node.Element) bool {
+    if (el.is(Node.Element.Html.Input) == null and
+        el.is(Node.Element.Html.Select) == null and
+        el.is(Node.Element.Html.TextArea) == null and
+        el.is(Node.Element.Html.Button) == null)
+    {
+        return false;
+    }
+    return isRequired(el) == false;
+}
+
+// https://html.spec.whatwg.org/multipage/semantics-other.html#selector-default
+fn isDefault(el: *Node.Element, frame: *Frame) bool {
+    if (el.is(Node.Element.Html.Option) != null) {
+        return el.hasAttributeInterned("selected");
+    }
+    if (el.is(Node.Element.Html.Input)) |input| {
+        if (input._input_type == .checkbox or input._input_type == .radio) {
+            return el.hasAttributeInterned("checked");
+        }
+    }
+    if (Node.Element.Html.Form.isSubmitButton(el) == false) {
+        return false;
+    }
+    const form = Node.Element.Html.Form.ownerOf(el) orelse return false;
+    return form.getDefaultButton(frame) == el;
+}
+
 fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *Node, nth: ?*NthCache, frame: *Frame) bool {
     const node = el.asNode();
     switch (pseudo) {
@@ -561,47 +652,25 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
 
         // Form validation
         .valid => {
-            if (el.is(Node.Element.Html.Input)) |input| {
-                return switch (input._input_type) {
-                    .hidden, .submit, .reset, .button => false,
-                    else => !input.getRequired() or input.getValue().len > 0,
-                };
-            }
-            if (el.is(Node.Element.Html.Select)) |select| {
-                return !select.getRequired() or select.getValue(frame).len > 0;
-            }
             if (el.is(Node.Element.Html.Form) != null or el.is(Node.Element.Html.FieldSet) != null) {
                 return !hasInvalidDescendant(node, frame);
             }
-            return false;
+            return ValidityState.isValid(el, frame) orelse false;
         },
         .invalid => {
-            if (el.is(Node.Element.Html.Input)) |input| {
-                return switch (input._input_type) {
-                    .hidden, .submit, .reset, .button => false,
-                    else => input.getRequired() and input.getValue().len == 0,
-                };
-            }
-            if (el.is(Node.Element.Html.Select)) |select| {
-                return select.getRequired() and select.getValue(frame).len == 0;
-            }
             if (el.is(Node.Element.Html.Form) != null or el.is(Node.Element.Html.FieldSet) != null) {
                 return hasInvalidDescendant(node, frame);
             }
-            return false;
+            return ValidityState.isValid(el, frame) == false;
         },
-        .required => {
-            return el.hasAttributeInterned("required");
-        },
-        .optional => {
-            return el.hasAttributeInterned("required") == false;
-        },
+        .required => return isRequired(el),
+        .optional => return isOptional(el),
         .in_range => return false,
         .out_of_range => return false,
         .placeholder_shown => return false,
         .read_only => return !isReadWrite(el),
         .read_write => return isReadWrite(el),
-        .default => return false,
+        .default => return isDefault(el, frame),
 
         // User interaction
         .hover => return false,
@@ -623,7 +692,7 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
         // and :visited matches nothing.
         .link, .any_link => {
             const tag = el.getTag();
-            if (tag != .anchor and tag != .area) return false;
+            if (tag != .a and tag != .area) return false;
             return el.hasAttributeInterned("href");
         },
         .visited => return false,
@@ -642,7 +711,12 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
             return parent._type == .document;
         },
         .scope => {
-            // :scope matches the reference element (querySelector root)
+            // :scope matches the reference element (querySelector root);
+            // for a document that is its root element
+            if (scope._type == .document) {
+                const parent = node.parentNode() orelse return false;
+                return parent == scope;
+            }
             return node == scope;
         },
         .empty => {
@@ -671,6 +745,8 @@ fn matchesPseudoClass(el: *Node.Element, pseudo: Selector.PseudoClass, scope: *N
         .only_of_type => return isFirstOfType(el) and isLastOfType(el),
         .nth_child => |pattern| return matchesNthChild(el, pattern, nth),
         .nth_last_child => |pattern| return matchesNthLastChild(el, pattern, nth),
+        .nth_child_of => |nth_of| return matchesNthChildOf(el, nth_of, false, scope, nth, frame),
+        .nth_last_child_of => |nth_of| return matchesNthChildOf(el, nth_of, true, scope, nth, frame),
         .nth_of_type => |pattern| return matchesNthOfType(el, pattern, nth),
         .nth_last_of_type => |pattern| return matchesNthLastOfType(el, pattern, nth),
 
@@ -763,15 +839,7 @@ fn hasInvalidDescendant(parent: *Node, frame: *Frame) bool {
     var child = parent.firstChild();
     while (child) |c| {
         if (c.is(Node.Element)) |child_el| {
-            if (child_el.is(Node.Element.Html.Input)) |input| {
-                const invalid = switch (input._input_type) {
-                    .hidden, .submit, .reset, .button => false,
-                    else => input.getRequired() and input.getValue().len == 0,
-                };
-                if (invalid) return true;
-            } else if (child_el.is(Node.Element.Html.Select)) |select| {
-                if (select.getRequired() and select.getValue(frame).len == 0) return true;
-            }
+            if (ValidityState.isValid(child_el, frame) == false) return true;
         }
         if (hasInvalidDescendant(c, frame)) return true;
         child = c.nextSibling();
@@ -867,6 +935,40 @@ fn matchesNthChild(el: *Node.Element, pattern: Selector.NthPattern, nth: ?*NthCa
 
 fn matchesNthLastChild(el: *Node.Element, pattern: Selector.NthPattern, nth: ?*NthCache) bool {
     return matchesNthPattern(getChildIndexFromEnd(el, nth), pattern);
+}
+
+fn matchesNthChildOf(el: *Node.Element, nth_of: Selector.NthOf, from_end: bool, scope: *Node, nth: ?*NthCache, frame: *Frame) bool {
+    // With a <= 0 (":nth-child(2 of .y)", "-n+3 of .y") only indexes up to b
+    // can match, so stop counting once past it.
+    const max_index: usize = if (nth_of.pattern.a > 0) std.math.maxInt(usize) else blk: {
+        if (nth_of.pattern.b < 1) return false;
+        break :blk @intCast(nth_of.pattern.b);
+    };
+
+    const node = el.asNode();
+    if (!matchesAny(node, nth_of.selectors, scope, nth, frame)) {
+        return false;
+    }
+
+    var index: usize = 1;
+    var sibling = if (from_end) node.nextSibling() else node.previousSibling();
+    while (sibling) |s| {
+        if (s.is(Node.Element) != null and matchesAny(s, nth_of.selectors, scope, nth, frame)) {
+            index += 1;
+            if (index > max_index) return false;
+        }
+        sibling = if (from_end) s.nextSibling() else s.previousSibling();
+    }
+    return matchesNthPattern(index, nth_of.pattern);
+}
+
+fn matchesAny(node: *Node, selectors: []const Selector.Selector, scope: *Node, nth: ?*NthCache, frame: *Frame) bool {
+    for (selectors) |selector| {
+        if (matches(node, selector, scope, nth, frame)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn matchesNthOfType(el: *Node.Element, pattern: Selector.NthPattern, nth: ?*NthCache) bool {

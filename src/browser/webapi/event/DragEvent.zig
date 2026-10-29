@@ -97,15 +97,6 @@ pub fn deinit(self: *DragEvent, page: *Page) void {
     if (self._data_transfer) |dt| {
         dt.releaseRef(page);
     }
-    self.asEvent().deinit(page);
-}
-
-pub fn acquireRef(self: *DragEvent) void {
-    self.asEvent().acquireRef();
-}
-
-pub fn releaseRef(self: *DragEvent, page: *Page) void {
-    self.asEvent()._rc.release(self, page);
 }
 
 pub fn asEvent(self: *DragEvent) *Event {
@@ -121,7 +112,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DragEvent";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

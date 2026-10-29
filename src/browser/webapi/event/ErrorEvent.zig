@@ -83,19 +83,10 @@ fn initWithTrusted(arena: *lp.Arena, typ: String, opts_: ?Options, trusted: bool
     return event;
 }
 
-pub fn deinit(self: *ErrorEvent, page: *Page) void {
+pub fn deinit(self: *ErrorEvent, _: *Page) void {
     if (self._error) |e| {
         e.release();
     }
-    self._proto.deinit(page);
-}
-
-pub fn releaseRef(self: *ErrorEvent, page: *Page) void {
-    self._proto._rc.release(self, page);
-}
-
-pub fn acquireRef(self: *ErrorEvent) void {
-    self._proto.acquireRef();
 }
 
 pub fn asEvent(self: *ErrorEvent) *Event {
@@ -127,7 +118,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ErrorEvent";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
         pub const weak = true;
         pub const finalizer = bridge.finalizer(ErrorEvent.deinit);

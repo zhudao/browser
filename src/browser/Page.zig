@@ -25,10 +25,14 @@ const Frame = @import("Frame.zig");
 const Session = @import("Session.zig");
 const Factory = @import("Factory.zig");
 const Viewport = @import("Viewport.zig");
+const EventManagerBase = @import("EventManagerBase.zig");
+const PageStatus = @import("PageStatus.zig");
 
 const Blob = @import("webapi/Blob.zig");
 const Node = @import("webapi/Node.zig");
 const Element = @import("webapi/Element.zig");
+const EventTarget = @import("webapi/EventTarget.zig");
+const WorkerGlobalScope = @import("webapi/WorkerGlobalScope.zig");
 const SharedWorkerGlobalScope = @import("webapi/SharedWorkerGlobalScope.zig");
 const PointList = @import("webapi/svg/PointList.zig");
 const StringList = @import("webapi/svg/StringList.zig");
@@ -77,9 +81,8 @@ style_version: usize = 0,
 // when it was called
 broadcast_sequence: u64 = 0,
 
-// Uncaught JS errors attributed to this Page (all of its frames and workers):
-// Not exhaustive: some swallowed-callback paths aren't routed here.
-js_error_count: usize = 0,
+// Health signals for this Page
+status: PageStatus = .{},
 
 // Entered (logScope) around any work done on this Page's behalf.
 log_context: log.PageContext,
@@ -89,8 +92,8 @@ factory: Factory,
 
 // The arena for this Page's lifetime. Document / Frame / Factory / DOM
 // objects allocate out of this.
-_frame_arena: *lp.Arena,
-frame_arena: Allocator,
+_arena: *lp.Arena,
+arena: Allocator,
 
 // Lazily-created per-node state, kept out of the nodes themselves because
 // few nodes ever need it. Keyed by node pointer and held by the Page, not a
@@ -164,6 +167,14 @@ identity: js.Identity = .{},
 // weak-callback safety.
 finalizer_callbacks: std.AutoHashMapUnmanaged(usize, js.FinalizerCallback) = .empty,
 
+// Event listener registration for every Frame in the Page. This used to be
+// per-frame, but a listener belongs to the target, e.g. a Node, and the Node
+// can be reached and live beyond its Frame.
+event_listeners: EventManagerBase,
+
+// Every live WorkerGlobalScope of this page
+worker_scopes: std.DoublyLinkedList = .{},
+
 // Persisted v8 handles owned by this Page. Handles that outlive the Page are
 // reset on teardown; handles that can be released early are dropped
 // individually. See js.GlobalTracker.
@@ -190,9 +201,16 @@ input_modifiers: if (lp.build_config.wpt_extensions) @import("frame/user_input.z
 // The element the synthetic pointer is currently over
 input_hover_target: ?*Element = null,
 
+// Touch contact and tap state; see user_input.TouchInput.
+input_touch: @import("frame/user_input.zig").TouchInput = .{},
+
 // Per-gesture button state for the synthetic mouse pointer; see
 // user_input.PointerButtons.
 input_pointer: @import("frame/user_input.zig").PointerButtons = .{},
+
+// A drag from outside the page a CDP client is driving; see
+// user_input.DragInput.
+input_drag: @import("frame/user_input.zig").DragInput = .{},
 
 // Popup Frames opened by window.open. They are top-level browsing contexts
 // (parent == null, no iframe element) but share this Page's factory, arena,
@@ -251,16 +269,17 @@ pub fn viewportChanged(self: *Page) void {
 
 // Initialize a Page and its root Frame.
 pub fn init(self: *Page, session: *Session, frame_id: u32) !void {
-    const frame_arena = try session.arena_pool.acquire(.large, "Page.frame_arena");
-    errdefer frame_arena.release();
+    const arena = try session.arena_pool.acquire(.large, "Page.arena");
+    errdefer arena.release();
 
     self.* = .{
         .session = session,
         .frame = undefined,
-        ._frame_arena = frame_arena,
-        .frame_arena = frame_arena.allocator(),
-        .factory = Factory.init(self, frame_arena.allocator(), &session.browser.documents),
+        ._arena = arena,
+        .arena = arena.allocator(),
+        .factory = Factory.init(self, arena.allocator(), &session.browser.documents),
         .globals = .init(session.browser.app.allocator),
+        .event_listeners = .init(arena.allocator()),
         .log_context = .{ .id = log.nextPageId(), .url = &self.frame.url },
     };
     self.queued_navigation = &self.queued_navigation_1;
@@ -281,16 +300,30 @@ pub fn deinit(self: *Page) void {
     log.log(.frame, self.log_context.max_level, "navigation done", .{ .url = self.frame.url });
 
     for (self.popups.items) |popup| {
+        self.session.removeNavigation(popup._frame_id);
         popup.deinit();
     }
     self.popups = .empty;
 
     for (self.closed_frames.items) |frame| {
+        if (frame.parent == null) {
+            // A closed popup: its window stayed reachable until now, and so
+            // did its session history.
+            self.session.removeNavigation(frame._frame_id);
+        }
         frame.deinit();
     }
     self.closed_frames = .empty;
 
+    const frame_id = self.frame._frame_id;
     self.frame.deinit();
+
+    // The JS of a closed page can run until now, so its session history must
+    // stay until now too. A root navigation's replacement page reuses the
+    // frame id and keeps the history.
+    if (self.session.livePage(frame_id) == null) {
+        self.session.removeNavigation(frame_id);
+    }
 
     {
         var svg_point_lists = self._svg_point_lists.valueIterator();
@@ -360,11 +393,11 @@ pub fn deinit(self: *Page) void {
     }
 
     self.factory.deinit();
-    self._frame_arena.release();
+    self._arena.release();
 }
 
 pub fn recordJsError(self: *Page, err: anyerror) void {
-    self.js_error_count += 1;
+    self.status.js_errors += 1;
     lp.metrics.js_errors.incr(if (err == error.JsException) .js_exception else .other);
 }
 
@@ -406,8 +439,8 @@ pub fn createBlobUrl(self: *Page, blob: *Blob, origin: ?[]const u8, creator_fram
     var uuid: [36]u8 = undefined;
     @import("../id.zig").uuidv4(&uuid);
 
-    const url = try self.frame_arena.print("blob:{s}/{s}", .{ origin orelse "null", uuid });
-    try self.blob_urls.put(self.frame_arena, url, .{ .blob = blob, .creator = creator_frame_id });
+    const url = try self.arena.print("blob:{s}/{s}", .{ origin orelse "null", uuid });
+    try self.blob_urls.put(self.arena, url, .{ .blob = blob, .creator = creator_frame_id });
     blob.acquireRef();
     return url;
 }
@@ -500,6 +533,17 @@ fn findPopupBy(self: *Page, comptime field: []const u8, id: u32) ?*Frame {
     return null;
 }
 
+// Called when an EventTarget is eagerly freed. Any listener it installed need
+// to be freed.
+pub fn removeTarget(self: *Page, target: *EventTarget) void {
+    self.event_listeners.removeTarget(target);
+    var node = self.worker_scopes.first;
+    while (node) |n| : (node = n.next) {
+        const wgs: *WorkerGlobalScope = @alignCast(@fieldParentPtr("_page_node", n));
+        wgs._event_manager.removeTarget(target);
+    }
+}
+
 // Snapshots the Execution of every same-origin global in this Page — the root
 // frame, descendant iframes, popups (and their descendants), and each frame's
 // worker scopes — into `arena`.
@@ -536,12 +580,12 @@ fn appendFrameExecutions(frame: *Frame, origin: []const u8, arena: Allocator, li
 
 const testing = @import("../testing.zig");
 
-test "Page: js_error_count" {
-
+test "Page: status counts uncaught JS errors" {
     // One uncaught top-level script exception, one uncaught timer-callback
     // exception.
+    testing.expectLog(&.{ .page_error, .page_error });
     const page = try testing.pageTest("page_js_error.html", .{});
     defer page.close();
 
-    try testing.expectEqual(2, page.frame().?.page.js_error_count);
+    try testing.expectEqual(2, page.frame().?.page.status.js_errors);
 }

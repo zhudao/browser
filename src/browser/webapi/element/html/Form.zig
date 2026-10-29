@@ -26,12 +26,16 @@ const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+const Event = @import("../../Event.zig");
 const collections = @import("../../collections.zig");
 
+const Custom = @import("Custom.zig");
 pub const Input = @import("Input.zig");
 pub const Button = @import("Button.zig");
 pub const Select = @import("Select.zig");
 pub const TextArea = @import("TextArea.zig");
+const Output = @import("Output.zig");
+const ValidityState = @import("ValidityState.zig");
 
 const NodeLive = collections.NodeLive;
 const HTMLFormControlsCollection = collections.HTMLFormControlsCollection;
@@ -48,6 +52,8 @@ _firing_submission_events: bool = false,
 // Prevents submission of the form while we're building the entry list for the
 // form. You can imagine an formdata = () => form.submit() endless loop.
 _constructing_entry_list: bool = false,
+
+_locked_for_reset: bool = false,
 
 fn asConstElement(self: *const Form) *const Element {
     return Factory.protoOf(self).asElement();
@@ -92,7 +98,7 @@ pub fn setMethod(self: *Form, method: []const u8, frame: *Frame) !void {
 }
 
 pub fn getElements(self: *Form, frame: *Frame) !*HTMLFormControlsCollection {
-    const node_live = self.iterator(.{ .image_buttons = false }, frame);
+    const node_live = self.iterator(.{ .image_buttons = false, .listed = true }, frame);
     const elements = try frame._factory.chained(.{
         node_live.htmlCollectionValue(),
         HTMLFormControlsCollection{ ._proto = undefined },
@@ -103,6 +109,8 @@ pub fn getElements(self: *Form, frame: *Frame) !*HTMLFormControlsCollection {
 
 const IteratorOpts = struct {
     image_buttons: bool = true, // form.elements doesn't incude input type=image
+    outputs: bool = false, // only reset() wants <output>
+    listed: bool = false, // form.elements also lists <fieldset>, <object> and <output>
 };
 
 pub fn iterator(self: *Form, opts: IteratorOpts, frame: *Frame) NodeLive(.form) {
@@ -112,7 +120,7 @@ pub fn iterator(self: *Form, opts: IteratorOpts, frame: *Frame) NodeLive(.form) 
     else
         self.asNode(); // No ID: walk only form subtree (no external controls possible)
 
-    return NodeLive(.form).init(root, .{ .form = self, .form_id = form_id, .image_buttons = opts.image_buttons }, frame);
+    return NodeLive(.form).init(root, .{ .form = self, .form_id = form_id, .image_buttons = opts.image_buttons, .outputs = opts.outputs, .listed = opts.listed }, frame);
 }
 
 fn getAction(self: *Form, frame: *Frame) ![]const u8 {
@@ -127,6 +135,15 @@ fn getAction(self: *Form, frame: *Frame) ![]const u8 {
 
 fn setAction(self: *Form, value: []const u8, frame: *Frame) !void {
     try self.asElement().setAttributeSafe(comptime .wrap("action"), .wrap(value), frame);
+}
+
+fn getRelList(self: *Form, frame: *Frame) !*collections.DOMTokenList {
+    return self.asElement().getRelList(frame);
+}
+
+fn setRelList(self: *Form, value: lp.String, frame: *Frame) !void {
+    const list = try self.getRelList(frame);
+    try list.setValue(value, frame);
 }
 
 fn getAcceptCharset(self: *Form) []const u8 {
@@ -154,6 +171,42 @@ pub fn submit(self: *Form, frame: *Frame) !void {
     return frame.submitForm(null, self, .{ .fire_event = false });
 }
 
+pub fn reset(self: *Form, frame: *Frame) !void {
+    if (self._locked_for_reset) {
+        // don't let a listener keep resetting during a reset
+        return;
+    }
+    self._locked_for_reset = true;
+    defer self._locked_for_reset = false;
+
+    const event = try Event.initTrusted(comptime .wrap("reset"), .{ .bubbles = true, .cancelable = true }, frame.page);
+    if (try frame._event_manager.dispatchCancelable(self.asElement().asEventTarget(), event)) {
+        return;
+    }
+
+    // resetting an <output> replaces its children, which ends the tree walker
+    // what would be inside of it
+    var controls: std.ArrayList(*Element) = .empty;
+    var it = self.iterator(.{ .outputs = true }, frame);
+    while (it.next()) |element| {
+        try controls.append(frame.call_arena, element);
+    }
+
+    for (controls.items) |element| {
+        if (element.is(Input)) |input| {
+            try input.reset(frame);
+        } else if (element.is(Select)) |select| {
+            select.reset(frame);
+        } else if (element.is(TextArea)) |textarea| {
+            textarea.reset();
+        } else if (element.is(Output)) |output| {
+            try output.reset(frame);
+        } else if (element.is(Custom)) |custom| {
+            try frame._ce_reactions.enqueueFormReset(frame, custom);
+        }
+    }
+}
+
 /// https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit
 /// Like submit(), but fires the submit event and validates the form.
 pub fn requestSubmit(self: *Form, submitter: ?*Element, frame: *Frame) !void {
@@ -164,7 +217,7 @@ pub fn requestSubmit(self: *Form, submitter: ?*Element, frame: *Frame) !void {
         }
 
         // The submitter's form owner must be this form element.
-        const submitter_form = getFormOwner(s, frame);
+        const submitter_form = ownerOf(s);
         if (submitter_form == null or submitter_form.? != self) return error.NotFound;
 
         break :blk s;
@@ -221,19 +274,30 @@ pub fn isSubmitButton(element: *Element) bool {
     return false;
 }
 
-/// Returns the form owner of a submittable element (Input or Button).
-fn getFormOwner(element: *Element, frame: *Frame) ?*Form {
-    if (element.is(Input)) |input| {
-        return input.getForm(frame);
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-owner
+pub fn ownerOf(element: *Element) ?*Form {
+    // A form attribute is authoritative, even when it names nothing. It
+    // resolves in the control's own tree (shadow root or document), not the
+    // calling realm's.
+    const element_node = element.asNode();
+    if (element_node.isConnected()) {
+        if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
+            const form_element = Frame.getElementByIdFromNode(element_node, form_id) orelse return null;
+            return form_element.is(Form);
+        }
     }
-    if (element.is(Button)) |button| {
-        return button.getForm(frame);
+
+    var node = element_node._parent;
+    while (node) |n| : (node = n._parent) {
+        if (n.is(Element.Html.Form)) |form| {
+            return form;
+        }
     }
     return null;
 }
 
 fn getAtIndex(self: *Form, index: usize, frame: *Frame) ?*Element {
-    var it = self.iterator(.{ .image_buttons = false }, frame);
+    var it = self.iterator(.{ .image_buttons = false, .listed = true }, frame);
     return it.getAtIndex(index, frame);
 }
 
@@ -245,7 +309,7 @@ fn namedItem(self: *Form, name: []const u8, frame: *Frame) !?HTMLFormControlsCol
     }
 
     var first: ?*Element = null;
-    var it = self.iterator(.{ .image_buttons = false }, frame);
+    var it = self.iterator(.{ .image_buttons = false, .listed = true }, frame);
     while (it.next()) |element| {
         if (HTMLFormControlsCollection.matchesName(element, name) == false) {
             continue;
@@ -270,7 +334,7 @@ pub fn checkValidity(self: *Form, frame: *Frame) !bool {
     var iter = self.iterator(.{}, frame);
     var all_valid = true;
     while (iter.next()) |element| {
-        const ok = try checkElementValidity(element, frame);
+        const ok = try ValidityState.checkValidity(element, frame);
         if (!ok) all_valid = false;
     }
     return all_valid;
@@ -282,14 +346,6 @@ fn reportValidity(self: *Form, frame: *Frame) !bool {
     return self.checkValidity(frame);
 }
 
-fn checkElementValidity(element: *Element, frame: *Frame) !bool {
-    if (element.is(Input)) |input| return input.checkValidity(frame);
-    if (element.is(Select)) |select| return select.checkValidity(frame);
-    if (element.is(TextArea)) |textarea| return textarea.checkValidity(frame);
-    if (element.is(Button)) |button| return button.checkValidity(frame);
-    return true;
-}
-
 pub fn getNoValidate(self: *const Form) bool {
     return self.asConstElement().getAttributeInterned("novalidate") != null;
 }
@@ -298,7 +354,6 @@ pub const JsApi = struct {
     pub const bridge = js.Bridge(Form);
     pub const Meta = struct {
         pub const name = "HTMLFormElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -309,7 +364,7 @@ pub const JsApi = struct {
                 return error.NotHandled;
             }
 
-            var it = self.iterator(.{ .image_buttons = false }, frame);
+            var it = self.iterator(.{ .image_buttons = false, .listed = true }, frame);
             while (it.next()) |element| {
                 if (HTMLFormControlsCollection.matchesName(element, field_name)) {
                     return js.v8.DontEnum;
@@ -327,6 +382,8 @@ pub const JsApi = struct {
     pub const method = bridge.accessor(Form.getMethod, Form.setMethod, .{ .ce_reactions = true });
     pub const action = bridge.accessor(Form.getAction, Form.setAction, .{ .ce_reactions = true });
     pub const target = reflect.string("target");
+    pub const rel = reflect.string("rel");
+    pub const relList = bridge.accessor(Form.getRelList, Form.setRelList, .{ .ce_reactions = true });
     pub const acceptCharset = bridge.accessor(Form.getAcceptCharset, Form.setAcceptCharset, .{ .ce_reactions = true });
     pub const enctype = bridge.accessor(Form.getEnctype, Form.setEnctype, .{ .ce_reactions = true });
     pub const noValidate = reflect.boolean("novalidate");
@@ -334,6 +391,7 @@ pub const JsApi = struct {
     pub const length = bridge.accessor(Form.getLength, null, .{});
     pub const submit = bridge.function(Form.submit, .{});
     pub const requestSubmit = bridge.function(Form.requestSubmit, .{});
+    pub const reset = bridge.function(Form.reset, .{ .ce_reactions = true });
     pub const checkValidity = bridge.function(Form.checkValidity, .{});
     pub const reportValidity = bridge.function(Form.reportValidity, .{});
 };

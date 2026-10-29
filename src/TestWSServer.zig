@@ -24,11 +24,13 @@ const posix = std.posix;
 
 const TestWSServer = @This();
 
+port: u16,
 shutdown: std.atomic.Value(bool),
 listener: ?posix.socket_t,
 
-pub fn init() TestWSServer {
+pub fn init(port: u16) TestWSServer {
     return .{
+        .port = port,
         .shutdown = .init(true),
         .listener = null,
     };
@@ -54,12 +56,14 @@ fn runImpl(self: *TestWSServer, wg: *lp.WaitGroup) !void {
     const socket = try sys_net.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     errdefer _ = std.c.close(socket);
 
-    const addr: sys_net.IpAddress = .{ .ip4 = .loopback(9584) };
+    const addr: sys_net.IpAddress = .{ .ip4 = .loopback(self.port) };
 
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     const sa = sys_net.sockaddrFromAddress(&addr);
     try sys_net.bind(socket, sa.ptr(), sa.len);
     try sys_net.listen(socket, 8);
+
+    self.port = (try sys_net.boundAddress(socket)).getPort();
 
     self.listener = socket;
     self.shutdown.store(false, .release);

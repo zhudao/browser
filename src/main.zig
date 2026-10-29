@@ -87,6 +87,14 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
             }
             return std.process.cleanExit(lp.io);
         },
+        .completion => |opts| {
+            const shell = opts.shell orelse return args.printUsageAndExit(main_arena, .completion, false);
+            var buf: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writerStreaming(lp.io, &buf);
+            try lp.completion.write(&stdout.interface, shell, args.exec_name);
+            try stdout.interface.flush();
+            return std.process.cleanExit(lp.io);
+        },
         .agent => |opts| if (opts.list_models) {
             try lp.Agent.listModels(allocator, opts);
             return std.process.cleanExit(lp.io);
@@ -115,21 +123,27 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
     switch (args.mode) {
         .serve => |opts| {
             log.debug(.app, "startup", .{ .mode = "serve", .snapshot = app.snapshot.fromEmbedded() });
-            const address = std.Io.net.IpAddress.parse(opts.host, opts.port) catch |err| {
-                log.fatal(.app, "invalid server address", .{ .err = err, .host = opts.host, .port = opts.port });
-                return args.printUsageAndExit(main_arena, .serve, false);
+            const address: lp.Server.Address = if (opts.unix_socket) |path| .{ .unix = path } else .{
+                .ip = std.Io.net.IpAddress.parse(args.serveHost(), args.port()) catch |err| {
+                    log.fatal(.app, "invalid server address", .{ .err = err, .host = args.serveHost(), .port = args.port() });
+                    return args.printUsageAndExit(main_arena, .serve, false);
+                },
             };
 
             var server = lp.Server.init(app, address) catch |err| {
-                if (err == error.AddressInUse) {
-                    log.fatal(.app, "address already in use", .{
-                        .host = opts.host,
-                        .port = opts.port,
+                if (err != error.AddressInUse) {
+                    log.fatal(.app, "server run error", .{ .err = err });
+                } else switch (address) {
+                    .ip => log.fatal(.app, "address already in use", .{
+                        .host = args.serveHost(),
+                        .port = args.port(),
                         .hint = "Another process is already listening on this address. " ++
                             "Stop the other process or use --port to choose a different port.",
-                    });
-                } else {
-                    log.fatal(.app, "server run error", .{ .err = err });
+                    }),
+                    .unix => |path| log.fatal(.app, "address already in use", .{
+                        .path = path,
+                        .hint = "The path already exists. If no other process is listening on it, delete it.",
+                    }),
                 }
                 return err;
             };
@@ -176,6 +190,14 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 log.fatal(.app, "--dump-max-bytes needs text", .{ .dump = opts.dump, .allowed = "html, markdown" });
                 return error.InvalidArgument;
             }
+            if (opts.markdown_alternate and opts.dump != .markdown) {
+                log.fatal(.app, "invalid --markdown-alternate", .{ .needs = "--dump markdown" });
+                return error.InvalidArgument;
+            }
+            if (opts.markdown_alternate and opts.dump_selector != null) {
+                log.fatal(.app, "invalid --markdown-alternate", .{ .conflicts_with = "--dump-selector" });
+                return error.InvalidArgument;
+            }
 
             var fetch_opts = lp.FetchOpts{
                 .wait_ms = opts.wait_ms,
@@ -186,6 +208,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 .dump_mode = opts.dump,
                 .selector = opts.dump_selector,
                 .fail_on_http_error = opts.fail_on_http_error,
+                .markdown_alternate = opts.markdown_alternate,
                 .dump = .{
                     .strip = opts.strip_mode,
                     .with_base = opts.with_base,
@@ -247,7 +270,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                     log.fatal(.mcp, "invalid cdp address", .{ .err = err, .port = port });
                     return;
                 };
-                cdp_server = try lp.Server.init(app, address);
+                cdp_server = try lp.Server.init(app, .{ .ip = address });
                 try sighandler.on(lp.Server.shutdown, .{cdp_server.?});
             }
             defer if (cdp_server) |s| s.deinit();

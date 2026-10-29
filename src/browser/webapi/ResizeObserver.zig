@@ -182,14 +182,12 @@ pub fn deliverEntries(self: *ResizeObserver, frame: *Frame) !void {
         return;
     }
 
-    var caught: js.TryCatch.Caught = .{};
-
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    ls.toLocal(self._callback).tryCall(void, .{ entries.items, self }, &caught) catch |err| {
-        log.debug(.frame, "ResizeObserver.deliverEntries", .{ .err = err, .caught = caught });
+    ls.toLocal(self._callback).callWithThisReport(self, .{ entries.items, self }) catch |err| {
+        log.debug(.frame, "ResizeObserver.deliverEntries", .{ .err = err });
         return err;
     };
 }
@@ -234,7 +232,6 @@ pub const ResizeObserverEntry = struct {
 
         pub const Meta = struct {
             pub const name = "ResizeObserverEntry";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -270,7 +267,6 @@ pub const ResizeObserverSize = struct {
 
         pub const Meta = struct {
             pub const name = "ResizeObserverSize";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -284,7 +280,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ResizeObserver";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

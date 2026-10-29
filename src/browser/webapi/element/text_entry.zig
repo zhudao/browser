@@ -22,7 +22,9 @@
 const std = @import("std");
 
 const Frame = @import("../../Frame.zig");
+const Factory = @import("../../Factory.zig");
 
+const CData = @import("../CData.zig");
 const Event = @import("../Event.zig");
 const Selection = @import("../Selection.zig");
 const InputEvent = @import("../event/InputEvent.zig");
@@ -65,8 +67,7 @@ pub fn TextEntry(comptime T: type) type {
             }
             const len: u32 = @intCast(self.getValue().len);
             try applySelectionRange(self, 0, len, .none, frame);
-            const event = try Event.init("select", .{ .bubbles = true }, frame.page);
-            try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
+            try frame.queueElementEvent(Factory.protoOf(self), .select);
         }
 
         pub fn innerInsert(self: *T, str: []const u8, data: ?[]const u8, input_type: []const u8, frame: *Frame) !void {
@@ -95,7 +96,7 @@ pub fn TextEntry(comptime T: type) type {
                 self._selection_start = new_pos;
                 self._selection_end = new_pos;
                 self._selection_direction = .none;
-                try dispatchSelectionChangeEvent(self, frame);
+                try scheduleSelectionChange(self, frame);
             }
             try dispatchInputEvent(self, data, input_type, frame);
         }
@@ -150,8 +151,35 @@ pub fn TextEntry(comptime T: type) type {
             self._selection_start = start;
             self._selection_end = start;
             self._selection_direction = .none;
-            try dispatchSelectionChangeEvent(self, frame);
+            try scheduleSelectionChange(self, frame);
             try dispatchInputEvent(self, null, input_type, frame);
+        }
+
+        pub fn rememberValueBeforeEdit(self: *T, frame: *Frame) !void {
+            if (self._value_before_edit != null) {
+                return;
+            }
+            const value = self.getValue();
+            // _value is never mutated in place, so it can be kept as is. A
+            // textarea without one shows its text child's data, which can change.
+            if (@hasField(T, "_input_type") or self._value != null) {
+                self._value_before_edit = value;
+            } else {
+                self._value_before_edit = try frame.page_arena.dupe(u8, value);
+            }
+        }
+
+        // Commits the user's edits: fires change when they left the value
+        // different, as when the control loses focus or Enter submits it.
+        // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
+        pub fn dispatchChangeIfEdited(self: *T, frame: *Frame) !void {
+            const before = self._value_before_edit orelse return;
+            self._value_before_edit = null;
+            if (std.mem.eql(u8, before, self.getValue())) {
+                return;
+            }
+            const event = try Event.initTrusted(comptime .wrap("change"), .{ .bubbles = true }, frame.page);
+            try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
         }
 
         // Collapses the selection to the end of the value. Unlike
@@ -211,7 +239,7 @@ pub fn TextEntry(comptime T: type) type {
             self._selection_start = new_start;
             self._selection_end = new_end;
             self._selection_direction = new_direction;
-            try dispatchSelectionChangeEvent(self, frame);
+            try scheduleSelectionChange(self, frame);
         }
 
         // Byte offset the caret lands on when moved from `pos`. Steps over
@@ -247,20 +275,31 @@ pub fn TextEntry(comptime T: type) type {
             return @tagName(self._selection_direction);
         }
 
+        // Selection offsets are kept as byte offsets into the UTF-8 value, while
+        // the JS API counts UTF-16 code units.
+        pub fn selectionOffsetToJs(self: *const T, offset: u32) u32 {
+            const value = self.getValue();
+            return @intCast(CData.utf16Len(value[0..@min(offset, value.len)]));
+        }
+
+        fn selectionOffsetFromJs(self: *const T, offset: u32) u32 {
+            return @intCast(CData.utf16OffsetToUtf8Floor(self.getValue(), offset));
+        }
+
         pub fn setSelectionStart(self: *T, value: u32, frame: *Frame) !void {
             if (self.selectionAvailable() == false) {
                 return error.InvalidStateError;
             }
-            self._selection_start = value;
-            try dispatchSelectionChangeEvent(self, frame);
+            // Spec: the end is raised to the new start, then set-range runs.
+            const start = selectionOffsetFromJs(self, value);
+            return applySelectionRange(self, start, @max(start, self._selection_end), self._selection_direction, frame);
         }
 
         pub fn setSelectionEnd(self: *T, value: u32, frame: *Frame) !void {
             if (self.selectionAvailable() == false) {
                 return error.InvalidStateError;
             }
-            self._selection_end = value;
-            try dispatchSelectionChangeEvent(self, frame);
+            return applySelectionRange(self, self._selection_start, selectionOffsetFromJs(self, value), self._selection_direction, frame);
         }
 
         pub fn setSelectionRange(
@@ -280,7 +319,96 @@ pub fn TextEntry(comptime T: type) type {
                 } else break :blk .none;
             };
 
-            return applySelectionRange(self, selection_start, selection_end, direction, frame);
+            return applySelectionRange(self, selectionOffsetFromJs(self, selection_start), selectionOffsetFromJs(self, selection_end), direction, frame);
+        }
+
+        const SelectionMode = enum { select, start, end, preserve };
+
+        // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
+        pub fn setRangeText(
+            self: *T,
+            replacement: []const u8,
+            range_start: ?u32,
+            range_end: ?u32,
+            selection_mode: ?[]const u8,
+            frame: *Frame,
+        ) !void {
+            // Argument errors come first: Chrome throws them while converting
+            // the arguments. A start needs an end.
+            const mode: SelectionMode = if (selection_mode) |m|
+                std.meta.stringToEnum(SelectionMode, m) orelse return error.TypeError
+            else
+                .preserve;
+            if (range_start != null and range_end == null) {
+                return error.TypeError;
+            }
+
+            if (self.selectionAvailable() == false) {
+                return error.InvalidStateError;
+            }
+
+            // Offsets are in UTF-16 code units, like the spec, and only become
+            // byte offsets against a given value: setValue can sanitize the new
+            // one (newlines, CRLF), so its byte offsets differ from the concat's.
+            const value = self.getValue();
+            const value_len: u32 = @intCast(CData.utf16Len(value));
+            const sel_start = selectionOffsetToJs(self, self._selection_start);
+            const sel_end = selectionOffsetToJs(self, self._selection_end);
+
+            // setRangeText(replacement) replaces the selection
+            var start = sel_start;
+            var end = sel_end;
+            if (range_start) |js_start| {
+                const js_end = range_end.?;
+                if (js_start > js_end) {
+                    return error.IndexSizeError;
+                }
+                start = @min(js_start, value_len);
+                end = @min(js_end, value_len);
+            }
+
+            {
+                const byte_start = selectionOffsetFromJs(self, start);
+                const byte_end = selectionOffsetFromJs(self, end);
+                const scratch = try frame.getArena(value.len + replacement.len, "TextEntry.setRangeText");
+                defer scratch.release();
+                const new_value = try std.mem.concat(scratch.allocator(), u8, &.{ value[0..byte_start], replacement, value[byte_end..] });
+                try self.setValue(new_value, frame);
+            }
+
+            const new_end: u32 = start + @as(u32, @intCast(CData.utf16Len(replacement)));
+            var new_start = sel_start;
+            var new_sel_end = sel_end;
+            switch (mode) {
+                .select => {
+                    new_start = start;
+                    new_sel_end = new_end;
+                },
+                .start => {
+                    new_start = start;
+                    new_sel_end = start;
+                },
+                .end => {
+                    new_start = new_end;
+                    new_sel_end = new_end;
+                },
+                .preserve => {
+                    // keep the selection on the same text: shift it past the
+                    // replaced range, or snap it to the range's edges inside it
+                    const delta: i64 = @as(i64, @intCast(replacement.len)) - @as(i64, end - start);
+                    if (sel_start > end) {
+                        new_start = @intCast(@as(i64, sel_start) + delta);
+                    } else if (sel_start > start) {
+                        new_start = start;
+                    }
+                    if (sel_end > end) {
+                        new_sel_end = @intCast(@as(i64, sel_end) + delta);
+                    } else if (sel_end > start) {
+                        new_sel_end = new_end;
+                    }
+                },
+            }
+            return applySelectionRange(self, selectionOffsetFromJs(self, new_start), selectionOffsetFromJs(self, new_sel_end), .none, frame);
         }
 
         fn applySelectionRange(
@@ -299,11 +427,14 @@ pub fn TextEntry(comptime T: type) type {
                 start = end;
             }
 
+            if (start == self._selection_start and end == self._selection_end and direction == self._selection_direction) {
+                return;
+            }
             self._selection_direction = direction;
             self._selection_start = start;
             self._selection_end = end;
 
-            try dispatchSelectionChangeEvent(self, frame);
+            try scheduleSelectionChange(self, frame);
         }
 
         const HowSelected = union(enum) { partial: struct { u32, u32 }, full, none };
@@ -325,9 +456,13 @@ pub fn TextEntry(comptime T: type) type {
             return .{ .partial = .{ start, end } };
         }
 
-        fn dispatchSelectionChangeEvent(self: *T, frame: *Frame) !void {
-            const event = try Event.init("selectionchange", .{ .bubbles = true }, frame.page);
-            try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
+        // https://w3c.github.io/selection-api/#scheduling-selectionchange-event
+        fn scheduleSelectionChange(self: *T, frame: *Frame) !void {
+            if (self._selectionchange_pending) {
+                return;
+            }
+            try frame.queueElementEvent(Factory.protoOf(self), .selectionchange);
+            self._selectionchange_pending = true;
         }
 
         fn dispatchInputEvent(self: *T, data: ?[]const u8, input_type: []const u8, frame: *Frame) !void {

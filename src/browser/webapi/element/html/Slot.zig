@@ -126,17 +126,12 @@ fn appendFlattened(comptime elements: bool, coll: CollectionType(elements), node
     }
 }
 
-// DOM spec HTMLSlotElement.assign(...nodes). Takes js.Value so the bridge
-// always treats the parameter as variadic: per WebIDL it's a rest parameter
-// of (Element or Text), so passing an array must throw a TypeError.
-pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
-    const nodes = try frame.call_arena.alloc(*Node, values.len);
-    for (values, nodes) |value, *entry| {
-        const node = value.toZig(*Node) catch return error.TypeError;
+// DOM spec HTMLSlotElement.assign(...nodes), each an Element or Text.
+pub fn assign(self: *Slot, nodes: js.Variadic(*Node), frame: *Frame) !void {
+    for (nodes.values) |node| {
         if (!slotting.isSlottable(node)) {
             return error.TypeError;
         }
-        entry.* = node;
     }
 
     const page = frame.page;
@@ -145,8 +140,8 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
     }
     self._manually_assigned.clearRetainingCapacity();
 
-    for (nodes) |node| {
-        const gop = try page._manual_slot_assignments.getOrPut(page.frame_arena, node);
+    for (nodes.values) |node| {
+        const gop = try page._manual_slot_assignments.getOrPut(page.arena, node);
         if (gop.found_existing) {
             const other = gop.value_ptr.*;
             if (other == self) {
@@ -162,7 +157,7 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
             }
         }
         gop.value_ptr.* = self;
-        try self._manually_assigned.append(frame.arena, node);
+        try self._manually_assigned.append(frame.page_arena, node);
     }
 
     if (self.asNode().containingShadowRoot()) |shadow_root| {
@@ -179,7 +174,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLSlotElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

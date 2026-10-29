@@ -103,7 +103,7 @@ fn request(
     errdefer exec._factory.destroy(req);
 
     if (watch_id != 0) {
-        try self._watches.append(exec.arena, req);
+        try self._watches.append(exec.page_arena, req);
     }
     errdefer if (watch_id != 0) {
         _ = self._watches.pop();
@@ -228,7 +228,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Geolocation";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

@@ -73,7 +73,7 @@ startup_data: v8.StartupData,
 // external reference. When we load the snapshot, we need to give it the same
 // array with the exact same number of entries in the same order (but, of course
 // cross-process, the value (address) might be different).
-external_references: [countExternalReferences()]isize,
+external_references: *const ExternalReferences,
 
 // Track whether this snapshot owns its data (was created in-process)
 // If false, the data points into embedded_snapshot_blob and will not be freed
@@ -138,13 +138,13 @@ fn isValid(self: Snapshot) bool {
 }
 
 pub fn create() !Snapshot {
-    var external_references = collectExternalReferences();
+    const external_references = collectExternalReferences();
 
     var params: v8.CreateParams = undefined;
     v8.v8__Isolate__CreateParams__CONSTRUCT(&params);
     params.array_buffer_allocator = v8.v8__ArrayBuffer__Allocator__NewDefaultAllocator(4 * 1024 * 1024 * 1024);
     defer v8.v8__ArrayBuffer__Allocator__DELETE(params.array_buffer_allocator.?);
-    params.external_references = @ptrCast(&external_references);
+    params.external_references = external_references;
 
     const snapshot_creator = v8.v8__SnapshotCreator__CREATE(&params);
     defer v8.v8__SnapshotCreator__DESTRUCT(snapshot_creator);
@@ -325,7 +325,7 @@ fn createSnapshotContext(
         @setEvalBranchQuota(10_000);
         const template_index = comptime bridge.JsApiLookup.getId(JsApi);
         const func = v8.v8__FunctionTemplate__GetFunction(templates[template_index], context);
-        if (@hasDecl(JsApi.Meta, "name")) {
+        if (@hasDecl(JsApi.Meta, "name") and comptime isNamespace(JsApi) == false) {
             const name = JsApi.Meta.name;
             const v8_class_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
             var maybe_result: v8.MaybeBool = undefined;
@@ -495,9 +495,18 @@ fn countExternalReferences() comptime_int {
     return count + 1; // +1 for null terminator
 }
 
-fn collectExternalReferences() [countExternalReferences()]isize {
+const ExternalReferences = [countExternalReferences()]isize;
+
+// Static rather than carried by value: in debug builds every frame the
+// Snapshot passed through (create, load, App.init) kept its own copy, which
+// was enough to exhaust V8's stack limit before the snapshot's first script.
+var external_references_storage: ExternalReferences = undefined;
+
+fn collectExternalReferences() *const ExternalReferences {
+    @setEvalBranchQuota(100_000);
     var idx: usize = 0;
-    var references = std.mem.zeroes([countExternalReferences()]isize);
+    const references = &external_references_storage;
+    @memset(references, 0);
 
     references[idx] = @bitCast(@intFromPtr(&illegalConstructorCallback));
     idx += 1;
@@ -788,6 +797,11 @@ fn inheritsFromHtmlElement(comptime JsApi: type) bool {
     return bridge.inheritsOrIs(JsApi, HtmlElement.JsApi);
 }
 
+// Web IDL namespace (CSS, console)
+fn isNamespace(comptime JsApi: type) bool {
+    return @hasDecl(JsApi.Meta, "namespace") and JsApi.Meta.namespace;
+}
+
 const Unforgeable = struct {
     Owner: type,
     name: [:0]const u8,
@@ -802,7 +816,7 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
     // Namespace objects (e.g. console) expose their members as own properties
     // of each instance rather than via the prototype, so Object.entries(...)
     // returns them. See https://console.spec.whatwg.org/#console-namespace.
-    const own_properties = @hasDecl(JsApi.Meta, "own_properties") and JsApi.Meta.own_properties;
+    const own_properties = isNamespace(JsApi);
     const member_template = if (own_properties) instance else prototype;
 
     const decl_names = @typeInfo(JsApi).@"struct".decl_names;
@@ -901,10 +915,11 @@ fn attachClass(comptime JsApi: type, comptime flatten: bool, isolate: *v8.Isolat
                 v8.v8__Template__Set(@ptrCast(prototype), js_name, @ptrCast(function_template), v8.DontEnum);
             },
             bridge.Property => {
+                // Comptime-known property values: never an over-long string.
                 const js_value = switch (value.value) {
                     .null => js.simpleZigValueToJs(.{ .handle = isolate }, null, true, false),
                     inline .bool, .int, .float, .string => |v| js.simpleZigValueToJs(.{ .handle = isolate }, v, true, false),
-                };
+                } catch unreachable;
                 const js_name = v8.v8__String__NewFromUtf8(isolate, name.ptr, v8.kNormal, @intCast(name.len));
 
                 {

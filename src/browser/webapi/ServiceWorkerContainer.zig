@@ -52,7 +52,7 @@ const RegisterOptions = struct {
 };
 
 pub fn init(frame: *Frame) !*ServiceWorkerContainer {
-    const self = try frame._factory.eventTargetWithAllocator(frame.arena, ServiceWorkerContainer{
+    const self = try frame._factory.eventTargetWithAllocator(frame.page_arena, ServiceWorkerContainer{
         ._proto = undefined,
         ._frame = frame,
     });
@@ -159,7 +159,7 @@ fn track(self: *ServiceWorkerContainer, scope: *ServiceWorkerGlobalScope) !*Serv
     const frame = self._frame;
     const registration = try ServiceWorkerRegistration.init(scope, self, &frame.js.execution);
     errdefer registration.detach();
-    try self._registrations.append(frame.arena, registration);
+    try self._registrations.append(frame.page_arena, registration);
 
     if (scope.hasActiveWorker()) {
         self.workerActivated();
@@ -292,7 +292,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ServiceWorkerContainer";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -309,8 +308,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: ServiceWorker" {
-    // The throwing-worker and cross-origin cases log at error level on purpose.
-    testing.silenceLog(&.{ .http, .browser });
+    testing.expectLog(&.{.page_error});
     try testing.htmlRunner("service_worker/service_worker.html", .{
         .timeout_ms = 8000,
         .experimental_features = .{ .serviceworker = true },

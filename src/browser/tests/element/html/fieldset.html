@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<meta name=lp-mode content=test>
 <script src="../../testing.js"></script>
 
 <fieldset id="fs1" disabled name="group1">
@@ -32,6 +33,11 @@
     const fs2 = document.getElementById('fs2');
     testing.expectEqual('', fs2.name);
   }
+</script>
+
+<script id="type">
+  testing.expectEqual('fieldset', $('#fs1').type);
+  testing.expectEqual('fieldset', document.createElement('fieldset').type);
 </script>
 
 <fieldset id="fs-off" disabled>

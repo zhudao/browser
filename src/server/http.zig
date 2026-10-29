@@ -1030,8 +1030,7 @@ fn touch(server: *Server, conn: *Connection, now: u64) void {
     server.http_connections.append(&conn.node);
 }
 
-pub fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
-    const host = app.config.advertiseHost();
+pub fn buildJSONVersionResponse(app: *const App, ws_url: []const u8) ![]const u8 {
     if (app.config.bindIsWildcard()) {
         // Serve is bound to INADDR_ANY but no --advertise-host was given;
         // advertiseHost() falls back to 127.0.0.1 so clients can still
@@ -1047,16 +1046,18 @@ pub fn buildJSONVersionResponse(app: *const App, port: u16) ![]const u8 {
         "\"Protocol-Version\": \"1.3\", " ++
         "\"User-Agent\": \"Lightpanda/1.0\", " ++
         "\"Lightpanda-Version\": \"" ++ lp.build_config.version ++ "\", " ++
-        "\"webSocketDebuggerUrl\": \"ws://{s}:{d}/\"" ++
+        "\"webSocketDebuggerUrl\": {f}" ++
         "}}";
-    const body_len = std.fmt.count(body_format, .{ host, port });
+    // A unix socket path is user input: escape it.
+    const url = std.json.fmt(ws_url, .{});
+    const body_len = std.fmt.count(body_format, .{url});
 
     const response_format =
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Length: {d}\r\n" ++
         "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
         body_format;
-    return try app.allocator.print(response_format, .{ body_len, host, port });
+    return try app.allocator.print(response_format, .{ body_len, url });
 }
 
 // Where the upgraded socket goes: a new worker, or an existing session's.
@@ -1069,7 +1070,11 @@ const Upgrade = union(enum) {
 // hand the fd to its worker (spawning one for a new connection).
 fn upgrade(server: *Server, conn: *Connection, req: *Connection.Request, target: Upgrade) !Served {
     var accept_buf: [28]u8 = undefined;
-    const accept_key = webSocketAccept(req.head, &accept_buf, server.advertise_host) catch |err| {
+    const accept_key = webSocketAccept(req.head, &accept_buf, .{
+        .host = server.advertise_host,
+        .origins = server.remote_allow_origins,
+        .check_host = server.unix_path == null,
+    }) catch |err| {
         const response: []const u8 = switch (err) {
             error.ForbiddenOrigin => forbidden_origin_response,
             error.ForbiddenHost => forbidden_host_response,
@@ -1101,9 +1106,17 @@ fn upgrade(server: *Server, conn: *Connection, req: *Connection.Request, target:
 
 // Validate an incoming WebSocket upgrade request head and, on success, write
 // the Sec-WebSocket-Accept value into `out`. Mirrors the origin/host defenses
-// from the old Handshake path. `advertise_host` is the explicit
-// --advertise-host, if any.
-fn webSocketAccept(head: []const u8, out: *[28]u8, advertise_host: ?[]const u8) ![]const u8 {
+// from the old Handshake path. `allow` holds the explicit --advertise-host and
+// --remote-allow-origins, if any.
+const Allow = struct {
+    // DNS rebinding needs a TCP connection: a browser can't reach a unix
+    // socket, and its clients send a bare `Host: localhost`.
+    check_host: bool = true,
+    host: ?[]const u8 = null,
+    origins: []const []const u8 = &.{},
+};
+
+fn webSocketAccept(head: []const u8, out: *[28]u8, allow: Allow) ![]const u8 {
     const FOUND_UPGRADE: u8 = 1 << 0;
     const FOUND_VERSION: u8 = 1 << 1;
     const FOUND_CONNECTION: u8 = 1 << 2;
@@ -1131,12 +1144,15 @@ fn webSocketAccept(head: []const u8, out: *[28]u8, advertise_host: ?[]const u8) 
             key = h.value;
             found |= FOUND_KEY;
         } else if (std.ascii.eqlIgnoreCase(h.key, "origin")) {
-            // Only a browser sends Origin, and a browser has no business
-            // driving CDP/BiDi: it's cross-origin to us by definition.
-            log.warn(.serve, "rejected websocket origin", .{ .origin = h.value[0..@min(h.value.len, 64)] });
-            return error.ForbiddenOrigin;
-        } else if (std.ascii.eqlIgnoreCase(h.key, "host")) {
-            if (isAllowedHost(h.value, advertise_host) == false) {
+            // A browser has no business driving CDP/BiDi: it's cross-origin
+            // to us by definition. But non-browser clients (e.g. Python's
+            // websocket-client) send one too, so the operator can allow it.
+            if (isAllowedOrigin(h.value, allow.origins) == false) {
+                log.warn(.serve, "rejected websocket origin", .{ .origin = h.value[0..@min(h.value.len, 64)], .note = "See `--remote-allow-origins <origins>` if this is a legitimate origin" });
+                return error.ForbiddenOrigin;
+            }
+        } else if (allow.check_host and std.ascii.eqlIgnoreCase(h.key, "host")) {
+            if (isAllowedHost(h.value, allow.host) == false) {
                 log.warn(.serve, "rejected websocket host", .{ .host = h.value[0..@min(h.value.len, 64)], .note = "See `--advertise-host <host>` if this is a legitimate host" });
                 return error.ForbiddenHost;
             }
@@ -1153,6 +1169,17 @@ fn webSocketAccept(head: []const u8, out: *[28]u8, advertise_host: ?[]const u8) 
     hasher.final(&sha);
     _ = std.base64.standard.Encoder.encode(out, &sha);
     return out;
+}
+
+// Exact (case-insensitive) match against a --remote-allow-origins value, or
+// anything if one is `*`, as Chrome does.
+fn isAllowedOrigin(value: []const u8, allowed: []const []const u8) bool {
+    for (allowed) |origin| {
+        if (std.mem.eql(u8, origin, "*") or std.ascii.eqlIgnoreCase(origin, value)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Defense in depth against DNS rebinding: only an IP literal can legitimately
@@ -1205,8 +1232,37 @@ test "http: webSocketAccept honours the advertised host" {
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
         "Sec-WebSocket-Version: 13\r\n\r\n";
     var out: [28]u8 = undefined;
-    try testing.expectError(error.ForbiddenHost, webSocketAccept(head, &out, null));
-    try testing.expectString("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try webSocketAccept(head, &out, "lightpanda"));
+    try testing.expectError(error.ForbiddenHost, webSocketAccept(head, &out, .{}));
+    try testing.expectString("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try webSocketAccept(head, &out, .{ .host = "lightpanda" }));
+    // Over a unix socket any Host is fine.
+    try testing.expectString("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try webSocketAccept(head, &out, .{ .check_host = false }));
+}
+
+test "http: isAllowedOrigin" {
+    try testing.expectEqual(false, isAllowedOrigin("http://localhost:3000", &.{}));
+    try testing.expectEqual(true, isAllowedOrigin("http://localhost:3000", &.{"http://localhost:3000"}));
+    try testing.expectEqual(true, isAllowedOrigin("http://LOCALHOST:3000", &.{"http://localhost:3000"}));
+    try testing.expectEqual(true, isAllowedOrigin("http://b.test", &.{ "http://a.test", "http://b.test" }));
+    try testing.expectEqual(true, isAllowedOrigin("null", &.{"*"}));
+    try testing.expectEqual(true, isAllowedOrigin("https://evil.com", &.{ "http://a.test", "*" }));
+    try testing.expectEqual(false, isAllowedOrigin("http://localhost:3001", &.{"http://localhost:3000"}));
+    try testing.expectEqual(false, isAllowedOrigin("http://a.test.evil.com", &.{"http://a.test"}));
+}
+
+test "http: webSocketAccept honours the allowed origins" {
+    testing.expectLog(&.{ .serve, .serve });
+    const head = "GET / HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1:9222\r\n" ++
+        "Origin: http://127.0.0.1:9222\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    var out: [28]u8 = undefined;
+    try testing.expectError(error.ForbiddenOrigin, webSocketAccept(head, &out, .{}));
+    try testing.expectError(error.ForbiddenOrigin, webSocketAccept(head, &out, .{ .origins = &.{"http://localhost:9222"} }));
+    try testing.expectString("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try webSocketAccept(head, &out, .{ .origins = &.{"http://127.0.0.1:9222"} }));
+    try testing.expectString("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try webSocketAccept(head, &out, .{ .origins = &.{"*"} }));
 }
 
 test "http: the read buffer grows with the request and gives the space back" {
@@ -1240,6 +1296,87 @@ test "http: the read buffer grows with the request and gives the space back" {
     buffer.reset();
     try testing.expectEqual(0, buffer.len);
     try testing.expectEqual(INITIAL_BUFFER_SIZE, buffer.buf.len);
+}
+
+test "http: a request can arrive over any number of reads" {
+    const body = "{\"capabilities\":{}}";
+    const head = std.fmt.comptimePrint("POST /session HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    // a head that outgrows the initial buffer, so it's split across doublings too
+    const long_head = "POST /session HTTP/1.1\r\nX-Padding: " ++ repeat("a", INITIAL_BUFFER_SIZE) ++ head["POST /session HTTP/1.1".len..];
+
+    // every two-way split, including within the final CRLF CRLF
+    for (1..head.len + body.len) |at| {
+        try expectSplitRequest(head, body, &.{at});
+    }
+
+    // one byte at a time
+    var one_byte: [head.len + body.len - 1]usize = undefined;
+    for (&one_byte, 1..) |*at, i| {
+        at.* = i;
+    }
+    try expectSplitRequest(head, body, &one_byte);
+
+    // either side of the initial buffer filling, then within the final CRLF
+    // CRLF and the body
+    try expectSplitRequest(long_head, body, &.{
+        INITIAL_BUFFER_SIZE - 1,
+        INITIAL_BUFFER_SIZE,
+        INITIAL_BUFFER_SIZE + 1,
+        long_head.len - 3,
+        long_head.len - 1,
+        long_head.len + 1,
+    });
+}
+
+// Writes head ++ body in pieces ending at each of `splits` (ascending) and
+// expects the request to be incomplete until the last piece arrives.
+fn expectSplitRequest(head: []const u8, body: []const u8, splits: []const usize) !void {
+    var pair: [2]posix.socket_t = undefined;
+    if (std.c.socketpair(posix.AF.LOCAL, posix.SOCK.STREAM, 0, &pair) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer sys_net.close(pair[0]);
+    defer sys_net.close(pair[1]);
+
+    var buffer = try Connection.Buffer.init(testing.allocator, 1024 * 1024);
+    defer buffer.deinit();
+
+    const request = try std.mem.concat(testing.allocator, u8, &.{ head, body });
+    defer testing.allocator.free(request);
+
+    var state: Connection.State = .header;
+    var start: usize = 0;
+    for (splits) |end| {
+        try sys_net.writeAll(pair[1], request[start..end]);
+        start = end;
+        try testing.expectEqual(false, try readWritten(&state, &buffer, pair[0], end));
+    }
+    try sys_net.writeAll(pair[1], request[start..]);
+    try testing.expectEqual(true, try readWritten(&state, &buffer, pair[0], request.len));
+
+    const req = state.request;
+    try testing.expectEqual(.POST, req.method);
+    try testing.expectString("/session", req.path);
+    try testing.expectString(head, req.head);
+    try testing.expectString(body, req.body);
+}
+
+// processHTTP's read/parse step, repeated until the `written` bytes are all
+// in the buffer. True once the request is complete.
+fn readWritten(state: *Connection.State, buffer: *Connection.Buffer, socket: posix.socket_t, written: usize) !bool {
+    while (true) {
+        const data = try buffer.read(socket);
+        switch (try state.parseHeader(testing.allocator, data)) {
+            .complete => {
+                try testing.expectEqual(written, data.len);
+                return true;
+            },
+            .need => |needed| try buffer.ensureCapacity(needed),
+        }
+        if (buffer.len == written) {
+            return false;
+        }
+    }
 }
 
 test "http: a declared body is sized upfront" {

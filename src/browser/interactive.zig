@@ -27,6 +27,7 @@ const AXNode = @import("../server/cdp/AXNode.zig");
 const Element = @import("webapi/Element.zig");
 const Node = @import("webapi/Node.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
+const popover = @import("webapi/element/popover.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -36,6 +37,19 @@ const InteractivityType = enum {
     contenteditable,
     listener,
     focusable,
+};
+
+/// Whether a control sits in something drawn over the page.
+const Overlay = struct {
+    /// In a `position: fixed` box.
+    fixed: bool = false,
+    /// In an open `<dialog>`, a `role=dialog`/`alertdialog` subtree, an
+    /// `aria-modal` one, or an open popover.
+    dialog: bool = false,
+
+    fn any(self: Overlay) bool {
+        return self.fixed or self.dialog;
+    }
 };
 
 const InteractiveElement = struct {
@@ -55,6 +69,7 @@ const InteractiveElement = struct {
     value: ?[]const u8,
     element_name: ?[]const u8,
     placeholder: ?[]const u8,
+    overlay: Overlay,
 
     pub fn jsonStringify(self: *const InteractiveElement, jw: anytype) !void {
         try jw.beginObject();
@@ -88,6 +103,11 @@ const InteractiveElement = struct {
         if (self.disabled) {
             try jw.objectField("disabled");
             try jw.write(true);
+        }
+
+        if (self.overlay.any()) {
+            try jw.objectField("overlay");
+            try jw.write(self.overlay);
         }
 
         try jw.objectField("tabIndex");
@@ -215,9 +235,18 @@ fn walkInteractive(
 
         // Not just the element's own display: a slotted element inherits
         // from its slot, which this light-tree walk never visits.
-        if (!el.isVisible(frame)) {
+        const owner = el.ownerFrame(frame) orelse {
             tw.skipChildren();
             continue;
+        };
+        switch (owner._style_manager.rendering(el)) {
+            .none => {
+                tw.skipChildren();
+                continue;
+            },
+            // A descendant can set visibility back to visible.
+            .invisible => continue,
+            .visible => {},
         }
 
         const html_el = el.is(Element.Html) orelse continue;
@@ -265,6 +294,7 @@ fn walkInteractive(
             .value = getInputValue(el),
             .element_name = el.getName(),
             .placeholder = el.getAttributeInterned("placeholder"),
+            .overlay = overlayOf(el, owner),
         });
 
         if (filter.max) |m| {
@@ -283,24 +313,16 @@ pub const ListenerTargetMap = std.AutoHashMapUnmanaged(usize, std.ArrayList([]co
 pub fn buildListenerTargetMap(frame: *Frame, arena: Allocator) !ListenerTargetMap {
     var map = ListenerTargetMap{};
 
-    // addEventListener registrations
-    var it = frame._event_manager.base.lookup.iterator();
+    // Listeners, event handlers (onclick, ...) included
+    var it = frame.page.event_listeners.lookup.iterator();
     while (it.next()) |entry| {
-        const list = entry.value_ptr.*;
-        if (list.first != null) {
-            const gop = try map.getOrPut(arena, entry.key_ptr.event_target);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(arena, entry.key_ptr.type_string.str());
+        for (entry.value_ptr.items) |*type_listeners| {
+            if (type_listeners.list.first != null) {
+                const gop = try map.getOrPut(arena, entry.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(arena, type_listeners.typ.str());
+            }
         }
-    }
-
-    // Inline handlers (onclick, onmousedown, etc.)
-    var attr_it = frame._event_target_attr_listeners.iterator();
-    while (attr_it.next()) |entry| {
-        const gop = try map.getOrPut(arena, @intFromPtr(entry.key_ptr.target));
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        // Strip "on" prefix to get the event type name.
-        try gop.value_ptr.append(arena, @tagName(entry.key_ptr.handler)[2..]);
     }
 
     return map;
@@ -317,7 +339,7 @@ pub fn classifyInteractivity(
     // 1. Native interactive by tag
     switch (el.getTag()) {
         .button, .summary, .details, .select, .textarea => return .native,
-        .anchor, .area => {
+        .a, .area => {
             if (el.getAttributeInterned("href") != null) return .native;
         },
         .input => {
@@ -401,9 +423,43 @@ pub fn isContentRole(role: []const u8) bool {
     return content_roles.has(lowered);
 }
 
+/// The `position` half comes from the cascade, which resolves it down the
+/// tree; the dialog half walks up, since a dialog is a subtree and not a
+/// style.
+fn overlayOf(el: *Element, owner: *Frame) Overlay {
+    var out: Overlay = .{ .fixed = owner._style_manager.inFixedBox(el) };
+    var current: ?*Element = el;
+    while (current) |ancestor| : (current = ancestor.asNode().flatTreeParentElement(owner)) {
+        if (isDialog(ancestor, owner)) {
+            out.dialog = true;
+            break;
+        }
+    }
+    return out;
+}
+
+fn isDialog(el: *Element, frame: *Frame) bool {
+    if (el.is(Element.Html.Dialog)) |dialog| {
+        return dialog.getOpen();
+    }
+    if (popover.isOpen(el, frame)) {
+        return true;
+    }
+    if (explicitRole(el)) |role| {
+        if (std.ascii.eqlIgnoreCase(role, "dialog") or std.ascii.eqlIgnoreCase(role, "alertdialog")) return true;
+    }
+    const modal = el.getAttributeSafe(comptime .wrap("aria-modal")) orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, modal, &std.ascii.whitespace), "true");
+}
+
 // ARIA `role` is a space-separated fallback list; the first token wins.
 pub fn explicitRole(el: *Element) ?[]const u8 {
-    const attr = el.getAttributeInterned("role") orelse return null;
+    // ElementInternals.role is a custom element's default role.
+    const attr = el.getAttributeInterned("role") orelse blk: {
+        const custom = el.is(Element.Html.Custom) orelse return null;
+        const internals = custom._internals orelse return null;
+        break :blk internals.getAria("role") orelse return null;
+    };
     var it = std.mem.tokenizeAny(u8, attr, " \t\n\r");
     return it.next();
 }
@@ -747,4 +803,63 @@ test "browser.interactive: hidden elements are skipped" {
     try testing.expectEqual(1, elements.len);
     try testing.expectEqual("button", elements[0].tag_name);
     try testing.expectEqual("Visible", elements[0].name.?);
+}
+
+test "browser.interactive: visibility:hidden elements are skipped" {
+    const elements = try testInteractive(
+        \\<button style="visibility:hidden">Inline</button>
+        \\<div style="visibility:hidden"><a href="/x">Ancestor</a><button style="visibility:visible">Visible again</button></div>
+        \\<button style="opacity:0">Transparent</button>
+    );
+    defer testing.test_session.closeAllPages();
+    try testing.expectEqual(2, elements.len);
+    try testing.expectEqual("Visible again", elements[0].name.?);
+    try testing.expectEqual("Transparent", elements[1].name.?);
+}
+
+test "browser.interactive: a control in a fixed box is in an overlay" {
+    defer testing.test_session.closeAllPages();
+    const elements = try testInteractive(
+        \\<div style="position: fixed"><div><button>Accept</button></div></div>
+        \\<div style="position: sticky"><button>Menu</button></div>
+        \\<div style="position: absolute"><button>Tooltip</button></div>
+        \\<div style="position: relative"><button>In the page</button></div>
+        \\<button style="position: fixed">Pinned itself</button>
+    );
+
+    try testing.expectEqual(5, elements.len);
+    try testing.expect(elements[0].overlay.fixed);
+    // Only `fixed` is pinned to the viewport. A sticky box lays out in flow and
+    // an absolute one scrolls away, so neither counts.
+    try testing.expect(!elements[1].overlay.fixed);
+    try testing.expect(!elements[2].overlay.fixed);
+    try testing.expect(!elements[3].overlay.fixed);
+    try testing.expect(elements[4].overlay.fixed);
+
+    for (elements) |el| {
+        try testing.expect(!el.overlay.dialog);
+    }
+}
+
+test "browser.interactive: a control in a dialog is in an overlay" {
+    defer testing.test_session.closeAllPages();
+    const elements = try testInteractiveInBody(
+        \\<dialog open><button>Dismiss</button></dialog>
+        \\<div role="dialog"><button>Close</button></div>
+        \\<div role="alertdialog"><button>Got it</button></div>
+        \\<div aria-modal="true"><button>OK</button></div>
+        \\<div aria-modal="false"><button>Not modal</button></div>
+        \\<dialog><button>Never shown</button></dialog>
+    );
+
+    // A closed dialog is display:none, so its button is not a candidate.
+    try testing.expectEqual(5, elements.len);
+    for (elements[0..4]) |el| {
+        try testing.expect(el.overlay.dialog);
+    }
+    try testing.expect(!elements[4].overlay.dialog);
+
+    for (elements) |el| {
+        try testing.expect(!el.overlay.fixed);
+    }
 }

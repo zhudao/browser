@@ -22,10 +22,13 @@ const lp = @import("lightpanda");
 
 const id = @import("../id.zig");
 const CDP = @import("../CDP.zig");
+const target = @import("target.zig");
+const network = @import("network.zig");
 
 const js = @import("../../../browser/js/js.zig");
 const URL = @import("../../../browser/URL.zig");
 const Frame = @import("../../../browser/Frame.zig");
+const History = @import("../../../browser/webapi/History.zig");
 const referrer = @import("../../../browser/referrer.zig");
 const Notification = @import("../../../Notification.zig");
 
@@ -122,36 +125,36 @@ fn setLifecycleEventsEnabled(cmd: *CDP.Command) !void {
     // attached targets.
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
-    // Like Chrome, report the initial about:blank as loaded. Its state is left
-    // as is, since the first navigation reuses it (see canNavigateInPlace).
-    if (frame._load_state == .waiting) {
-        const frame_id = &id.toFrameId(frame._frame_id);
-        const loader_id = &id.toLoaderId(frame._loader_id);
+    switch (frame._load_state) {
+        .load, .parsing => {
+            // The page is in progress, events will be dispatch later.
+            return cmd.sendResult(null, .{});
+        },
+        .waiting, .complete => {
+            // The page is loaded (or waiting for navigation) always dispatch
+            // load event.
+            const frame_id = &id.toFrameId(frame._frame_id);
+            const loader_id = &id.toLoaderId(frame._loader_id);
 
-        const now = lp.datetime.timestamp(.boot);
-        try sendPageLifecycle(bc, "DOMContentLoaded", now, frame_id, loader_id);
-        try sendPageLifecycle(bc, "load", now, frame_id, loader_id);
-        return cmd.sendResult(null, .{});
-    }
+            const now = lp.datetime.timestamp(.boot);
+            try sendPageLifecycle(bc, "DOMContentLoaded", now, frame_id, loader_id);
+            try sendPageLifecycle(bc, "load", now, frame_id, loader_id);
 
-    if (frame._load_state == .complete) {
-        const frame_id = &id.toFrameId(frame._frame_id);
-        const loader_id = &id.toLoaderId(frame._loader_id);
-
-        const now = lp.datetime.timestamp(.boot);
-        try sendPageLifecycle(bc, "DOMContentLoaded", now, frame_id, loader_id);
-        try sendPageLifecycle(bc, "load", now, frame_id, loader_id);
-
-        const http_client = frame._session.browser.http_client;
-        const http_active = http_client.http_active;
-        const http_buffered = http_client.dispatch_count;
-        const total_network_activity = http_active + http_buffered + http_client.intercepted;
-        if (frame._notified_network_almost_idle.check(total_network_activity <= 2)) {
-            try sendPageLifecycle(bc, "networkAlmostIdle", now, frame_id, loader_id);
-        }
-        if (frame._notified_network_idle.check(total_network_activity == 0)) {
-            try sendPageLifecycle(bc, "networkIdle", now, frame_id, loader_id);
-        }
+            // Dispatch network events only for complete page, ie. w/ real nav
+            // done.
+            if (frame._load_state == .complete) {
+                const http_client = frame._session.browser.http_client;
+                const http_active = http_client.http_active;
+                const http_buffered = http_client.dispatch_count;
+                const total_network_activity = http_active + http_buffered + http_client.intercepted;
+                if (frame._notified_network_almost_idle.check(total_network_activity <= 2)) {
+                    try sendPageLifecycle(bc, "networkAlmostIdle", now, frame_id, loader_id);
+                }
+                if (frame._notified_network_idle.check(total_network_activity == 0)) {
+                    try sendPageLifecycle(bc, "networkIdle", now, frame_id, loader_id);
+                }
+            }
+        },
     }
 
     return cmd.sendResult(null, .{});
@@ -448,7 +451,8 @@ fn getNavigationHistory(cmd: *CDP.Command) !void {
         return error.SessionIdNotLoaded;
     }
 
-    const nav = bc.session.navigation;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const nav = bc.session.navigationFor(frame);
     const entries_in = nav._entries.items;
 
     const entries_out = try cmd.arena.alloc(NavigationEntry, entries_in.len);
@@ -483,7 +487,8 @@ fn navigateToHistoryEntry(cmd: *CDP.Command) !void {
     }
 
     const session = bc.session;
-    const nav = session.navigation;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const nav = session.navigationFor(frame);
 
     var target_index: ?usize = null;
     var target_url: ?[:0]const u8 = null;
@@ -499,7 +504,20 @@ fn navigateToHistoryEntry(cmd: *CDP.Command) !void {
     const idx = target_index orelse return error.InvalidParams;
     const url = target_url orelse return error.InvalidParams;
 
-    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    // An entry of the current document (pushState, fragment) is restored in
+    // place, as history.back() does: same document, popstate, no reload.
+    if (nav._entries.items[idx].sameDocument(frame)) {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+
+        var caller: js.Caller = undefined;
+        caller.initWithContext(frame.js, ls.local.handle);
+        defer caller.deinit();
+
+        try History.traverse(idx, frame);
+        return cmd.sendResult(null, .{});
+    }
 
     const opts = Frame.NavigateOpts{
         .reason = .history,
@@ -637,10 +655,7 @@ pub fn frameNavigateFailed(bc: *CDP.BrowserContext, event: *const Notification.F
         .result = .{
             .frameId = &id.toFrameId(event.frame_id),
             .loaderId = &id.toLoaderId(event.loader_id),
-            .errorText = switch (event.err) {
-                error.TransferCanceled => "net::ERR_ABORTED",
-                else => |err| @errorName(err),
-            },
+            .errorText = network.errorText(event.err),
         },
         .sessionId = session_id,
     }, .{});
@@ -672,6 +687,14 @@ pub fn frameChildFrameCreated(bc: *CDP.BrowserContext, event: *const Notificatio
             .timestamp = event.timestamp,
         }, .{ .session_id = session_id });
     }
+}
+
+pub fn frameChildFrameDetached(bc: *CDP.BrowserContext, event: *const Notification.FrameChildFrameDetached) !void {
+    const session_id = bc.session_id orelse return;
+    try bc.cdp.sendEvent("Page.frameDetached", .{
+        .frameId = &id.toFrameId(event.frame_id),
+        .reason = "remove",
+    }, .{ .session_id = session_id });
 }
 
 pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const Notification.FrameNavigated) !void {
@@ -755,6 +778,7 @@ pub fn frameNavigated(arena: Allocator, bc: *CDP.BrowserContext, event: *const N
         .type = "Navigation",
         .frame = FrameWriter{ .bc = bc, .frame = frame },
     }, .{ .session_id = session_id });
+    try target.sendTargetInfoChanged(bc, event.frame_id);
 
     {
         const aux_data = try arena.print("{{\"isDefault\":true,\"type\":\"default\",\"frameId\":\"{s}\",\"loaderId\":\"{s}\"}}", .{ frame_id, loader_id });
@@ -854,6 +878,7 @@ pub fn frameNavigatedWithinDocument(bc: anytype, event: *const Notification.Fram
         .url = event.url,
         .navigationType = @tagName(event.navigation_type),
     }, .{ .session_id = session_id });
+    try target.sendTargetInfoChanged(bc, event.frame_id);
 }
 
 pub fn frameDOMContentLoaded(bc: anytype, event: *const Notification.FrameDOMContentLoaded) !void {
@@ -891,6 +916,8 @@ pub fn frameLoaded(bc: anytype, event: *const Notification.FrameLoaded) !void {
         .{ .timestamp = timestamp },
         .{ .session_id = session_id },
     );
+    // The title is usually known by now, not at navigation.
+    try target.sendTargetInfoChanged(bc, event.frame_id);
 
     if (bc.page_life_cycle_events) {
         const loader_id = &id.toLoaderId(event.loader_id);
@@ -1457,6 +1484,135 @@ test "cdp.frame: createIsolatedWorld targets the requested frame" {
     try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "Parent jobs" } }, .{ .id = 37 });
 }
 
+// A DOM change made from an isolated world queues the MutationObserver
+// delivery while the world's context is the frame's current one. The
+// main-world callbacks then call natives, and must not reset the frame's
+// call_arena, which holds the delivery's snapshot of observers and records.
+test "cdp.frame: isolated world mutation delivers main-world observers" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-IW", .url = "hi.html", .target_id = "FID-000000000X".* });
+    const root = bc.mainFrame() orelse unreachable;
+    const root_id = id.toFrameId(root._frame_id);
+
+    try ctx.processMessage(.{ .id = 1, .method = "Runtime.evaluate", .params = .{
+        .expression =
+        \\ window.calls = [];
+        \\ for (const name of ['a', 'b', 'c']) {
+        \\   new MutationObserver((records) => {
+        \\     for (let i = 0; i < 50; i++) {
+        \\       document.getElementById(name.repeat(64) + i);
+        \\     }
+        \\     calls.push(name + records.length);
+        \\   }).observe(document.body, {attributes: true});
+        \\ }
+        ,
+    } });
+
+    try ctx.processMessage(.{ .id = 2, .method = "Page.createIsolatedWorld", .params = .{
+        .frameId = &root_id,
+        .worldName = "utility",
+        .grantUniveralAccess = true,
+    } });
+    const world_ctx = try isolatedWorldContextId(bc, root);
+
+    try ctx.processMessage(.{ .id = 3, .method = "Runtime.evaluate", .params = .{
+        .expression = "document.body.setAttribute('data-x', '1')",
+        .contextId = world_ctx,
+    } });
+
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .params = .{
+        .expression = "calls.join(',')",
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "a1,b1,c1" } }, .{ .id = 4 });
+}
+
+// An event caused from an isolated world reaches main-world listeners with
+// main-world wrappers: page expandos on the target are visible.
+test "cdp.frame: isolated world event reaches main-world listeners with main-world wrappers" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-IW", .url = "hi.html", .target_id = "FID-000000000X".* });
+    const root = bc.mainFrame() orelse unreachable;
+    const root_id = id.toFrameId(root._frame_id);
+
+    try ctx.processMessage(.{ .id = 1, .method = "Runtime.evaluate", .params = .{
+        .expression =
+        \\ window.seen = [];
+        \\ const el = document.body.appendChild(document.createElement('input'));
+        \\ el.marker = 'main';
+        \\ const record = (kind) => (e) => seen.push(`${kind} ${e.type} ${e.target === el} ${e.target.marker}`);
+        \\ el.addEventListener('focus', record('listener'));
+        \\ el.setAttribute('onfocus', "seen.push(`attribute ${event.type} ${event.target === el} ${event.target.marker}`)");
+        \\ el.addEventListener('click', { handleEvent: record('object') });
+        \\ el.onclick = record('handler');
+        ,
+    } });
+
+    try ctx.processMessage(.{ .id = 2, .method = "Page.createIsolatedWorld", .params = .{
+        .frameId = &root_id,
+        .worldName = "utility",
+        .grantUniveralAccess = true,
+    } });
+    const world_ctx = try isolatedWorldContextId(bc, root);
+
+    try ctx.processMessage(.{ .id = 3, .method = "Runtime.evaluate", .params = .{
+        .expression = "const i = document.querySelector('input'); i.focus(); i.click();",
+        .contextId = world_ctx,
+    } });
+
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .params = .{
+        .expression = "seen.join(',')",
+    } });
+    try ctx.expectSentResult(.{ .result = .{
+        .type = "string",
+        .value = "listener focus true main,attribute focus true main,object click true main,handler click true main",
+    } }, .{ .id = 4 });
+}
+
+// A script inserted from an isolated world runs in the main world, as
+// Playwright's setContent (document.write from its utility world) expects.
+test "cdp.frame: script inserted from an isolated world runs in the main world" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-IW", .url = "hi.html", .target_id = "FID-000000000X".* });
+    const root = bc.mainFrame() orelse unreachable;
+    const root_id = id.toFrameId(root._frame_id);
+
+    try ctx.processMessage(.{ .id = 1, .method = "Page.createIsolatedWorld", .params = .{
+        .frameId = &root_id,
+        .worldName = "utility",
+        .grantUniveralAccess = true,
+    } });
+    const world_ctx = try isolatedWorldContextId(bc, root);
+
+    try ctx.processMessage(.{ .id = 2, .method = "Runtime.evaluate", .params = .{
+        .expression =
+        \\ window.worldOnly = 1;
+        \\ const s = document.createElement('script');
+        \\ s.textContent = "window.appended = 'main ' + typeof window.worldOnly";
+        \\ document.body.appendChild(s);
+        ,
+        .contextId = world_ctx,
+    } });
+    try ctx.processMessage(.{ .id = 3, .method = "Runtime.evaluate", .params = .{
+        .expression = "String(window.appended)",
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "main undefined" } }, .{ .id = 3 });
+
+    try ctx.processMessage(.{ .id = 4, .method = "Runtime.evaluate", .params = .{
+        .expression = "document.open(); document.write('<script>window.written = 1<\\/script>'); document.close();",
+        .contextId = world_ctx,
+    } });
+    try ctx.processMessage(.{ .id = 5, .method = "Runtime.evaluate", .params = .{
+        .expression = "String(window.written)",
+    } });
+    try ctx.expectSentResult(.{ .result = .{ .type = "string", .value = "1" } }, .{ .id = 5 });
+}
+
 // Chrome only puts a world in a frame on an explicit trigger. A world the
 // client asked for on the root must not appear in a sibling frame just
 // because that frame navigated afterwards.
@@ -1812,6 +1968,28 @@ test "cdp.frame: frameAttached" {
     try ctx.expectSentEvent("Page.frameAttached", .{
         .frameId = "FID-0000000002",
         .parentFrameId = "FID-0000000001",
+    }, .{ .session_id = "SID-X" });
+}
+
+test "cdp.frame: frameDetached" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .session_id = "SID-X", .url = "hi.html" });
+    const frame = bc.mainFrame().?;
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    try ls.local.eval(
+        \\const f = document.createElement('iframe');
+        \\document.body.appendChild(f);
+        \\f.remove();
+    , null);
+
+    try ctx.expectSentEvent("Page.frameDetached", .{
+        .frameId = &id.toFrameId(frame._frame_id + 1),
+        .reason = "remove",
     }, .{ .session_id = "SID-X" });
 }
 
@@ -2178,6 +2356,53 @@ test "cdp.page: stopLoading cancels an uncommitted root navigation" {
     defer ls.deinit();
     const v = try ls.local.exec("document.readyState === 'complete'", null);
     try testing.expect(v.toBool());
+}
+
+test "cdp.page: Fetch.failRequest on a script navigation" {
+    testing.silenceLog(&.{.frame});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-FR", .session_id = "SID-FR", .target_id = "TID-FR-0000000".*, .url = "hi.html" });
+    const live = bc.mainPage() orelse unreachable;
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "Fetch.enable" });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+
+    {
+        // Aborted is a cancel: the live page stays.
+        const frame = bc.mainFrame() orelse unreachable;
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("location.href = 'hi.html?aborted'", null);
+    }
+    try ctx.expectSentEvent("Fetch.requestPaused", .{ .requestId = "INT-0000000001" }, .{});
+    try ctx.processMessage(.{ .id = 3, .method = "Fetch.failRequest", .params = .{ .requestId = "INT-0000000001", .errorReason = "Aborted" } });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    try ctx.expectSentEvent("Network.loadingFailed", .{ .errorText = "net::ERR_ABORTED", .canceled = true }, .{});
+    try testing.waitForPage(bc);
+    try testing.expectEqual(null, bc.session.replacementOf(live));
+    try testing.expect(live == bc.mainPage().?);
+
+    {
+        const frame = bc.mainFrame() orelse unreachable;
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("location.href = 'hi.html?failed'", null);
+    }
+    try ctx.expectSentEvent("Fetch.requestPaused", .{ .requestId = "INT-0000000002" }, .{});
+    try ctx.processMessage(.{ .id = 4, .method = "Fetch.failRequest", .params = .{ .requestId = "INT-0000000002", .errorReason = "Failed" } });
+    try ctx.expectSentResult(null, .{ .id = 4 });
+
+    // Any other reason is a network error: like Chrome, an error document
+    // commits, which a client waiting on the navigation sees.
+    try ctx.expectSentEvent("Network.loadingFailed", .{ .errorText = "net::ERR_FAILED", .canceled = false }, .{});
+    try ctx.expectSentEvent("Page.frameNavigated", .{ .frame = .{ .url = "http://127.0.0.1:9582/src/browser/tests/hi.html?failed" } }, .{});
 }
 
 test "cdp.frame: reload replays POST navigation" {
@@ -2786,6 +3011,45 @@ test "cdp.frame: addScriptToEvaluateOnNewDocument" {
     }
 }
 
+test "cdp.frame: navigateToHistoryEntry restores an entry of the same document in place" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-B3", .url = "hi.html", .target_id = "TID-B3-0000000".* });
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec(
+            \\window.__marker = 'kept';
+            \\window.__pops = [];
+            \\addEventListener('popstate', (e) => __pops.push(location.pathname + ' ' + JSON.stringify(e.state)));
+            \\history.pushState({n: 1}, '', '/next');
+        , null);
+    }
+
+    // Entry 1 is hi.html, entry 2 the pushState one. Going back to entry 1
+    // must not reload the document: like history.back(), it restores the
+    // entry in place and fires popstate, then answers at once.
+    try ctx.processMessage(.{
+        .id = 50,
+        .method = "Page.navigateToHistoryEntry",
+        .params = .{ .entryId = 1 },
+    });
+    try ctx.expectSentResult(null, .{ .id = 50 });
+
+    try testing.expectEqualSlices(u8, "http://127.0.0.1:9582/src/browser/tests/hi.html", frame.url);
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const v = try ls.local.exec("window.__marker + '|' + __pops.join(',')", null);
+        try testing.expectEqualSlices(u8, "kept|/src/browser/tests/hi.html null", try v.toStringSlice());
+    }
+}
+
 test "cdp.frame: getNavigationHistory + navigateToHistoryEntry" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -2914,4 +3178,128 @@ test "cdp.frame: history.pushState emits Page.navigatedWithinDocument" {
         .navigationType = "historyApi",
         .url = "http://127.0.0.1:9582/next",
     }, .{});
+}
+
+test "cdp.frame: a fragment navigation emits Page.navigatedWithinDocument" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("location.hash = 'a'", null);
+    }
+
+    // Chrome reports location.hash (and same-document anchor clicks) as a
+    // "fragment" navigation.
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .frameId = "FID-0000000001",
+        .navigationType = "fragment",
+        .url = "http://127.0.0.1:9582/src/browser/tests/hi.html#a",
+    }, .{});
+}
+
+test "cdp.frame: a same-document history traversal emits Page.navigatedWithinDocument" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec("history.pushState({}, '', '/next'); history.back()", null);
+    }
+
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .frameId = "FID-0000000001",
+        .navigationType = "historyApi",
+        .url = "http://127.0.0.1:9582/next",
+    }, .{});
+    // Going back to the pushState entry stays in the document. Chrome reports
+    // a traversal as "fragment" whatever the entry's URL.
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{
+        .frameId = "FID-0000000001",
+        .navigationType = "fragment",
+        .url = "http://127.0.0.1:9582/src/browser/tests/hi.html",
+    }, .{});
+}
+
+test "cdp.frame: a fragment navigation to the current URL emits Page.navigatedWithinDocument" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        // Setting location.hash to the current fragment doesn't navigate, but
+        // navigating to the current URL does.
+        _ = try ls.local.exec("location.hash = 'a'; location.hash = 'a'; location.href = '#a'", null);
+    }
+
+    try expectNavigatedWithinDocument(&ctx, &.{
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#a",
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#a",
+    });
+}
+
+test "cdp.frame: Page.navigatedWithinDocument precedes navigations from listeners" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    var bc = try ctx.loadBrowserContext(.{ .id = "BID-9", .url = "hi.html", .target_id = "FID-000000000X".* });
+
+    const frame = bc.mainFrame() orelse unreachable;
+
+    {
+        var ls: js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        _ = try ls.local.exec(
+            \\navigation.addEventListener('currententrychange', () => {
+            \\  if (location.hash === '#a') location.hash = 'b';
+            \\});
+            \\navigation.addEventListener('navigatesuccess', () => {
+            \\  location.hash = 'd';
+            \\}, { once: true });
+            \\location.hash = 'a';
+            \\navigation.navigate('#c');
+        , null);
+    }
+
+    try expectNavigatedWithinDocument(&ctx, &.{
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#a",
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#b",
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#c",
+        "http://127.0.0.1:9582/src/browser/tests/hi.html#d",
+    });
+}
+
+// The subset matcher can't check order or count; look at the events directly.
+fn expectNavigatedWithinDocument(ctx: *testing.TestContext, expected: []const []const u8) !void {
+    try ctx.expectSentEvent("Page.navigatedWithinDocument", .{ .url = expected[expected.len - 1] }, .{});
+
+    var i: usize = 0;
+    for (ctx.received.items) |received| {
+        const method = received.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "Page.navigatedWithinDocument")) continue;
+        try testing.expect(i < expected.len);
+        const url = received.object.get("params").?.object.get("url").?.string;
+        try testing.expectEqualSlices(u8, expected[i], url);
+        i += 1;
+    }
+    try testing.expectEqual(expected.len, i);
 }

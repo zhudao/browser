@@ -71,6 +71,18 @@ Verify the binary before running anything:
 
 [Linux aarch64 is also available](https://github.com/lightpanda-io/browser/releases/tag/nightly)
 
+If you use [**Nix**](https://nixos.org/download/), you can run Lightpanda directly from the flake without downloading a binary:
+```console
+nix run github:lightpanda-io/browser -- --help
+```
+
+Or pin it as an input in your own flake:
+```nix
+{
+  inputs.lightpanda.url = "github:lightpanda-io/browser";
+}
+```
+
 > **Note:** The Linux release binaries are linked against glibc. On musl-based Linux distributions (Alpine, etc.) the binary fails with `cannot execute: required file not found` because the glibc dynamic linker is missing. Use a glibc-based base image (e.g., `FROM debian:bookworm-slim` or `FROM ubuntu:24.04`) or [build from sources](#build-from-sources).
 >
 > **Android / Termux:** there is no native Android build. The Linux aarch64 binary needs the glibc loader (`/lib/ld-linux-aarch64.so.1`), which Android's Bionic libc does not provide, so it fails with the same `cannot execute: required file not found` error.
@@ -99,7 +111,7 @@ images](https://hub.docker.com/r/lightpanda/browser) for both Linux amd64 and
 arm64 architectures.
 The following command fetches the Docker image and starts a new container exposing Lightpanda's CDP server on port `9222`.
 ```console
-docker run -d --name lightpanda -p 127.0.0.1:9222:9222 lightpanda/browser:nightly
+docker run -d --name lightpanda -p 127.0.0.1:9222:9222 lightpanda/browser:latest
 ```
 
 ### Dump a URL
@@ -110,7 +122,8 @@ docker run -d --name lightpanda -p 127.0.0.1:9222:9222 lightpanda/browser:nightl
 
 You can use `--dump markdown` to convert directly into markdown, or
 `--dump png > page.png` or `--dump pdf > page.pdf` for a text-only rendering
-of the page.
+of the page. `--dump structured_data` prints the page's JSON-LD, OpenGraph,
+Twitter card, meta and link tags as JSON, like the MCP `structuredData` tool.
 `--wait-until`, `--wait-ms`, `--wait-selector` and `--wait-script` are
 available to adjust waiting time before dump.
 
@@ -119,6 +132,13 @@ available to adjust waiting time before dump.
 ```console
 ./lightpanda serve --obey-robots --log-format pretty  --log-level info --host 127.0.0.1 --port 9222
 ```
+
+To listen on a Unix-domain socket (owner-only, mode 0600) instead of TCP:
+
+```console
+./lightpanda serve --unix-socket /run/user/1000/lightpanda.sock
+```
+
 Once the CDP server started, you can run a Puppeteer script by configuring the
 `browserWSEndpoint`.
 
@@ -247,6 +267,16 @@ longer clobber each other's page:
 
 A skill is available in [lightpanda-io/agent-skill](https://github.com/lightpanda-io/agent-skill).
 
+### Shell completion
+
+`lightpanda completion <bash | fish | zsh>` prints a completion script for commands, flags and their values:
+
+```console
+lightpanda completion fish > ~/.config/fish/completions/lightpanda.fish
+lightpanda completion bash > ~/.local/share/bash-completion/completions/lightpanda
+lightpanda completion zsh > ~/.zfunc/_lightpanda  # with fpath=(~/.zfunc $fpath) before compinit
+```
+
 ### Telemetry
 
 By default, Lightpanda collects and sends usage telemetry. This can be disabled by setting an environment variable `LIGHTPANDA_DISABLE_TELEMETRY=true`. You can read Lightpanda's privacy policy at: [https://lightpanda.io/privacy-policy](https://lightpanda.io/privacy-policy).
@@ -303,7 +333,7 @@ sudo apt install xz-utils ca-certificates \
 ```
 You also need to [install Rust](https://rust-lang.org/tools/install/).
 
-For systems with [**Nix**](https://nixos.org/download/), you can use the devShell:
+For systems with [**Nix**](https://nixos.org/download/), you can use the devShell.
 ```
 nix develop
 ```
@@ -350,6 +380,7 @@ TEST_FILTER="WebApi: #selector_all" make test   # Filter main + subtest (separat
 TEST_VERBOSE=true make test
 TEST_FAIL_FIRST=true make test
 METRICS=true make test                          # Capture allocation/duration metrics as JSON
+TEST_JOBS=1 make test                           # Run in one process (default: up to 4, or 1 when filtered)
 ```
 
 ### End to end tests

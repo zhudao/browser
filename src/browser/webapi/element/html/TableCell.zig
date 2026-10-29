@@ -24,6 +24,8 @@ const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 
 const HtmlElement = @import("../Html.zig");
+const Table = @import("Table.zig");
+const Row = @import("TableRow.zig");
 
 const String = lp.String;
 
@@ -42,12 +44,21 @@ pub fn asNode(self: *TableCell) *Node {
     return self.asElement().asNode();
 }
 
+// The index in the parent row's cells, -1 outside a row
+fn getCellIndex(self: *TableCell) i32 {
+    const node = self.asNode();
+    const parent = node._parent orelse return -1;
+    if (parent.is(Row) == null) {
+        return -1;
+    }
+    return Table.childIndex(parent, TableCell, node);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(TableCell);
 
     pub const Meta = struct {
         pub const name = "HTMLTableCellElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -66,6 +77,7 @@ pub const JsApi = struct {
     pub const abbr = reflect.string("abbr");
 
     pub const colSpan = reflect.unsignedLong("colspan", .{ .default = 1, .clamp = .{ .min = 1, .max = 1000 } });
+    pub const cellIndex = bridge.accessor(TableCell.getCellIndex, null, .{});
     pub const rowSpan = reflect.unsignedLong("rowspan", .{ .default = 1, .clamp = .{ .min = 0, .max = 65534 } });
 };
 

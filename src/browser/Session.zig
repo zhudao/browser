@@ -29,6 +29,7 @@ const Factory = @import("Factory.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
 const Navigation = @import("webapi/navigation/Navigation.zig");
 
+const URL = @import("URL.zig");
 const Page = @import("Page.zig");
 const Frame = @import("Frame.zig");
 const Browser = @import("Browser.zig");
@@ -50,7 +51,10 @@ const Session = @This();
 
 browser: *Browser,
 arena: *lp.Arena,
-navigation: *Navigation,
+// Session history, one per top-level browsing context, keyed by its root
+// frame id. Outlives the Page: a root navigation's replacement Page reuses the
+// frame id, and so the history. Removed by closePage.
+navigations: std.AutoHashMapUnmanaged(u32, *Navigation) = .empty,
 storage_shed: storage.Shed,
 idb: IdbManager, // Per-origin IndexedDB engines
 cache_store: CacheStore, // Per-origin CacheStorage
@@ -137,6 +141,9 @@ pub const DownloadBehavior = enum {
     // The CDP `default` behavior is mapped to `deny`: we don't write downloads
     // to disk unless the driver explicitly opts in with `allow`/`allowAndName`.
     deny,
+    /// LP extension to `DownloadBehavior`; instead of writing files to disk,
+    /// they are streamed over CDP.
+    stream,
 };
 
 const CancelHook = struct {
@@ -158,15 +165,9 @@ pub fn init(self: *Session, browser: *Browser, notification: *Notification) !voi
     const arena = try arena_pool.acquire(.small, "Session");
     errdefer arena.release();
 
-    const navigation = try Factory.chainedWithAllocator(arena.allocator(), .{
-        EventTarget{ ._type = .navigation },
-        Navigation{ ._proto = undefined },
-    });
-
     self.* = .{
         .arena = arena,
         .arena_pool = arena_pool,
-        .navigation = navigation,
         .storage_shed = .{},
         .idb = IdbManager.init(allocator),
         .cache_store = CacheStore.init(allocator),
@@ -357,7 +358,6 @@ fn removePageFromList(self: *Session, page: *Page) void {
 fn tearDownPage(self: *Session, page: *Page) void {
     self.notification.dispatch(.frame_remove, .{});
     self.retire(page);
-    self.navigation.onRemoveFrame();
 }
 
 // Allocate a Page in a free slot, publish it as the active page, and
@@ -394,18 +394,8 @@ pub fn createPage(self: *Session) !PageHandle {
     const frame_id = self.nextFrameId();
     const frame = try self.installNewActivePage(frame_id);
 
-    // https://html.spec.whatwg.org/multipage/document-sequences.html --
-    // Creating a new browsing context always produces an initial about:blank
-    // Document with its own session history entry, even before any real
-    // navigation happens. Without this, navigation.currentEntry crashes on
-    // a page that hasn't navigated yet.
-    _ = try self.navigation.pushEntry(
-        frame.url,
-        .{ .source = .navigation, .value = null },
-        frame,
-        false,
-    );
-    self.navigation._initial_entry = true;
+    frame.document._ready_state = .complete;
+    try self.createNavigation(frame);
 
     return .{ .session = self, .frame_id = frame_id };
 }
@@ -424,6 +414,55 @@ pub fn closePage(self: *Session, frame_id: u32) void {
     self.tearDownPage(live);
 }
 
+// Creates the session history of `frame`, a new top-level browsing context:
+// a page's root frame or a popup.
+// https://html.spec.whatwg.org/multipage/document-sequences.html --
+// Creating a new browsing context always produces an initial about:blank
+// Document with its own session history entry, even before any real
+// navigation happens. Without this, navigation.currentEntry crashes on
+// a browsing context that hasn't navigated yet.
+pub fn createNavigation(self: *Session, frame: *Frame) !void {
+    const navigation = try self.getOrCreateNavigation(frame._frame_id);
+    _ = try navigation.pushEntry(
+        frame.url,
+        .{ .source = .navigation, .value = null },
+        frame,
+        false,
+    );
+    navigation._initial_entry = true;
+}
+
+// Drops the session history of the top-level browsing context `frame_id`.
+// The Navigation's memory lives in the session arena.
+pub fn removeNavigation(self: *Session, frame_id: u32) void {
+    _ = self.navigations.remove(frame_id);
+}
+
+fn getOrCreateNavigation(self: *Session, frame_id: u32) !*Navigation {
+    const gop = try self.navigations.getOrPut(self.arena.allocator(), frame_id);
+    if (gop.found_existing) {
+        return gop.value_ptr.*;
+    }
+    errdefer _ = self.navigations.remove(frame_id);
+    gop.value_ptr.* = try Factory.chainedWithAllocator(self.arena.allocator(), .{
+        EventTarget{ ._type = .navigation },
+        Navigation{ ._proto = undefined },
+    });
+    return gop.value_ptr.*;
+}
+
+// The session history of `frame`'s top-level browsing context: its page's
+// root frame or a popup, both without a parent. Child frames share theirs.
+pub fn navigationFor(self: *const Session, frame: *const Frame) *Navigation {
+    var top = frame;
+    while (top.parent) |parent| {
+        top = parent;
+    }
+    return self.navigations.get(top._frame_id) orelse {
+        lp.assert(false, "Session.navigationFor no navigation", .{ .frame_id = frame._frame_id });
+    };
+}
+
 // Does not dispatch notifications. Used in session.deinit() and used in tests.
 // We queue then process so that there is a single place (processDestroyQueues)
 // where pages get destroyed.
@@ -433,6 +472,7 @@ pub fn closeAllPages(self: *Session) void {
         self.queuePageDestruction(page);
     }
     self.pages.clearRetainingCapacity();
+    self.navigations.clearRetainingCapacity();
     self.processDestroyQueues();
 }
 
@@ -912,7 +952,7 @@ pub fn initiateRootNavigation(self: *Session, frame_id: u32, url: [:0]const u8, 
     // therefore no frameHeaderDoneCallback to commit a pending Page. Swap the
     // active Page immediately instead of allocating a pending one that would
     // never be promoted, leaving the previous document in place (issue #2363).
-    if (std.mem.eql(u8, "about:blank", url) or std.mem.startsWith(u8, url, "blob:")) {
+    if (URL.isAboutBlank(url) or std.mem.startsWith(u8, url, "blob:")) {
         return self.replaceRootImmediate(frame_id, url, opts);
     }
 
@@ -990,7 +1030,6 @@ pub fn commitPendingPage(self: *Session, replacement: *Page) !void {
     // walkable (node_registry, inspector context group, isolated worlds). OLD
     // is still the live page (index 0); its memory stays alive until step 4.
     self.notification.dispatch(.frame_remove, .{});
-    self.navigation.onRemoveFrame();
 
     // Step 2: register the new page with CDP. `replacement.replaces` is still
     // set, so the session still reports an in-flight nav and CDP's frameCreated
@@ -1130,6 +1169,47 @@ test "Session: a root navigation whose submit fails commits an error document" {
     defer ls.deinit();
     const text = try ls.local.exec("document.querySelector('p')?.textContent", null);
     try testing.expectEqual("Reason: TestSubmitFailure", try text.toStringSlice());
+}
+
+test "Session: each page has its own session history" {
+    const session = testing.test_session;
+    defer session.closeAllPages();
+
+    const a = (try session.createPage()).frame().?;
+    const b = (try session.createPage()).frame().?;
+    const nav_a = session.navigationFor(a);
+    const nav_b = session.navigationFor(b);
+    try testing.expect(nav_a != nav_b);
+
+    const js = @import("js/js.zig");
+    var ls: js.Local.Scope = undefined;
+    a.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec("history.pushState(null, '', '#one'); history.pushState(null, '', '#two')", null);
+
+    try testing.expectEqual(3, nav_a._entries.items.len);
+    try testing.expectEqual(1, nav_b._entries.items.len);
+}
+
+test "Session: a popup has its own session history" {
+    const session = testing.test_session;
+    defer session.closeAllPages();
+
+    const frame = (try session.createPage()).frame().?;
+    const popup = try frame.openPopup(.{ .url = "about:blank", .name = "", .opener = frame.window });
+    const frame_nav = session.navigationFor(frame);
+    const popup_nav = session.navigationFor(popup);
+    try testing.expect(frame_nav != popup_nav);
+
+    const js = @import("js/js.zig");
+    var ls: js.Local.Scope = undefined;
+    popup.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec("history.pushState(null, '', '#one')", null);
+
+    try testing.expectEqual(1, frame_nav._entries.items.len);
+    try testing.expectEqual("about:blank", frame_nav.getCurrentEntry()._url.?);
+    try testing.expectEqual("about:blank#one", popup_nav.getCurrentEntry()._url.?);
 }
 
 test "Session: console capture runs no page JS" {

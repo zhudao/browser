@@ -91,7 +91,7 @@ pending_text: ?PendingText,
 // on flush keeps the largest capacity ever needed, so total dead memory on the
 // parser arena is bounded to one peak-run-sized allocation regardless of how
 // many text runs the parse contains. Matters for Streaming, whose arena is the
-// page-lifetime frame.arena (individual frees are no-ops there).
+// page-lifetime frame.page_arena (individual frees are no-ops there).
 //
 // Single-chunk text runs leave this buf empty: the chunk lives only in
 // CData._data via createTextNode. The buf is seeded from _data.str() on the
@@ -113,6 +113,8 @@ context: ?*Element = null,
 fragment: bool = false,
 
 xml_error: bool = false,
+// An XML entity that xml5ever doesn't know is only an error without a DTD.
+seen_doctype: bool = false,
 terminated: bool = false,
 appends_until_terminate_check: u16 = TERMINATE_CHECK_INTERVAL,
 inserted_since_checkpoint: u16 = 0,
@@ -150,7 +152,7 @@ pub fn flushPendingText(self: *Parser) !void {
     if (self.buf.items.len == 0) return;
     defer self.buf.clearRetainingCapacity();
     pt.text_node._data = try lp.String.init(
-        self.frame.arena,
+        self.frame.page_arena,
         self.buf.items,
         .{ .dupe = true },
     );
@@ -313,18 +315,28 @@ pub fn parseXML(self: *Parser, xml: []const u8) void {
     };
 }
 
+pub fn isWellFormedXML(xml: []const u8) bool {
+    var has_error = false;
+    h5e.xml5ever_validate_document(xml.ptr, xml.len, &has_error, validateErrorCallback);
+    return has_error == false;
+}
+
 pub fn parseFragment(self: *Parser, html: []const u8) void {
     self.fragment = true;
-    const context_name: []const u8 = if (self.context orelse self.container.node.is(Element)) |el|
-        el.getLocalName()
-    else
-        "";
+    const context_el = self.context orelse self.container.node.is(Element);
+    const context_name: []const u8 = if (context_el) |el| el.getLocalName() else "";
+    const context_ns: h5e.ContextNamespace = if (context_el) |el| switch (el._namespace) {
+        .svg => .svg,
+        .mathml => .mathml,
+        else => .html,
+    } else .html;
 
     h5e.html5ever_parse_fragment(
         html.ptr,
         html.len,
         context_name.ptr,
         context_name.len,
+        context_ns,
         &self.container,
         self,
         createElementCallback,
@@ -416,7 +428,8 @@ pub const Streaming = struct {
         while (true) {
             try self.feed(input);
             if (self.pending_input.items.len == 0) {
-                return;
+                // document.write's text must be visible when it returns,
+                return self.parser.flushPendingText();
             }
             // Scripts that ran during the feed queued more markup via
             // re-entrant read(). This swaps the buffers, and ensures that
@@ -473,16 +486,31 @@ fn parseErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
 // xml5ever xml error callback indicating a well-formedness violating.
 fn xmlParseErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
     const self: *Parser = @ptrCast(@alignCast(ctx));
-    const msg = err.slice();
+    // Without a DTD to declare it, an unknown entity breaks the "Entity
+    // Declared" well-formedness constraint.
+    if (isWellFormednessError(err.slice(), self.seen_doctype == false)) {
+        self.xml_error = true;
+    }
+}
+
+fn validateErrorCallback(ctx: *anyopaque, err: h5e.StringSlice) callconv(.c) void {
+    const has_error: *bool = @ptrCast(@alignCast(ctx));
+    // Lenient: a page that fails this goes through the HTML parser instead.
+    if (isWellFormednessError(err.slice(), false)) {
+        has_error.* = true;
+    }
+}
+
+fn isWellFormednessError(msg: []const u8, unknown_entity_is_error: bool) bool {
     if (std.mem.startsWith(u8, msg, "Bad character") and msg.len > "Bad character".len) {
         // discouraged by legal code point
-        return;
+        return false;
     }
     if (std.mem.startsWith(u8, msg, "Invalid character reference")) {
-        // xml5ever doesn't know about this entity, but it could be valid
-        return;
+        // xml5ever doesn't know about this entity, but a DTD could declare it
+        return unknown_entity_is_error;
     }
-    self.xml_error = true;
+    return true;
 }
 
 fn popCallback(ctx: *anyopaque, node_ref: *anyopaque) callconv(.c) void {
@@ -570,7 +598,7 @@ fn _createElementCallback(self: *Parser, data: *anyopaque, qname: h5e.QualName, 
         // Same as Document.createElementNS: keep the URI so namespaceURI and
         // lookupNamespaceURI can return it.
         const page = self.document._page;
-        try page.element_namespace_uris.put(page.frame_arena, node.as(Element), try frame.dupeString(namespace_string));
+        try page.element_namespace_uris.put(page.arena, node.as(Element), try frame.dupeString(namespace_string));
     }
 
     const pn = try self.arena.create(ParsedNode);
@@ -624,6 +652,7 @@ fn appendDoctypeToDocument(ctx: *anyopaque, name: h5e.StringSlice, public_id: h5
     if (self.terminated) {
         return;
     }
+    self.seen_doctype = true;
     const cp = self.frame._ce_reactions.push();
     defer self.frame._ce_reactions.popAndInvoke(cp, self.frame);
     self._appendDoctypeToDocument(name.slice(), public_id.slice(), system_id.slice()) catch |err| {
@@ -665,8 +694,15 @@ fn _addAttrsIfMissingCallback(self: *Parser, node: *Node, attributes: h5e.Attrib
     while (attributes.next()) |attr| {
         const name = attr.name.local.slice();
         const value = attr.value.slice();
-        // putNew only adds if the attribute doesn't already exist
-        try attr_list.putNew(name, value, frame);
+        if (try attr_list.putNew(name, value, frame)) {
+            // attribute didn't previously exist
+            if (std.mem.eql(u8, name, "id") and node.isConnected()) {
+                try frame.addElementId(node._parent.?, element, element.getId().?);
+            }
+            if (element.is(Element.Html)) |html| {
+                try html.eventHandlerAttributeChanged(name, element.getAttributeSafe(.wrap(name)), frame);
+            }
+        }
     }
     element.noteStyleAttribute();
 }
@@ -832,7 +868,7 @@ fn rebuildIn(self: *Parser, node: *Node, document: *Node.Document) !*Node {
         // The URI lives in a side table, see _createElementCallback.
         const page = self.document._page;
         if (page.element_namespace_uris.fetchRemove(element)) |entry| {
-            try page.element_namespace_uris.put(page.frame_arena, copy.as(Element), entry.value);
+            try page.element_namespace_uris.put(page.arena, copy.as(Element), entry.value);
         }
     }
     return copy;
@@ -1042,4 +1078,14 @@ fn pollTerminate(self: *Parser) bool {
     const terminated = self.frame.js.env.terminatePending();
     self.terminated = terminated;
     return terminated;
+}
+
+const testing = @import("../../testing.zig");
+test "Parser: isWellFormedXML" {
+    try testing.expectEqual(true, isWellFormedXML("<?xml version=\"1.0\"?><a><b/>&nbsp;&amp;</a>"));
+    try testing.expectEqual(true, isWellFormedXML("<!DOCTYPE svg [ <!ENTITY x \"y\"> ]><svg/>"));
+    try testing.expectEqual(false, isWellFormedXML("<a><b></a>"));
+    try testing.expectEqual(false, isWellFormedXML("<a>unclosed"));
+    try testing.expectEqual(false, isWellFormedXML("<a x=1/>"));
+    try testing.expectEqual(false, isWellFormedXML("<?xml version=\"2.0\"?><a/>"));
 }

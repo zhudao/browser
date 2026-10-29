@@ -69,18 +69,6 @@ pub fn initTrusted(typ: String, opts_: ?Options, page: *Page) !*ExtendableEvent 
     return event;
 }
 
-pub fn deinit(self: *ExtendableEvent, page: *Page) void {
-    self._proto.deinit(page);
-}
-
-pub fn releaseRef(self: *ExtendableEvent, page: *Page) void {
-    self._proto._rc.release(self, page);
-}
-
-pub fn acquireRef(self: *ExtendableEvent) void {
-    self._proto.acquireRef();
-}
-
 pub fn asEvent(self: *ExtendableEvent) *Event {
     return self._proto;
 }
@@ -145,7 +133,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ExtendableEvent";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

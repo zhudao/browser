@@ -19,9 +19,12 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const Notification = @import("../../Notification.zig");
+
 const js = @import("../js/js.zig");
 const URL = @import("../URL.zig");
 const Frame = @import("../Frame.zig");
+
 const Console = @import("Console.zig");
 const History = @import("History.zig");
 const Navigation = @import("navigation/Navigation.zig");
@@ -51,7 +54,7 @@ const CustomElementRegistry = @import("CustomElementRegistry.zig");
 const Selection = @import("Selection.zig");
 const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
-const Notification = @import("../../Notification.zig");
+const global_event_handlers = @import("global_event_handlers.zig");
 
 const log = lp.log;
 
@@ -79,22 +82,10 @@ _performance: *Performance,
 _cookie_store: ?*CookieStore = null,
 _idb_factory: ?*idb.IDBFactory = null,
 _caches: ?*CacheStorage = null,
-_on_load: ?js.Function.Global = null,
-_on_pageshow: ?js.Function.Global = null,
-_on_popstate: ?js.Function.Global = null,
-_on_hashchange: ?js.Function.Global = null,
-_on_error: ?js.Function.Global = null,
-_on_blur: ?js.Function.Global = null,
-_on_focus: ?js.Function.Global = null,
-_on_resize: ?js.Function.Global = null,
-_on_scroll: ?js.Function.Global = null,
-_on_message: ?js.Function.Global = null,
-_on_rejection_handled: ?js.Function.Global = null,
-_on_unhandled_rejection: ?js.Function.Global = null,
 _reporting_error: bool = false,
 _current_event: ?*Event = null,
 _location: *Location,
-_history: History = .{},
+_history: History,
 _timers: Timers = .{},
 _scheduler: Scheduler = .{},
 _custom_elements: CustomElementRegistry = .{},
@@ -171,7 +162,7 @@ pub fn getName(self: *const Window) []const u8 {
 
 pub fn setName(self: *Window, name: []const u8, frame: *Frame) !void {
     // Store in the Page's frame arena so the slice outlives any call_arena.
-    self._name = try frame.arena.dupe(u8, name);
+    self._name = try frame.page_arena.dupe(u8, name);
 }
 
 pub fn getTop(self: *Window, frame: *Frame) Access {
@@ -227,6 +218,30 @@ fn setInnerHeight(self: *Window, value: js.Value) void {
 
 fn setDevicePixelRatio(self: *Window, value: js.Value) void {
     self.replaceGlobalProperty(value, "devicePixelRatio");
+}
+
+fn setOuterWidth(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "outerWidth");
+}
+
+fn setOuterHeight(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "outerHeight");
+}
+
+fn setScreenX(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenX");
+}
+
+fn setScreenY(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenY");
+}
+
+fn setScreenLeft(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenLeft");
+}
+
+fn setScreenTop(self: *Window, value: js.Value) void {
+    self.replaceGlobalProperty(value, "screenTop");
 }
 
 fn setScrollX(self: *Window, value: js.Value) void {
@@ -367,7 +382,7 @@ pub fn getHistory(self: *Window) *History {
 }
 
 fn getNavigation(_: *Window, frame: *Frame) *Navigation {
-    return frame._session.navigation;
+    return frame._session.navigationFor(frame);
 }
 
 fn setNavigation(self: *Window, value: js.Value) void {
@@ -378,165 +393,52 @@ pub fn getCustomElements(self: *Window) *CustomElementRegistry {
     return &self._custom_elements;
 }
 
-fn getOnLoad(self: *const Window) ?js.Function.Global {
-    return self._on_load;
-}
-
-fn setOnLoad(self: *Window, setter: ?FunctionSetter) void {
-    self._on_load = getFunctionFromSetter(setter);
-}
-
-fn getOnPageShow(self: *const Window) ?js.Function.Global {
-    return self._on_pageshow;
-}
-
-fn setOnPageShow(self: *Window, setter: ?FunctionSetter) void {
-    self._on_pageshow = getFunctionFromSetter(setter);
-}
-
-fn getOnPopState(self: *const Window) ?js.Function.Global {
-    return self._on_popstate;
-}
-
-fn setOnPopState(self: *Window, setter: ?FunctionSetter) void {
-    self._on_popstate = getFunctionFromSetter(setter);
-}
-
-fn getOnHashChange(self: *const Window) ?js.Function.Global {
-    return self._on_hashchange;
-}
-
-fn setOnHashChange(self: *Window, setter: ?FunctionSetter) void {
-    self._on_hashchange = getFunctionFromSetter(setter);
-}
-
-fn getOnError(self: *const Window) ?js.Function.Global {
-    return self._on_error;
-}
-
-fn setOnError(self: *Window, setter: ?FunctionSetter) void {
-    self._on_error = getFunctionFromSetter(setter);
-}
-
-fn getOnBlur(self: *const Window) ?js.Function.Global {
-    return self._on_blur;
-}
-
-fn setOnBlur(self: *Window, setter: ?FunctionSetter) void {
-    self._on_blur = getFunctionFromSetter(setter);
-}
-
-fn getOnFocus(self: *const Window) ?js.Function.Global {
-    return self._on_focus;
-}
-
-fn setOnFocus(self: *Window, setter: ?FunctionSetter) void {
-    self._on_focus = getFunctionFromSetter(setter);
-}
-
-fn getOnResize(self: *const Window) ?js.Function.Global {
-    return self._on_resize;
-}
-
-fn setOnResize(self: *Window, setter: ?FunctionSetter) void {
-    self._on_resize = getFunctionFromSetter(setter);
-}
-
-fn getOnScroll(self: *const Window) ?js.Function.Global {
-    return self._on_scroll;
-}
-
-fn setOnScroll(self: *Window, setter: ?FunctionSetter) void {
-    self._on_scroll = getFunctionFromSetter(setter);
-}
-
-// Stored in the frame's attribute-listener map (like element and ShadowRoot
-// property handlers), which the dispatch propagation path consults for any
-// event target.
-fn getOnClick(self: *Window) ?js.Function.Global {
-    return self._frame._event_target_attr_listeners.get(.{ .target = self.asEventTarget(), .handler = .onclick });
-}
-
-fn setOnClick(self: *Window, setter: ?FunctionSetter) !void {
-    if (getFunctionFromSetter(setter)) |cb| {
-        try self._frame._event_target_attr_listeners.put(self._frame.arena, .{ .target = self.asEventTarget(), .handler = .onclick }, cb);
-    } else {
-        _ = self._frame._event_target_attr_listeners.remove(.{ .target = self.asEventTarget(), .handler = .onclick });
+// The event handlers of body and frameset elements that are aliases for the
+// Window's: the "window-reflecting body element event handler set" plus
+// WindowEventHandlers (HTML spec, "determining the target of an event handler").
+pub fn isWindowReflectingHandler(name: []const u8) bool {
+    inline for (.{ "onblur", "onerror", "onfocus", "onload", "onresize", "onscroll" }) |n| {
+        if (std.mem.eql(u8, name, n)) {
+            return true;
+        }
     }
+    return global_event_handlers.isWindowEventHandler(name);
 }
 
-// The "window-reflecting body element event handler set" (HTML spec): these
-// event handlers of body and frameset elements are aliases for the Window's.
-// Returns the Window storage slot for the given content attribute name, or
-// null if the attribute isn't part of the set.
-fn windowReflectingHandler(self: *Window, name: lp.String) ?*?js.Function.Global {
-    if (name.eql(comptime .wrap("onblur"))) return &self._on_blur;
-    if (name.eql(comptime .wrap("onerror"))) return &self._on_error;
-    if (name.eql(comptime .wrap("onfocus"))) return &self._on_focus;
-    if (name.eql(comptime .wrap("onload"))) return &self._on_load;
-    if (name.eql(comptime .wrap("onresize"))) return &self._on_resize;
-    if (name.eql(comptime .wrap("onscroll"))) return &self._on_scroll;
-    return null;
-}
+// Accessor for a window-reflecting event handler (i.e. body or frameset)..
+pub fn reflectingHandlerAccessor(comptime T: type, comptime typ: []const u8) js.bridge.Accessor {
+    const H = struct {
+        fn get(self: *T, frame: *Frame) ?js.Function.Global {
+            const owner = self.asElement().ownerFrame(frame) orelse return null;
+            return owner._event_manager.getHandler(owner.window.asEventTarget(), typ);
+        }
 
-// Applies a window-reflecting content attribute (set on a body or frameset
-// element) to the Window's event handler. A null value clears the handler.
-pub fn setWindowReflectingHandlerFromAttribute(self: *Window, name: lp.String, value: ?[]const u8, frame: *Frame) void {
-    const slot = self.windowReflectingHandler(name) orelse return;
-    const expr = value orelse {
-        slot.* = null;
-        return;
+        fn set(self: *T, value: ?EventTarget.HandlerValue, frame: *Frame) !void {
+            const owner = self.asElement().ownerFrame(frame) orelse return;
+            return owner._event_manager.setHandler(owner.window.asEventTarget(), typ, EventTarget.HandlerValue.function(value));
+        }
     };
-    if (frame.js.stringToPersistedFunction(expr, &.{"event"}, &.{})) |func| {
-        slot.* = func;
-    } else |err| {
-        log.debug(.js, "window reflecting handler", .{ .err = err, .str = expr });
-        slot.* = null;
-    }
-}
-
-fn getOnMessage(self: *const Window) ?js.Function.Global {
-    return self._on_message;
-}
-
-fn setOnMessage(self: *Window, setter: ?FunctionSetter) void {
-    self._on_message = getFunctionFromSetter(setter);
-}
-
-fn getOnRejectionHandled(self: *const Window) ?js.Function.Global {
-    return self._on_rejection_handled;
-}
-
-fn setOnRejectionHandled(self: *Window, setter: ?FunctionSetter) void {
-    self._on_rejection_handled = getFunctionFromSetter(setter);
-}
-
-fn getOnUnhandledRejection(self: *const Window) ?js.Function.Global {
-    return self._on_unhandled_rejection;
-}
-
-fn setOnUnhandledRejection(self: *Window, setter: ?FunctionSetter) void {
-    self._on_unhandled_rejection = getFunctionFromSetter(setter);
+    return js.Bridge(T).accessor(H.get, H.set, .{});
 }
 
 pub fn fetch(_: *const Window, input: Fetch.Input, options: ?Fetch.InitOpts, exec: *const js.Execution) !js.Promise {
     return Fetch.init(input, options, exec);
 }
 
-pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setTimeout(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: js.Variadic(js.Value.Global), exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = false,
-        .params = params,
+        .params = params.values,
         .name = "window.setTimeout",
     });
 }
 
-pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: []js.Value.Global, exec: *js.Execution) !u32 {
+pub fn setInterval(self: *Window, handler: Timers.LegacyHandler, delay_ms: ?i32, params: js.Variadic(js.Value.Global), exec: *js.Execution) !u32 {
     const cb = try handler.resolve(exec);
     return self._timers.schedule(exec, cb, Timers.delayFromJs(delay_ms), .{
         .repeat = true,
-        .params = params,
+        .params = params.values,
         .name = "window.setInterval",
     });
 }
@@ -592,15 +494,27 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
         return;
     }
 
+    // Reporting calls back into Zig (e.g. a DOMException's message accessor).
+    // At call_depth 0 that call resets the call_arena, which the code reporting
+    // the error may still be using (e.g. a dispatch's snapshot of its targets).
+    const call_depth = frame.js.call_depth;
+    frame.js.call_depth = call_depth + 1;
+    defer frame.js.call_depth = call_depth;
+
     frame.page.recordJsError(error.JsException);
+    frame.page.status.noteException(err.toStringSlice() catch "");
+
+    const location = err.errorLocation(frame.call_arena) catch js.Value.ErrorLocation{};
 
     const target = self.asEventTarget();
-    if (!frame._event_manager.hasDirectListeners(target, "error", self._on_error)) {
-        if (comptime lp.IS_TEST == false) {
-            log.debug(.js, "window.reportError", .{
-                .message = err.toStringSlice() catch "Unknown error",
-            });
-        }
+    if (!frame._event_manager.hasDirectListeners(target, "error")) {
+        log.warn(.page_error, "uncaught exception", .{
+            .message = err.toStringSlice() catch "Unknown error",
+            .url = location.url,
+            .line = location.line,
+            .column = location.column,
+        });
+        notifyExceptionThrown(err, location, .exception, frame);
         return;
     }
 
@@ -610,56 +524,44 @@ pub fn reportError(self: *Window, err: js.Value, frame: *Frame) !void {
     const error_event = try ErrorEvent.initTrusted(comptime .wrap("error"), .{
         .@"error" = try err.persist(),
         .message = err.toStringSlice() catch "Unknown error",
+        .filename = location.url,
+        .lineno = location.line,
+        .colno = location.column,
         .bubbles = false,
         .cancelable = true,
     }, frame.page);
-
-    // Invoke window.onerror callback if set (per WHATWG spec, this is called
-    // with 5 arguments: message, source, lineno, colno, error)
-    // If it returns true, the event is cancelled.
-    var prevent_default = false;
-    if (self._on_error) |on_error| {
-        var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
-        defer ls.deinit();
-
-        const local_func = ls.toLocal(on_error);
-        const result = local_func.call(js.Value, .{
-            error_event._message,
-            error_event._filename,
-            error_event._line_number,
-            error_event._column_number,
-            err,
-        }) catch null;
-
-        // Per spec: returning true from onerror cancels the event
-        if (result) |r| {
-            prevent_default = r.isTrue();
-        }
-    }
 
     const event = error_event.asEvent();
     event.acquireRef();
     defer event.releaseRef(frame.page);
 
-    event._prevent_default = prevent_default;
-    // Pass null as handler: onerror was already called above with 5 args.
-    // We still dispatch so that addEventListener('error', ...) listeners fire.
-    try frame._event_manager.dispatchDirect(target, event, null, .{
+    // window.onerror is called with the event's fields (see Listener.run).
+    try frame._event_manager.dispatchDirect(target, event, .{
         .context = "window.reportError",
         .run_microtasks = false,
     });
 
-    if (comptime lp.IS_TEST == false) {
-        if (!event._prevent_default) {
-            log.debug(.js, "window.reportError", .{
-                .message = error_event._message,
-                .filename = error_event._filename,
-                .line_number = error_event._line_number,
-                .column_number = error_event._column_number,
-            });
-        }
+    if (!event._prevent_default) {
+        log.warn(.page_error, "uncaught exception", .{
+            .message = error_event._message,
+            .url = error_event._filename,
+            .line = error_event._line_number,
+            .column = error_event._column_number,
+        });
+        notifyExceptionThrown(err, location, .exception, frame);
     }
+}
+
+// An error event (or unhandledrejection event) left uncancelled leaves the
+// exception "uncaught": CDP clients learn about it through
+// Runtime.exceptionThrown.
+pub fn notifyExceptionThrown(err: js.Value, location: js.Value.ErrorLocation, kind: @FieldType(Notification.ExceptionThrown, "kind"), frame: *Frame) void {
+    frame._session.notification.dispatch(.exception_thrown, &.{
+        .timestamp = lp.datetime.timestamp(.boot),
+        .value = err,
+        .location = location,
+        .kind = kind,
+    });
 }
 
 pub fn matchMedia(_: *const Window, query: []const u8, frame: *Frame) !*MediaQueryList {
@@ -672,7 +574,7 @@ pub fn getComputedStyle(_: *const Window, element: *Element, pseudo_element: ?[]
     // common probes
     const pseudo = Element.PseudoElement.parse(pseudo_element orelse "");
     const page = frame.page;
-    const gop = try page.element_computed_styles.getOrPut(page.frame_arena, .{ .element = element, .pseudo = pseudo });
+    const gop = try page.element_computed_styles.getOrPut(page.arena, .{ .element = element, .pseudo = pseudo });
     if (!gop.found_existing) {
         if (pseudo == .other) {
             log.debug(.not_implemented, "window.GetComputedStyle", .{ .pseudo_element = pseudo_element.? });
@@ -735,7 +637,7 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
     if (is_named) {
         if (page.findPopupByName(target)) |existing| {
             if (raw_url.len > 0) {
-                try existing.scheduleNavigation(raw_url, .{
+                try frame.scheduleNavigation(raw_url, .{
                     .reason = .script,
                     .kind = .{ .push = null },
                 }, .{ .script = existing });
@@ -768,52 +670,16 @@ pub fn close(self: *Window) void {
     // Per spec, close() is only honored on script-opened windows. That
     // maps exactly to membership in page.popups.
     const frame = self._frame;
-    const page = frame.page;
-
-    var popup_index: usize = 0;
-    while (popup_index < page.popups.items.len) : (popup_index += 1) {
-        if (page.popups.items[popup_index] == frame) {
-            break;
-        }
-    } else return;
-
-    self._closed = true;
-
-    // Any live Window holding us as its opener must drop the reference —
-    // our Frame is about to go away, and a stale _frame deref on their
-    // side would crash.
-    for (page.popups.items) |popup| {
-        if (popup.window._opener == self) {
-            popup.window._opener = null;
-        }
+    if (std.mem.findScalar(*Frame, frame.page.popups.items, frame) == null) {
+        return;
     }
-    if (page.frame.window._opener == self) {
-        page.frame.window._opener = null;
-    }
-
-    _ = page.popups.swapRemove(popup_index);
-
-    // Drop any pending queued navigation for this frame.
-    if (frame._queued_navigation != null) {
-        for (page.queued_navigation.items, 0..) |f, i| {
-            if (f == frame) {
-                _ = page.queued_navigation.swapRemove(i);
-                break;
-            }
-        }
-    }
-
-    page.session.idb.detachContext(frame.js);
-    frame.js.scheduler.reset();
-    frame.abortTransfers();
 
     // Do not teardown the frame. The Window can still be referenced in JS
     // (window.open(...) returns the window). It would be nice to be able to
     // free this now (just like it would be nice to be more pro-active about
-    // freeing workers and iframes), but, for now, we don't have the
-    // infrastructure to do this safely so doing it on page tear down is our
-    // only option.
-    page.closed_frames.append(page.frame_arena, frame) catch @panic("OOM");
+    // freeing workers), but, for now, we don't have the infrastructure to do
+    // this safely so doing it on page tear down is our only option.
+    frame.discard() catch @panic("OOM");
 }
 
 pub fn focus(_: *Window) void {}
@@ -823,10 +689,17 @@ pub fn stop(self: *Window) void {
     self._frame.stopLoading();
 }
 
-pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
+// postMessage(message, targetOrigin, transfer) or postMessage(message, options).
+pub fn postMessage(self: *Window, message: js.Value, target_origin_or_options: ?js.Value, transfer: ?js.Value, frame: *Frame) !void {
     // For now, we ignore targetOrigin checking and just dispatch the message
     // In a full implementation, we would validate the origin
-    _ = target_origin;
+    var transfer_arg = transfer;
+    if (target_origin_or_options) |arg| {
+        if (arg.isObject()) {
+            transfer_arg = arg;
+        }
+    }
+    const ports = try MessagePort.transferList(transfer_arg);
 
     const target_frame = self._frame;
     const source_window = target_frame.js.getIncumbent().window;
@@ -834,27 +707,10 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
     const arena = try target_frame.getArena(.medium, "Window.postMessage");
     errdefer arena.release();
 
-    // StructuredSerialize runs synchronously (per spec): clone the message into
-    // the target window's realm now. The receiver gets a fresh, independent copy
-    // minted in its own realm (not the source realm's object), an unserializable
-    // value throws a DataCloneError to the caller, and the source-realm temp
-    // doesn't leak into the destination context. Mirrors Worker.postMessage.
-    const cloned = blk: {
-        var ls: js.Local.Scope = undefined;
-        target_frame.js.localScope(&ls);
-        defer ls.deinit();
-
-        // Contain any V8 exception from a failed serialization so it surfaces as
-        // a clean DataCloneError; deinit() (no rethrow) clears it.
-        var try_catch: js.TryCatch = undefined;
-        try_catch.init(&ls.local);
-        defer try_catch.deinit();
-
-        const c = message.structuredCloneTo(&ls.local) catch {
-            return error.DataClone;
-        };
-        break :blk try c.persist();
-    };
+    // Clone the message into the target window's realm now: the receiver gets
+    // a fresh copy minted in its own realm, and the transferred ports move
+    // there. Mirrors Worker.postMessage.
+    const cloned = try MessagePort.cloneMessage(message, ports, &target_frame.js.execution);
     errdefer cloned.release();
 
     // Origin should be the source window's origin (where the message came from)
@@ -866,7 +722,6 @@ pub fn postMessage(self: *Window, message: js.Value, target_origin: ?[]const u8,
         .frame = target_frame,
         .source = source_window,
         .origin = try arena.dupe(u8, origin),
-        .ports = if (transfer) |t| try arena.dupe(*MessagePort, t) else &.{},
     };
 
     try target_frame.js.scheduler.add(callback, PostMessageCallback.run, 0, .{
@@ -937,6 +792,20 @@ pub fn getInnerHeight(_: *const Window, frame: *Frame) u32 {
 
 fn getDevicePixelRatio(_: *const Window, frame: *Frame) f32 {
     return frame.page.getViewport().scale;
+}
+
+// There is no window frame around the viewport and no window position on a
+// screen, so the outer size is the viewport and the position is 0.
+fn getOuterWidth(_: *const Window, frame: *Frame) u32 {
+    return frame.page.getViewport().width;
+}
+
+fn getOuterHeight(_: *const Window, frame: *Frame) u32 {
+    return frame.page.getViewport().height;
+}
+
+fn getScreenPosition(_: *const Window) i32 {
+    return 0;
 }
 
 pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Frame) !void {
@@ -1026,34 +895,29 @@ fn getWebDriver(_: *const Window) @import("WebDriver.zig") {
     return .{};
 }
 
-pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, rejection: js.PromiseRejection, frame: *Frame) !void {
-    if (comptime lp.IS_DEBUG) {
-        log.debug(.js, "unhandled rejection", .{
-            .target = "window",
-            .value = rejection.reason(),
-            .stack = rejection.local.stackTrace() catch |err| @errorName(err) orelse "???",
-        });
-    }
-
-    const event_name, const attribute_callback = blk: {
-        if (no_handler) {
-            break :blk .{ "unhandledrejection", self._on_unhandled_rejection };
-        }
-        break :blk .{ "rejectionhandled", self._on_rejection_handled };
-    };
-
-    if (no_handler) {
-        frame.page.recordJsError(error.JsException);
-    }
+// "unhandledrejection" for a promise still rejected without a handler at the
+// end of a microtask checkpoint, "rejectionhandled" for one that got a handler
+// after that. Env.reportRejectedPromises reports an "unhandledrejection" the
+// page doesn't cancel. Returns whether the event was cancelled.
+pub fn unhandledPromiseRejection(self: *Window, no_handler: bool, promise: js.Promise, reason: ?js.Value, frame: *Frame) !bool {
+    const event_name = if (no_handler) "unhandledrejection" else "rejectionhandled";
 
     const target = self.asEventTarget();
-    if (frame._event_manager.hasDirectListeners(target, event_name, attribute_callback)) {
-        const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
-            .reason = if (rejection.reason()) |r| try r.persist() else null,
-            .promise = try rejection.promise().persist(),
-        }, frame.page)).asEvent();
-        try frame._event_manager.dispatchDirect(target, event, attribute_callback, .{ .context = "window.unhandledrejection" });
+    if (!frame._event_manager.hasDirectListeners(target, event_name)) {
+        return false;
     }
+
+    const event = (try @import("event/PromiseRejectionEvent.zig").init(event_name, .{
+        .reason = if (reason) |r| try r.persist() else null,
+        .promise = try promise.persist(),
+        .cancelable = no_handler,
+    }, frame.page)).asEvent();
+    // Keep the event alive past dispatch so we can read _prevent_default.
+    event.acquireRef();
+    defer event.releaseRef(frame.page);
+
+    try frame._event_manager.dispatchDirect(target, event, .{ .context = "window.unhandledrejection" });
+    return event._prevent_default;
 }
 
 // Some properties are readonly but [Replaceable]. They get assigned as own
@@ -1088,8 +952,7 @@ const PostMessageCallback = struct {
     source: *Window,
     arena: *lp.Arena,
     origin: []const u8,
-    message: js.Value.Global,
-    ports: []const *MessagePort,
+    message: MessagePort.Message,
 
     fn deinit(self: *PostMessageCallback) void {
         self.arena.release();
@@ -1106,48 +969,47 @@ const PostMessageCallback = struct {
     fn run(ctx: *anyopaque) !?u32 {
         const self: *PostMessageCallback = @ptrCast(@alignCast(ctx));
         defer self.deinit();
+        defer self.message.releasePorts();
 
         const frame = self.frame;
         const window = frame.window;
 
         const event_target = window.asEventTarget();
 
+        const data = self.message.data orelse {
+            if (frame._event_manager.hasDirectListeners(event_target, "messageerror")) {
+                const event = (try MessageEvent.initTrusted(comptime .wrap("messageerror"), .{
+                    .origin = self.origin,
+                    .source = .{ .window = self.source },
+                    .ports = self.message.ports,
+                    .bubbles = false,
+                    .cancelable = false,
+                }, frame.page)).asEvent();
+                try frame._event_manager.dispatchDirect(event_target, event, .{ .context = "window.postMessage" });
+            }
+            return null;
+        };
+
         // The MessageEvent takes ownership of the cloned temp and releases it on
         // teardown; if there are no listeners, release it here so it doesn't leak.
-        if (!frame._event_manager.hasDirectListeners(event_target, "message", window._on_message)) {
-            self.message.release();
+        if (!frame._event_manager.hasDirectListeners(event_target, "message")) {
+            data.release();
             return null;
         }
 
         const event = (try MessageEvent.initTrusted(comptime .wrap("message"), .{
-            .data = .{ .value = self.message },
+            .data = .{ .value = data },
             .origin = self.origin,
             .source = .{ .window = self.source },
-            .ports = self.ports,
+            .ports = self.message.ports,
             .bubbles = false,
             .cancelable = false,
         }, frame.page)).asEvent();
-        try frame._event_manager.dispatchDirect(event_target, event, window._on_message, .{ .context = "window.postMessage" });
+        try frame._event_manager.dispatchDirect(event_target, event, .{ .context = "window.postMessage" });
 
         return null;
     }
 };
-
-pub const FunctionSetter = union(enum) {
-    func: js.Function.Global,
-    anything: js.Value,
-};
-
-// window.onload = {}; doesn't fail, but it doesn't do anything.
-// seems like setting to null is ok (though, at least on Firefix, it preserves
-// the original value, which we could do, but why?)
-pub fn getFunctionFromSetter(setter_: ?FunctionSetter) ?js.Function.Global {
-    const setter = setter_ orelse return null;
-    return switch (setter) {
-        .func => |func| func, // Already a Global from bridge auto-conversion
-        .anything => null,
-    };
-}
 
 // Checks whether a window.open features string contains a token, matched
 // case-insensitively on whole-token boundaries (comma or whitespace separated).
@@ -1168,7 +1030,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Window";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1196,19 +1057,115 @@ pub const JsApi = struct {
     pub const crypto = bridge.accessor(Window.getCrypto, null, .{});
     pub const CSS = bridge.accessor(Window.getCSS, null, .{});
     pub const customElements = bridge.accessor(Window.getCustomElements, null, .{});
-    pub const onload = bridge.accessor(Window.getOnLoad, Window.setOnLoad, .{});
-    pub const onpageshow = bridge.accessor(Window.getOnPageShow, Window.setOnPageShow, .{});
-    pub const onpopstate = bridge.accessor(Window.getOnPopState, Window.setOnPopState, .{});
-    pub const onhashchange = bridge.accessor(Window.getOnHashChange, Window.setOnHashChange, .{});
-    pub const onerror = bridge.accessor(Window.getOnError, Window.setOnError, .{});
-    pub const onblur = bridge.accessor(Window.getOnBlur, Window.setOnBlur, .{});
-    pub const onfocus = bridge.accessor(Window.getOnFocus, Window.setOnFocus, .{});
-    pub const onresize = bridge.accessor(Window.getOnResize, Window.setOnResize, .{});
-    pub const onscroll = bridge.accessor(Window.getOnScroll, Window.setOnScroll, .{});
-    pub const onclick = bridge.accessor(Window.getOnClick, Window.setOnClick, .{});
-    pub const onmessage = bridge.accessor(Window.getOnMessage, Window.setOnMessage, .{});
-    pub const onrejectionhandled = bridge.accessor(Window.getOnRejectionHandled, Window.setOnRejectionHandled, .{});
-    pub const onunhandledrejection = bridge.accessor(Window.getOnUnhandledRejection, Window.setOnUnhandledRejection, .{});
+    pub const onabort = EventTarget.handlerAccessor(Window, "abort");
+    pub const onanimationcancel = EventTarget.handlerAccessor(Window, "animationcancel");
+    pub const onanimationend = EventTarget.handlerAccessor(Window, "animationend");
+    pub const onanimationiteration = EventTarget.handlerAccessor(Window, "animationiteration");
+    pub const onanimationstart = EventTarget.handlerAccessor(Window, "animationstart");
+    pub const onauxclick = EventTarget.handlerAccessor(Window, "auxclick");
+    pub const onbeforeinput = EventTarget.handlerAccessor(Window, "beforeinput");
+    pub const onbeforematch = EventTarget.handlerAccessor(Window, "beforematch");
+    pub const onbeforetoggle = EventTarget.handlerAccessor(Window, "beforetoggle");
+    pub const onblur = EventTarget.handlerAccessor(Window, "blur");
+    pub const oncancel = EventTarget.handlerAccessor(Window, "cancel");
+    pub const oncanplay = EventTarget.handlerAccessor(Window, "canplay");
+    pub const oncanplaythrough = EventTarget.handlerAccessor(Window, "canplaythrough");
+    pub const onchange = EventTarget.handlerAccessor(Window, "change");
+    pub const onclick = EventTarget.handlerAccessor(Window, "click");
+    pub const onclose = EventTarget.handlerAccessor(Window, "close");
+    pub const oncommand = EventTarget.handlerAccessor(Window, "command");
+    pub const oncontentvisibilityautostatechange = EventTarget.handlerAccessor(Window, "contentvisibilityautostatechange");
+    pub const oncontextlost = EventTarget.handlerAccessor(Window, "contextlost");
+    pub const oncontextmenu = EventTarget.handlerAccessor(Window, "contextmenu");
+    pub const oncontextrestored = EventTarget.handlerAccessor(Window, "contextrestored");
+    pub const oncuechange = EventTarget.handlerAccessor(Window, "cuechange");
+    pub const ondblclick = EventTarget.handlerAccessor(Window, "dblclick");
+    pub const ondrag = EventTarget.handlerAccessor(Window, "drag");
+    pub const ondragend = EventTarget.handlerAccessor(Window, "dragend");
+    pub const ondragenter = EventTarget.handlerAccessor(Window, "dragenter");
+    pub const ondragleave = EventTarget.handlerAccessor(Window, "dragleave");
+    pub const ondragover = EventTarget.handlerAccessor(Window, "dragover");
+    pub const ondragstart = EventTarget.handlerAccessor(Window, "dragstart");
+    pub const ondrop = EventTarget.handlerAccessor(Window, "drop");
+    pub const ondurationchange = EventTarget.handlerAccessor(Window, "durationchange");
+    pub const onemptied = EventTarget.handlerAccessor(Window, "emptied");
+    pub const onended = EventTarget.handlerAccessor(Window, "ended");
+    pub const onerror = EventTarget.handlerAccessor(Window, "error");
+    pub const onfocus = EventTarget.handlerAccessor(Window, "focus");
+    pub const onformdata = EventTarget.handlerAccessor(Window, "formdata");
+    pub const ongotpointercapture = EventTarget.handlerAccessor(Window, "gotpointercapture");
+    pub const oninput = EventTarget.handlerAccessor(Window, "input");
+    pub const oninvalid = EventTarget.handlerAccessor(Window, "invalid");
+    pub const onkeydown = EventTarget.handlerAccessor(Window, "keydown");
+    pub const onkeypress = EventTarget.handlerAccessor(Window, "keypress");
+    pub const onkeyup = EventTarget.handlerAccessor(Window, "keyup");
+    pub const onload = EventTarget.handlerAccessor(Window, "load");
+    pub const onloadeddata = EventTarget.handlerAccessor(Window, "loadeddata");
+    pub const onloadedmetadata = EventTarget.handlerAccessor(Window, "loadedmetadata");
+    pub const onloadstart = EventTarget.handlerAccessor(Window, "loadstart");
+    pub const onlostpointercapture = EventTarget.handlerAccessor(Window, "lostpointercapture");
+    pub const onmousedown = EventTarget.handlerAccessor(Window, "mousedown");
+    pub const onmouseenter = EventTarget.handlerAccessor(Window, "mouseenter");
+    pub const onmouseleave = EventTarget.handlerAccessor(Window, "mouseleave");
+    pub const onmousemove = EventTarget.handlerAccessor(Window, "mousemove");
+    pub const onmouseout = EventTarget.handlerAccessor(Window, "mouseout");
+    pub const onmouseover = EventTarget.handlerAccessor(Window, "mouseover");
+    pub const onmouseup = EventTarget.handlerAccessor(Window, "mouseup");
+    pub const onpause = EventTarget.handlerAccessor(Window, "pause");
+    pub const onplay = EventTarget.handlerAccessor(Window, "play");
+    pub const onplaying = EventTarget.handlerAccessor(Window, "playing");
+    pub const onpointercancel = EventTarget.handlerAccessor(Window, "pointercancel");
+    pub const onpointerdown = EventTarget.handlerAccessor(Window, "pointerdown");
+    pub const onpointerenter = EventTarget.handlerAccessor(Window, "pointerenter");
+    pub const onpointerleave = EventTarget.handlerAccessor(Window, "pointerleave");
+    pub const onpointermove = EventTarget.handlerAccessor(Window, "pointermove");
+    pub const onpointerout = EventTarget.handlerAccessor(Window, "pointerout");
+    pub const onpointerover = EventTarget.handlerAccessor(Window, "pointerover");
+    pub const onpointerrawupdate = EventTarget.handlerAccessor(Window, "pointerrawupdate");
+    pub const onpointerup = EventTarget.handlerAccessor(Window, "pointerup");
+    pub const onprogress = EventTarget.handlerAccessor(Window, "progress");
+    pub const onratechange = EventTarget.handlerAccessor(Window, "ratechange");
+    pub const onreset = EventTarget.handlerAccessor(Window, "reset");
+    pub const onresize = EventTarget.handlerAccessor(Window, "resize");
+    pub const onscroll = EventTarget.handlerAccessor(Window, "scroll");
+    pub const onscrollend = EventTarget.handlerAccessor(Window, "scrollend");
+    pub const onsecuritypolicyviolation = EventTarget.handlerAccessor(Window, "securitypolicyviolation");
+    pub const onseeked = EventTarget.handlerAccessor(Window, "seeked");
+    pub const onseeking = EventTarget.handlerAccessor(Window, "seeking");
+    pub const onselect = EventTarget.handlerAccessor(Window, "select");
+    pub const onselectionchange = EventTarget.handlerAccessor(Window, "selectionchange");
+    pub const onselectstart = EventTarget.handlerAccessor(Window, "selectstart");
+    pub const onslotchange = EventTarget.handlerAccessor(Window, "slotchange");
+    pub const onstalled = EventTarget.handlerAccessor(Window, "stalled");
+    pub const onsubmit = EventTarget.handlerAccessor(Window, "submit");
+    pub const onsuspend = EventTarget.handlerAccessor(Window, "suspend");
+    pub const ontimeupdate = EventTarget.handlerAccessor(Window, "timeupdate");
+    pub const ontoggle = EventTarget.handlerAccessor(Window, "toggle");
+    pub const ontransitioncancel = EventTarget.handlerAccessor(Window, "transitioncancel");
+    pub const ontransitionend = EventTarget.handlerAccessor(Window, "transitionend");
+    pub const ontransitionrun = EventTarget.handlerAccessor(Window, "transitionrun");
+    pub const ontransitionstart = EventTarget.handlerAccessor(Window, "transitionstart");
+    pub const onvolumechange = EventTarget.handlerAccessor(Window, "volumechange");
+    pub const onwaiting = EventTarget.handlerAccessor(Window, "waiting");
+    pub const onwheel = EventTarget.handlerAccessor(Window, "wheel");
+    pub const onafterprint = EventTarget.handlerAccessor(Window, "afterprint");
+    pub const onbeforeprint = EventTarget.handlerAccessor(Window, "beforeprint");
+    pub const onbeforeunload = EventTarget.handlerAccessor(Window, "beforeunload");
+    pub const onhashchange = EventTarget.handlerAccessor(Window, "hashchange");
+    pub const onlanguagechange = EventTarget.handlerAccessor(Window, "languagechange");
+    pub const onmessage = EventTarget.handlerAccessor(Window, "message");
+    pub const onmessageerror = EventTarget.handlerAccessor(Window, "messageerror");
+    pub const onoffline = EventTarget.handlerAccessor(Window, "offline");
+    pub const ononline = EventTarget.handlerAccessor(Window, "online");
+    pub const onpagehide = EventTarget.handlerAccessor(Window, "pagehide");
+    pub const onpagereveal = EventTarget.handlerAccessor(Window, "pagereveal");
+    pub const onpageshow = EventTarget.handlerAccessor(Window, "pageshow");
+    pub const onpageswap = EventTarget.handlerAccessor(Window, "pageswap");
+    pub const onpopstate = EventTarget.handlerAccessor(Window, "popstate");
+    pub const onrejectionhandled = EventTarget.handlerAccessor(Window, "rejectionhandled");
+    pub const onstorage = EventTarget.handlerAccessor(Window, "storage");
+    pub const onunhandledrejection = EventTarget.handlerAccessor(Window, "unhandledrejection");
+    pub const onunload = EventTarget.handlerAccessor(Window, "unload");
     pub const event = bridge.accessor(Window.getEvent, Window.setEvent, .{ .null_as_undefined = true });
     pub const fetch = bridge.function(Window.fetch, .{});
     pub const queueMicrotask = bridge.function(Window.queueMicrotask, .{});
@@ -1249,6 +1206,12 @@ pub const JsApi = struct {
     pub const innerWidth = bridge.accessor(Window.getInnerWidth, Window.setInnerWidth, .{});
     pub const innerHeight = bridge.accessor(Window.getInnerHeight, Window.setInnerHeight, .{});
     pub const devicePixelRatio = bridge.accessor(Window.getDevicePixelRatio, Window.setDevicePixelRatio, .{});
+    pub const outerWidth = bridge.accessor(Window.getOuterWidth, Window.setOuterWidth, .{});
+    pub const outerHeight = bridge.accessor(Window.getOuterHeight, Window.setOuterHeight, .{});
+    pub const screenX = bridge.accessor(Window.getScreenPosition, Window.setScreenX, .{});
+    pub const screenY = bridge.accessor(Window.getScreenPosition, Window.setScreenY, .{});
+    pub const screenLeft = bridge.accessor(Window.getScreenPosition, Window.setScreenLeft, .{});
+    pub const screenTop = bridge.accessor(Window.getScreenPosition, Window.setScreenTop, .{});
 
     pub const opener = bridge.accessor(Window.getOpener, Window.setOpener, .{});
     pub const closed = bridge.accessor(Window.getClosed, null, .{});
@@ -1309,8 +1272,8 @@ pub const JsApi = struct {
 const CrossOriginWindow = struct {
     window: *Window,
 
-    pub fn postMessage(self: *CrossOriginWindow, message: js.Value, target_origin: ?[]const u8, transfer: ?[]const *MessagePort, frame: *Frame) !void {
-        return self.window.postMessage(message, target_origin, transfer, frame);
+    pub fn postMessage(self: *CrossOriginWindow, message: js.Value, target_origin_or_options: ?js.Value, transfer: ?js.Value, frame: *Frame) !void {
+        return self.window.postMessage(message, target_origin_or_options, transfer, frame);
     }
 
     pub fn getTop(self: *CrossOriginWindow, frame: *Frame) Access {
@@ -1354,7 +1317,6 @@ const CrossOriginWindow = struct {
 
         pub const Meta = struct {
             pub const name = "CrossOriginWindow";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 

@@ -23,12 +23,14 @@ const js = @import("../js/js.zig");
 const dump = @import("../dump.zig");
 const Frame = @import("../Frame.zig");
 const Factory = @import("../Factory.zig");
+const StyleManager = @import("../StyleManager.zig");
+const layout = @import("../layout.zig");
 const text_measure = @import("../text_measure.zig");
 
 const CSS = @import("CSS.zig");
 const Node = @import("Node.zig");
-const TreeWalker = @import("TreeWalker.zig");
 const ShadowRoot = @import("ShadowRoot.zig");
+const TreeWalker = @import("TreeWalker.zig");
 const EventTarget = @import("EventTarget.zig");
 const collections = @import("collections.zig");
 const Sanitizer = @import("Sanitizer.zig");
@@ -48,6 +50,7 @@ pub const Reflect = @import("element/reflection.zig").Reflect;
 
 const log = lp.log;
 const String = lp.String;
+const Allocator = std.mem.Allocator;
 
 const Element = @This();
 
@@ -240,13 +243,21 @@ pub fn asConstNode(self: *const Element) *const Node {
     return Factory.protoOf(@constCast(self));
 }
 
-/// TODO: localName and prefix comparison.
-pub fn isEqualNode(self: *Element, other: *Element) bool {
-    const self_tag = self.getTagNameDump();
-    const other_tag = other.getTagNameDump();
-    // Compare namespaces and tags.
-    const dirty = self._namespace != other._namespace or !std.mem.eql(u8, self_tag, other_tag);
-    if (dirty) {
+pub fn isEqualNode(self: *Element, other: *Element, frame: *Frame) bool {
+    if (self._namespace != other._namespace) {
+        return false;
+    }
+
+    // Custom namespace URIs live in a page lookup, not in the enum.
+    if (self._namespace == .unknown and !optionalStringEql(self.getNamespaceUri(frame), other.getNamespaceUri(frame))) {
+        return false;
+    }
+
+    if (!optionalStringEql(self._prefix(), other._prefix())) {
+        return false;
+    }
+
+    if (!std.mem.eql(u8, self.getLocalName(), other.getLocalName())) {
         return false;
     }
 
@@ -254,7 +265,13 @@ pub fn isEqualNode(self: *Element, other: *Element) bool {
         return false;
     }
 
-    return self.asNode().isEqualChildren(other.asNode());
+    return self.asNode().isEqualChildren(other.asNode(), frame);
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    const av = a orelse return b == null;
+    const bv = b orelse return false;
+    return std.mem.eql(u8, av, bv);
 }
 
 pub fn getTagNameLower(self: *const Element) []const u8 {
@@ -346,7 +363,7 @@ pub fn getTagNameLower(self: *const Element) []const u8 {
     }
 }
 
-pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
+pub fn getTagNameSpec(self: *const Element, allocator: Allocator) []const u8 {
     return switch (self._type) {
         .html => blk: {
             const he = self.subtype(Html);
@@ -358,7 +375,7 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                 .br => "BR",
                 .button => "BUTTON",
                 .canvas => "CANVAS",
-                .custom => upperTagName(&he.subtype(Html.Custom)._tag_name, buf),
+                .custom => upperTagName(&he.subtype(Html.Custom)._tag_name, allocator),
                 .data => "DATA",
                 .datalist => "DATALIST",
                 .details => "DETAILS",
@@ -371,8 +388,8 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                 .font => "FONT",
                 .frameset => "FRAMESET",
                 .form => "FORM",
-                .generic => upperTagName(&he.subtype(Html.Generic)._tag_name, buf),
-                .heading => upperTagName(&he.subtype(Html.Heading)._tag_name, buf),
+                .generic => upperTag(he.subtype(Html.Generic)._tag),
+                .heading => upperTag(he.subtype(Html.Heading)._tag),
                 .head => "HEAD",
                 .html => "HTML",
                 .hr => "HR",
@@ -392,7 +409,7 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                     .generic => "MEDIA",
                 },
                 .meter => "METER",
-                .mod => upperTagName(&he.subtype(Html.Mod)._tag_name, buf),
+                .mod => upperTag(he.subtype(Html.Mod)._tag),
                 .object => "OBJECT",
                 .ol => "OL",
                 .optgroup => "OPTGROUP",
@@ -403,7 +420,7 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                 .param => "PARAM",
                 .pre => "PRE",
                 .progress => "PROGRESS",
-                .quote => upperTagName(&he.subtype(Html.Quote)._tag_name, buf),
+                .quote => upperTag(he.subtype(Html.Quote)._tag),
                 .script => "SCRIPT",
                 .select => "SELECT",
                 .slot => "SLOT",
@@ -412,10 +429,10 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                 .style => "STYLE",
                 .table => "TABLE",
                 .table_caption => "CAPTION",
-                .table_cell => upperTagName(&he.subtype(Html.TableCell)._tag_name, buf),
-                .table_col => upperTagName(&he.subtype(Html.TableCol)._tag_name, buf),
+                .table_cell => upperTag(he.subtype(Html.TableCell)._tag),
+                .table_col => upperTag(he.subtype(Html.TableCol)._tag),
                 .table_row => "TR",
-                .table_section => upperTagName(&he.subtype(Html.TableSection)._tag_name, buf),
+                .table_section => upperTag(he.subtype(Html.TableSection)._tag),
                 .template => "TEMPLATE",
                 .textarea => "TEXTAREA",
                 .time => "TIME",
@@ -423,7 +440,7 @@ pub fn getTagNameSpec(self: *const Element, buf: []u8) []const u8 {
                 .track => "TRACK",
                 .ul => "UL",
                 .unknown => switch (self._namespace) {
-                    .html => upperTagName(&he.subtype(Html.Unknown)._tag_name, buf),
+                    .html => upperTagName(&he.subtype(Html.Unknown)._tag_name, allocator),
                     .svg, .xml, .mathml, .unknown, .null => he.subtype(Html.Unknown)._tag_name.str(),
                 },
             };
@@ -549,8 +566,24 @@ pub fn insertAdjacentHTML(
     html_or_xml: []const u8,
     frame: *Frame,
 ) !void {
-    const he = self.is(Html) orelse return error.NotHtmlElement;
-    return he.insertAdjacentHTML(position, html_or_xml, frame);
+    const node = self.asNode();
+
+    // The parse context is the node we insert into
+    const context_node, _ = try node.findAdjacentNodes(position, .html);
+    const context = if (context_node.is(Element)) |el|
+        if (el.is(Html.Html) == null) el else null
+    else
+        null;
+
+    const fragment = (try Node.DocumentFragment.init(node.getDocument(frame), frame)).asNode();
+    try Frame.parse.fragment(frame, fragment, html_or_xml, .{ .context = context });
+
+    const target_node, const prev_node = try node.findAdjacentNodes(position, .html);
+
+    var iter = fragment.childrenIterator();
+    while (iter.next()) |child_node| {
+        _ = try target_node.insertBefore(child_node, prev_node, frame);
+    }
 }
 
 pub fn requestFullscreen(_: *const Element, frame: *Frame) js.Promise {
@@ -779,6 +812,10 @@ pub fn hasAttributeInterned(self: *const Element, comptime name: []const u8) boo
 pub fn hasDisabledConcept(self: *const Element) bool {
     return switch (self.getTag()) {
         .button, .input, .select, .textarea, .optgroup, .option, .fieldset => true,
+        .custom => {
+            const custom = @constCast(self).is(Html.Custom) orelse return false;
+            return custom.isFormAssociated();
+        },
         else => false,
     };
 }
@@ -925,9 +962,15 @@ pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Fram
     }
 
     const shadow_root = try ShadowRoot.init(self, opts, frame);
+    shadow_root._available_to_internals = opts.declarative or blk: {
+        const custom = self.is(Html.Custom) orelse break :blk false;
+        break :blk custom._definition != null;
+    };
     const page = frame.page;
-    try page.element_shadow_roots.put(page.frame_arena, self, shadow_root);
+    try page.element_shadow_roots.put(page.arena, self, shadow_root);
     self._flags.shadow_host = true;
+    // The host's children leave the flat tree until a slot takes them
+    frame.renderingChanged();
     return shadow_root;
 }
 
@@ -1026,7 +1069,7 @@ pub fn getAttributeNames(self: *const Element, frame: *Frame) ![][]const u8 {
 
 pub fn getAttributeNamedNodeMap(self: *Element, frame: *Frame) !*Attribute.NamedNodeMap {
     const page = frame.page;
-    const gop = try page.attribute_named_node_map_lookup.getOrPut(page.frame_arena, @intFromPtr(self));
+    const gop = try page.attribute_named_node_map_lookup.getOrPut(page.arena, @intFromPtr(self));
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(Attribute.NamedNodeMap{ ._element = self });
     }
@@ -1038,7 +1081,7 @@ pub fn getAttributeNamedNodeMap(self: *Element, frame: *Frame) !*Attribute.Named
 pub fn getOrCreateStyle(self: *Element, frame: *Frame) !*CSSStyleProperties {
     const owner = self.ownerFrame(frame) orelse frame;
     const page = frame.page;
-    const gop = try page.element_styles.getOrPut(page.frame_arena, self);
+    const gop = try page.element_styles.getOrPut(page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try CSSStyleProperties.init(self, false, owner);
     }
@@ -1087,11 +1130,11 @@ pub fn setStyle(self: *Element, value: []const u8, frame: *Frame) !void {
 
 pub fn getClassList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
     const page = frame.page;
-    const gop = try page.element_class_lists.getOrPut(page.frame_arena, self);
+    const gop = try page.element_class_lists.getOrPut(page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
             ._element = self,
-            ._attribute_name = comptime .wrap("class"),
+            ._attribute = .class,
         });
     }
     return gop.value_ptr.*;
@@ -1109,11 +1152,11 @@ pub fn setPartList(self: *Element, value: String, frame: *Frame) !void {
 
 pub fn getPartList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
     const page = frame.page;
-    const gop = try page.element_part_lists.getOrPut(page.frame_arena, self);
+    const gop = try page.element_part_lists.getOrPut(page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
             ._element = self,
-            ._attribute_name = comptime .wrap("part"),
+            ._attribute = .part,
         });
     }
     return gop.value_ptr.*;
@@ -1121,11 +1164,11 @@ pub fn getPartList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
 
 pub fn getRelList(self: *Element, frame: *Frame) !*collections.DOMTokenList {
     const page = frame.page;
-    const gop = try page.element_rel_lists.getOrPut(page.frame_arena, self);
+    const gop = try page.element_rel_lists.getOrPut(page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
             ._element = self,
-            ._attribute_name = comptime .wrap("rel"),
+            ._attribute = .rel,
         });
     }
     return gop.value_ptr.*;
@@ -1139,11 +1182,11 @@ pub const TokenListLookup = std.AutoHashMapUnmanaged(TokenListKey, *collections.
 
 pub fn getTokenList(self: *Element, comptime attribute: TokenListAttribute, frame: *Frame) !*collections.DOMTokenList {
     const page = frame.page;
-    const gop = try page.element_token_lists.getOrPut(page.frame_arena, .{ .element = self, .attribute = attribute });
+    const gop = try page.element_token_lists.getOrPut(page.arena, .{ .element = self, .attribute = attribute });
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(collections.DOMTokenList{
             ._element = self,
-            ._attribute_name = comptime .wrap(@tagName(attribute)),
+            ._attribute = @field(collections.DOMTokenList.Attribute, @tagName(attribute)),
         });
     }
     return gop.value_ptr.*;
@@ -1151,7 +1194,7 @@ pub fn getTokenList(self: *Element, comptime attribute: TokenListAttribute, fram
 
 pub fn getDataset(self: *Element, frame: *Frame) !*DOMStringMap {
     const page = frame.page;
-    const gop = try page.element_datasets.getOrPut(page.frame_arena, self);
+    const gop = try page.element_datasets.getOrPut(page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = try frame._factory.create(DOMStringMap{
             ._element = self,
@@ -1160,53 +1203,12 @@ pub fn getDataset(self: *Element, frame: *Frame) !*DOMStringMap {
     return gop.value_ptr.*;
 }
 
-pub fn replaceChildren(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    return self.asNode().replaceChildren(nodes, frame);
+pub fn replaceChildren(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceChildren(nodes.values, frame);
 }
 
-pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    const ref_node = self.asNode();
-    const parent = ref_node._parent orelse return;
-    frame.domChanged();
-
-    // Detect if the ref_node must be removed (by default) or kept.
-    // We kept it when ref_node is present into the nodes list.
-    var rm_ref_node = true;
-
-    for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(self.getDocument(frame));
-
-        // If a child is the ref node. We keep it at its own current position.
-        if (child == ref_node) {
-            rm_ref_node = false;
-            continue;
-        }
-
-        // A DocumentFragment contributes its children, not itself
-        if (child.is(Node.DocumentFragment)) |_| {
-            try frame.insertAllChildrenBefore(child, parent, ref_node);
-            continue;
-        }
-
-        var previous_root: ?*Node = null;
-        if (child._parent) |current_parent| {
-            previous_root = child.getRootNode(.{});
-            frame.removeNode(current_parent, child, .{ .reconnect_to = parent });
-        }
-
-        try frame.insertNodeRelative(
-            parent,
-            child,
-            .{ .before = ref_node },
-            .{ .previous_root = previous_root },
-        );
-    }
-
-    // Re-check parent after insertNodeRelative since callbacks (e.g. connectedCallback)
-    // could have already removed ref_node from parent.
-    if (rm_ref_node and ref_node._parent == parent) {
-        frame.removeNode(parent, ref_node, .{ .reconnect_to = null });
-    }
+pub fn replaceWith(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceWithNodes(nodes.values, frame);
 }
 
 pub fn remove(self: *Element, frame: *Frame) void {
@@ -1225,19 +1227,35 @@ pub fn isSvgLink(self: *Element) bool {
     return self.is(Svg.Graphics.A) != null and self.svgAnchorHref() != null;
 }
 
+// The contenteditable attribute's own state: true for the true and
+// plaintext-only states, false for false, null for inherit (no attribute,
+// or an invalid value). The attribute only applies to HTML elements.
+pub fn contentEditableState(self: *Element) ?bool {
+    if (self.is(Html) == null) {
+        return null;
+    }
+    const value = self.getAttributeInterned("contenteditable") orelse return null;
+    if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "plaintext-only")) {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "false")) {
+        return false;
+    }
+    return null;
+}
+
 // An editing host takes focus like a form control does.
 pub fn isEditingHost(self: *Element) bool {
-    const value = self.getAttributeInterned("contenteditable") orelse return false;
-    return std.ascii.eqlIgnoreCase(value, "false") == false;
+    return self.contentEditableState() orelse false;
 }
 
 // An editing host or a descendant of one: the nearest contenteditable
-// attribute decides.
+// attribute in a true or false state decides.
 pub fn isEditable(self: *Element) bool {
     var current: ?*Element = self;
     while (current) |el| : (current = el.parentElement()) {
-        if (el.getAttributeInterned("contenteditable") != null) {
-            return el.isEditingHost();
+        if (el.contentEditableState()) |editable| {
+            return editable;
         }
     }
     return false;
@@ -1252,7 +1270,7 @@ fn isNativelyFocusable(self: *Element) bool {
     return switch (self.getTag()) {
         .button, .select, .textarea, .iframe => true,
         .input => self.as(Html.Input)._input_type != .hidden,
-        .anchor, .area => self.getAttributeInterned("href") != null,
+        .a, .area => self.getAttributeInterned("href") != null,
         else => false,
     };
 }
@@ -1308,25 +1326,7 @@ pub fn focus(self: *Element, frame: *Frame) !void {
         return;
     }
 
-    // The focus chain runs through navigable containers: each <iframe> holding
-    // the focused document is the focused area of its parent document, so the
-    // parent's activeElement is that <iframe>. Like Chrome, ancestors blur
-    // their previous element first, and the <iframe> itself gets no focus events.
-    // https://html.spec.whatwg.org/multipage/interaction.html#focus-chain
-    var child = owner;
-    while (child.iframe) |container| {
-        const parent = child.parent orelse break;
-        const parent_doc = parent.document;
-        const old = parent_doc._active_element;
-        if (old == container.asElement()) {
-            break;
-        }
-        parent_doc.setActiveElement(container.asElement(), parent);
-        if (old) |o| {
-            _ = try blurFocusedArea(o, null, parent);
-        }
-        child = parent;
-    }
+    try focusFrameAncestors(owner);
 
     if (already_active) {
         return;
@@ -1348,6 +1348,29 @@ pub fn focus(self: *Element, frame: *Frame) !void {
     // Dispatch focusin on new element (bubbles, composed)
     const focusin_event = try FocusEvent.initTrusted(comptime .wrap("focusin"), .{ .bubbles = true, .composed = true, .relatedTarget = old_related }, owner);
     try owner._event_manager.dispatch(new_target, focusin_event.asEvent());
+}
+
+/// Establish the iframe containers of a focused element or document viewport.
+pub fn focusFrameAncestors(owner: *Frame) !void {
+    // The focus chain runs through navigable containers: each <iframe> holding
+    // the focused document is the focused area of its parent document, so the
+    // parent's activeElement is that <iframe>. Like Chrome, ancestors blur
+    // their previous element first, and the <iframe> itself gets no focus events.
+    // https://html.spec.whatwg.org/multipage/interaction.html#focus-chain
+    var child = owner;
+    while (child.iframe) |container| {
+        const parent = child.parent orelse break;
+        const parent_doc = parent.document;
+        const old = parent_doc._active_element;
+        if (old == container.asElement()) {
+            break;
+        }
+        parent_doc.setActiveElement(container.asElement(), parent);
+        if (old) |o| {
+            _ = try blurFocusedArea(o, null, parent);
+        }
+        child = parent;
+    }
 }
 
 // `old` just lost focus in `frame`'s document. When it's an <iframe> holding
@@ -1378,6 +1401,12 @@ fn dispatchBlur(old: *Element, related: ?*EventTarget, frame: *Frame) !void {
     const FocusEvent = @import("event/FocusEvent.zig");
     const old_target = old.asEventTarget();
 
+    if (old.is(Html.Input)) |input| {
+        try input.dispatchChangeIfEdited(frame);
+    } else if (old.is(Html.TextArea)) |textarea| {
+        try textarea.dispatchChangeIfEdited(frame);
+    }
+
     const blur_event = try FocusEvent.initTrusted(comptime .wrap("blur"), .{ .composed = true, .relatedTarget = related }, frame);
     try frame._event_manager.dispatch(old_target, blur_event.asEvent());
 
@@ -1399,34 +1428,34 @@ pub fn getChildren(self: *Element, frame: *Frame) !collections.NodeLive(.child_e
     return collections.NodeLive(.child_elements).init(self.asNode(), {}, frame);
 }
 
-pub fn append(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    return self.asNode().appendNodes(nodes, frame);
+pub fn append(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().appendNodes(nodes.values, frame);
 }
 
-pub fn prepend(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    return self.asNode().prependNodes(nodes, frame);
+pub fn prepend(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().prependNodes(nodes.values, frame);
 }
 
 pub fn moveBefore(self: *Element, node: js.Value, child: js.Value, frame: *Frame) !void {
     return self.asNode().moveBefore(node, child, frame);
 }
 
-pub fn before(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn before(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const node = self.asNode();
     const parent = node.parentNode() orelse return;
 
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(self.getDocument(frame));
         _ = try parent.insertBefore(child, node, frame);
     }
 }
 
-pub fn after(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn after(self: *Element, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const node = self.asNode();
     const parent = node.parentNode() orelse return;
-    const viable_next = Node.NodeOrText.viableNextSibling(node, nodes);
+    const viable_next = Node.NodeOrText.viableNextSibling(node, nodes.values);
 
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(self.getDocument(frame));
         _ = try parent.insertBefore(child, viable_next, frame);
     }
@@ -1496,7 +1525,9 @@ pub fn getAnimations(_: *const Element) []*Animation {
 }
 
 pub fn animate(_: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
-    return Animation.init(frame);
+    const animation = try Animation.init(frame);
+    try animation.play(frame);
+    return animation;
 }
 
 pub fn closest(self: *Element, input: []const u8, frame: *Frame) !?*Element {
@@ -1538,6 +1569,11 @@ pub fn hasPointerEventsNone(self: *Element, frame: *Frame) bool {
 pub fn isVisible(self: *Element, frame: *Frame) bool {
     const owner = self.ownerFrame(frame) orelse return false;
     return !owner._style_manager.isHidden(self, .{});
+}
+
+fn computedPosition(self: *Element, frame: *Frame) StyleManager.Position {
+    const owner = self.ownerFrame(frame) orelse return .static;
+    return owner._style_manager.position(self);
 }
 
 const CheckVisibilityOpts = struct {
@@ -1661,6 +1697,11 @@ fn viewportAxis(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
 
 // Caller must have made sure self is visible.
 pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    if (axis == .width) {
+        const owner = self.ownerFrame(frame) orelse return self.getElementAxis(frame, .width).value;
+        return layout.boxWidth(self, owner);
+    }
+
     const own = self.getElementAxis(frame, axis);
     if (own.explicit) {
         // an explicitly set value always wins
@@ -1671,7 +1712,6 @@ pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
         // html/body return their set value regardless of children.
         return own.value;
     }
-
     return @max(own.value, self.contentAxis(frame, axis));
 }
 
@@ -1691,11 +1731,22 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
 
 // Some cases need the bounding rect but have already done the visibility check.
 pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+    const origin = self.clientOrigin(frame);
     return .{
-        .x = self.horizontalPosition(frame),
-        .y = calculateDocumentPosition(self.asNode()),
+        .x = origin.x,
+        .y = origin.y,
         .width = self.boxAxis(frame, .width),
         .height = self.boxAxis(frame, .height),
+    };
+}
+
+// Client rects are viewport-relative: offset the faux-layout document
+// position by the owning window's scroll position.
+pub fn clientOrigin(self: *Element, frame: *Frame) struct { x: f64, y: f64 } {
+    const window = (self.ownerFrame(frame) orelse frame).window;
+    return .{
+        .x = self.horizontalPosition(frame) - @as(f64, @floatFromInt(window.getScrollX())),
+        .y = calculateDocumentPosition(self.asNode(), frame) - @as(f64, @floatFromInt(window.getScrollY())),
     };
 }
 
@@ -1748,7 +1799,8 @@ pub fn scrollContainer(self: *Element, axes: ScrollAxes, frame: *Frame) ScrollTa
     const owner = self.ownerFrame(frame) orelse return .viewport;
     const style_manager = &owner._style_manager;
     var current: ?*Element = self;
-    while (current) |el| : (current = el.parentElement()) {
+    // Shadow content scrolls its host's containers: walk the flat tree.
+    while (current) |el| : (current = el.asNode().flatTreeParentElement(frame)) {
         if (el.isRootContainer()) break;
         const scrolls = style_manager.overflowAxes(el);
         if ((axes.x and scrolls.x) or (axes.y and scrolls.y)) {
@@ -1786,15 +1838,14 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
         return 0.0;
     }
 
-    const width = self.getElementAxis(frame, .width).value;
-
     // Roots don't sum their children side by side. The root scroller
     // reports what the viewport scrolls over.
     if (self.isRootContainer()) {
-        return self.rootScrollSize(frame, .width) orelse width;
+        return self.rootScrollSize(frame, .width) orelse self.getElementAxis(frame, .width).value;
     }
 
-    return @max(width, self.contentAxis(frame, .width));
+    const owner = self.ownerFrame(frame) orelse return self.getElementAxis(frame, .width).value;
+    return @max(layout.boxWidth(self, owner), layout.contentWidth(self, .clipped, owner));
 }
 
 /// Null where we can't prove a limit, which leaves the offset unbounded:
@@ -1821,9 +1872,8 @@ fn scrollExtent(self: *Element, frame: *Frame, comptime axis: Axis) ?f64 {
 // The dummy layout engine has no line-breaking, and an element only overflows
 // horizontally when its children don't wrap (white-space:nowrap, a flex row, an
 // inline-block strip), so the single-row assumption covers the case that
-// matters. We can't detect the layout mode to do better: existingStyle() sees only
-// the inline `style=` attribute, and the computed cascade resolves stylesheet
-// rules for `display:none` and `visibility` alone.
+// matters. We don't detect the layout mode to do better: the cascade resolves
+// too few properties to lay out lines.
 //
 // Only direct children are measured, never the whole subtree. This runs on
 // every size read, and recursing would make an element's cost O(subtree)
@@ -1846,12 +1896,16 @@ pub fn contentAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
     if (axis == .height) {
         const width = self.getElementAxis(frame, .width);
         if (width.explicit) {
-            wrap = .{ .line_width = width.value, .font_size = style_manager.computedFontSize(self) };
+            wrap = .{
+                .line_width = width.value,
+                .font_size = style_manager.computedFontSize(self),
+                .white_space = style_manager.whiteSpace(self),
+            };
         }
     }
 
-    var child = self.asNode().firstChild();
-    while (child) |node| : (child = node.nextSibling()) {
+    var children: TreeWalker.FlatChildren = .init(self.asNode(), .{ .frame = frame });
+    while (children.next()) |node| {
         if (node.is(Element)) |el| {
             if (!style_manager.hasDisplayNone(el)) {
                 total += el.getElementAxis(frame, axis).value;
@@ -1889,7 +1943,7 @@ pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
     if (!self.isVisible(frame)) {
         return 0.0;
     }
-    return calculateDocumentPosition(self.asNode());
+    return calculateDocumentPosition(self.asNode(), frame);
 }
 
 pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
@@ -1909,11 +1963,10 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
         else => {},
     }
 
-    const self_position = self.positionStyle(frame);
-    if (std.mem.eql(u8, self_position, "fixed")) {
+    const self_position = self.computedPosition(frame);
+    if (self_position == .fixed) {
         return null;
     }
-    const self_static = self_position.len == 0 or std.mem.eql(u8, self_position, "static");
 
     var node: ?*Node = self.asNode()._parent;
     while (node) |n| {
@@ -1928,21 +1981,15 @@ pub fn getOffsetParent(self: *Element, frame: *Frame) ?*Element {
         if (tag == .body) {
             return ancestor;
         }
-        const position = ancestor.positionStyle(frame);
-        if (position.len > 0 and !std.mem.eql(u8, position, "static")) {
+        if (ancestor.computedPosition(frame) != .static) {
             return ancestor;
         }
-        if (self_static and (tag == .td or tag == .th or tag == .table)) {
+        if (self_position == .static and (tag == .td or tag == .th or tag == .table)) {
             return ancestor;
         }
         node = n._parent;
     }
     return null;
-}
-
-fn positionStyle(self: *Element, frame: *Frame) []const u8 {
-    const style = self.inlineStyle(frame) orelse return "";
-    return style.asCSSStyleDeclaration().getPropertyValue("position", frame);
 }
 
 pub fn getClientTop(_: *Element) f64 {
@@ -1979,18 +2026,17 @@ pub fn getClientLeft(_: *Element) f64 {
 // - Linear scaling: 5px per node
 // - Perfect document order, guaranteed unique positions
 // - Compact coordinates (1000 nodes ≈ 5,000px)
-fn calculateDocumentPosition(node: *Node) f64 {
+fn calculateDocumentPosition(node: *Node, frame: *const Frame) f64 {
     var position: f64 = 0.0;
     var current = node;
 
     // Walk up to root, counting preceding nodes
-    while (current.parentNode()) |parent| {
+    while (current.flatParent(frame)) |parent| {
         // Count all previous siblings and their descendants
-        var sibling = parent.firstChild();
-        while (sibling) |s| {
+        var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
+        while (siblings.next()) |s| {
             if (s == current) break;
-            position += countSubtreeNodes(s);
-            sibling = s.nextSibling();
+            position += countSubtreeNodes(s, frame);
         }
 
         // Count the parent itself
@@ -2001,11 +2047,11 @@ fn calculateDocumentPosition(node: *Node) f64 {
     return position * 5.0; // 5px per node
 }
 
-// Counts total nodes in a subtree (node + all descendants)
-fn countSubtreeNodes(node: *Node) f64 {
+// Counts total nodes in a flat-tree subtree (node + all descendants)
+fn countSubtreeNodes(node: *Node, frame: *const Frame) f64 {
     var count: f64 = 0;
-    var tw = TreeWalker.Full.init(node, .{});
-    while (tw.next()) |_| {
+    var walker: TreeWalker.Flat = .init(node, .{ .frame = frame });
+    while (walker.next()) |_| {
         count += 1;
     }
     return count;
@@ -2027,14 +2073,14 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
         x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
     }
 
-    while (current.parentNode()) |parent| {
+    while (current.flatParent(frame)) |parent| {
         if (parent.is(Element)) |el| {
             if (el.inlineStyle(frame)) |style| {
                 x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
             }
         }
-        var sibling = parent.firstChild();
-        while (sibling) |s| : (sibling = s.nextSibling()) {
+        var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
+        while (siblings.next()) |s| {
             if (s == current) break;
             if (s.is(Element)) |el| {
                 if (!style_manager.hasDisplayNone(el)) {
@@ -2069,7 +2115,7 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: 
     if (self._namespace == .unknown) {
         const page = document._page;
         if (page.element_namespace_uris.get(self)) |uri| {
-            try page.element_namespace_uris.put(page.frame_arena, node.as(Element), uri);
+            try page.element_namespace_uris.put(page.arena, node.as(Element), uri);
         }
     }
 
@@ -2104,10 +2150,10 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: 
 
 pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
     _ = center_if_needed;
-    const y = calculateDocumentPosition(self.asNode());
+    const y = calculateDocumentPosition(self.asNode(), frame);
     const scroll_y: f64 = @floatFromInt(frame.window.getScrollY());
     const viewport_height: f64 = @floatFromInt(frame.window.getInnerHeight(frame));
-    if (y >= scroll_y and y <= scroll_y + viewport_height) {
+    if (y >= scroll_y and y < scroll_y + viewport_height) {
         return;
     }
     self.scrollIntoView(null, frame);
@@ -2122,7 +2168,7 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) 
     // Scroll the window so the element's top is brought into the viewport.
     // Positions come from the faux-layout document position (top = preorder
     // depth-scaled y), the same source getBoundingClientRect uses.
-    const y = calculateDocumentPosition(self.asNode());
+    const y = calculateDocumentPosition(self.asNode(), frame);
     frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
 }
 
@@ -2207,7 +2253,7 @@ fn writeScroll(self: *Element, write: ScrollWrite, frame: *Frame) !bool {
         return false;
     }
 
-    const gop = try owner.page.element_scroll_positions.getOrPut(owner.page.frame_arena, self);
+    const gop = try owner.page.element_scroll_positions.getOrPut(owner.page.arena, self);
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
@@ -2325,13 +2371,31 @@ pub fn format(self: *Element, writer: *std.Io.Writer) !void {
     try writer.writeByte('>');
 }
 
-fn upperTagName(tag_name: *String, buf: []u8) []const u8 {
-    if (tag_name.len > buf.len) {
-        log.info(.dom, "tag.long.name", .{ .name = tag_name.str() });
-        return tag_name.str();
-    }
+// Falls back to the stored name when the copy can't be allocated, e.g. a long
+// name and a caller's fixed buffer.
+fn upperTagName(tag_name: *String, allocator: Allocator) []const u8 {
     const tag = tag_name.str();
-    return std.ascii.upperString(buf, tag);
+    return std.ascii.allocUpperString(allocator, tag) catch {
+        log.info(.dom, "tag.long.name", .{ .name = tag });
+        return tag;
+    };
+}
+
+// For the element types that store a Tag, whose name is always @tagName(tag).
+fn upperTag(tag: Tag) []const u8 {
+    @setEvalBranchQuota(10_000);
+    return switch (tag) {
+        inline else => |t| comptime upperLiteral(@tagName(t)),
+    };
+}
+
+fn upperLiteral(comptime lower: []const u8) *const [lower.len]u8 {
+    comptime {
+        var upper: [lower.len]u8 = undefined;
+        _ = std.ascii.upperString(&upper, lower);
+        const final = upper;
+        return &final;
+    }
 }
 
 pub fn getTag(self: *const Element) Tag {
@@ -2339,7 +2403,7 @@ pub fn getTag(self: *const Element) Tag {
         .html => blk: {
             const he = self.subtype(Html);
             break :blk switch (he._type) {
-                .anchor => .anchor,
+                .anchor => .a,
                 .area => .area,
                 .base => .base,
                 .div => .div,
@@ -2352,7 +2416,7 @@ pub fn getTag(self: *const Element) Tag {
                 .datalist => .datalist,
                 .details => .details,
                 .dialog => .dialog,
-                .directory => .directory,
+                .directory => .dir,
                 .iframe => .iframe,
                 .img => .img,
                 .br => .br,
@@ -2422,8 +2486,8 @@ pub fn ownerFrame(self: *const Element, frame: *const Frame) ?*Frame {
 }
 
 pub const Tag = enum {
+    a,
     address,
-    anchor,
     audio,
     area,
     aside,
@@ -2448,8 +2512,8 @@ pub const Tag = enum {
     del,
     dfn,
     dialog,
+    dir,
     div,
-    directory,
     dl,
     dt,
     embed,
@@ -2506,7 +2570,7 @@ pub const Tag = enum {
     polyline,
     pre,
     progress,
-    quote,
+    q,
     rect,
     s,
     script,
@@ -2544,6 +2608,8 @@ pub const Tag = enum {
         const tag = std.meta.stringToEnum(Tag, lower) orelse return null;
         return switch (tag) {
             .unknown, .custom => null,
+            // groupings, not element names (h1-h6, audio/video)
+            .heading, .media => null,
             else => tag,
         };
     }
@@ -2569,6 +2635,15 @@ pub const Tag = enum {
             else => false,
         };
         // zig fmt: on
+    }
+
+    // Replaced elements and form controls: sized by what they show, never
+    // stretched to their container.
+    pub fn isReplacedOrControl(self: Tag) bool {
+        return switch (self) {
+            .img, .iframe, .canvas, .video, .audio, .media, .object, .embed, .svg, .input, .select, .textarea, .button, .meter, .progress => true,
+            else => false,
+        };
     }
 
     pub fn isMetadata(self: Tag) bool {
@@ -2610,24 +2685,16 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Element";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const tagName = bridge.accessor(_tagName, null, .{});
     fn _tagName(self: *Element, frame: *Frame) []const u8 {
-        return self.getTagNameSpec(&frame.buf);
+        return self.getTagNameSpec(frame.local_arena);
     }
     // the frame-aware variant returns the original URI for namespaces
     // outside the built-in set instead of the placeholder
     pub const namespaceURI = bridge.accessor(Element.getNamespaceUri, null, .{});
-
-    pub const innerText = bridge.accessor(_innerText, Element.setInnerText, .{ .ce_reactions = true });
-    fn _innerText(self: *Element, frame: *Frame) ![]const u8 {
-        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
-        try self.getInnerText(&buf.writer, frame);
-        return buf.written();
-    }
 
     pub const outerHTML = bridge.accessor(_getOuterHTML, _setOuterHTML, .{ .ce_reactions = true });
     fn _getOuterHTML(self: *Element, frame: *Frame) ![]const u8 {
@@ -2750,7 +2817,7 @@ pub const JsApi = struct {
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
     pub const part = bridge.accessor(Element.getPartList, Element.setPartList, .{ .ce_reactions = true });
     pub const dataset = bridge.accessor(Element.getDataset, null, .{});
-    pub const style = bridge.accessor(Element.getOrCreateStyle, Element.setStyle, .{});
+    pub const style = bridge.accessor(Element.getOrCreateStyle, Element.setStyle, .{ .ce_reactions = true });
     pub const attributes = bridge.accessor(Element.getAttributeNamedNodeMap, null, .{});
     pub const hasAttribute = bridge.function(Element.hasAttribute, .{});
     pub const hasAttributeNS = bridge.function(Element.hasAttributeNS, .{});

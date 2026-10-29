@@ -16,8 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
-
 const js = @import("../js/js.zig");
 const Frame = @import("../Frame.zig");
 const EventTarget = @import("EventTarget.zig");
@@ -64,7 +62,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Screen";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -81,7 +78,6 @@ pub const Orientation = struct {
     pub const Proto = EventTarget;
 
     _proto: *EventTarget,
-    _on_change: ?js.Function.Global = null,
 
     pub fn init(frame: *Frame) !*Orientation {
         return frame._factory.eventTarget(Orientation{
@@ -91,13 +87,6 @@ pub const Orientation = struct {
 
     pub fn asEventTarget(self: *Orientation) *EventTarget {
         return self._proto;
-    }
-
-    pub fn inlineHandler(self: *const Orientation, typ: lp.String) ?js.Function.Global {
-        if (typ.eql(comptime .wrap("change"))) {
-            return self._on_change;
-        }
-        return null;
     }
 
     const LockType = enum {
@@ -136,20 +125,11 @@ pub const Orientation = struct {
     // Nothing is ever locked.
     fn unlock(_: *Orientation) void {}
 
-    fn getOnChange(self: *const Orientation) ?js.Function.Global {
-        return self._on_change;
-    }
-
-    fn setOnChange(self: *Orientation, cb: ?js.Function.Global) void {
-        self._on_change = cb;
-    }
-
     pub const JsApi = struct {
         pub const bridge = js.Bridge(Orientation);
 
         pub const Meta = struct {
             pub const name = "ScreenOrientation";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -157,6 +137,6 @@ pub const Orientation = struct {
         pub const @"type" = bridge.accessor(Orientation.getType, null, .{});
         pub const lock = bridge.function(Orientation.lock, .{});
         pub const unlock = bridge.function(Orientation.unlock, .{});
-        pub const onchange = bridge.accessor(Orientation.getOnChange, Orientation.setOnChange, .{});
+        pub const onchange = EventTarget.handlerAccessor(Orientation, "change");
     };
 };

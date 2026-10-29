@@ -10,9 +10,9 @@
         },
         // .v8 = .{ .path = "../zig-v8-fork" },
         .brotli = .{
-            // v1.2.0
-            .url = "https://github.com/google/brotli/archive/028fb5a23661f123017c060daa546b55cf4bde29.tar.gz",
-            .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
+            // v1.2.1
+            .url = "https://github.com/google/brotli/archive/db24a98aed38a16de78cc05ca15cdd8dc2a0d92d.tar.gz",
+            .hash = "N-V-__8AAHajKgD1oXsbBWLJka_y0ZSKZnQaTc6L-KURx6-j",
         },
         .zlib = .{
             .url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz",
@@ -32,20 +32,20 @@
         },
         // .@"boringssl-zig" = .{ .path = "../boringssl-zig" },
         .curl = .{
-            .url = "https://github.com/curl/curl/releases/download/curl-8_22_0/curl-8.22.0.tar.gz",
-            .hash = "N-V-__8AALJXUwHr71AwttzhEqqYTvFb_jz0EQ5Ou3OWpHBM",
+            .url = "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz",
+            .hash = "N-V-__8AAMjlVwH79yAHsK65VUcPuhOO6BWgpLDvvnlWPLly",
         },
         .sqlite3 = .{
             .url = "https://sqlite.org/2026/sqlite-amalgamation-3530200.zip",
             .hash = "N-V-__8AALc_rgC04POe18O0LKFRm4ouQpLtL3riscEmWp-Q",
         },
         .zenai = .{
-            .url = "git+https://github.com/lightpanda-io/zenai.git#85f9e359096a82732d59d2f1d96777cb31615daf",
-            .hash = "zenai-0.0.0-iOY_VASbBwCT391IzMrstG7bV8ExUlIhqMDEtcs4dc4N",
+            .url = "git+https://github.com/lightpanda-io/zenai.git#1de895f6a44facc789d7b1af8f9d8b1b6f5a2798",
+            .hash = "zenai-0.0.0-iOY_VAJHCQBfwIoPimnpcHayNdwoN8gHtUkr6ui5lMi0",
         },
         .isocline = .{
-            .url = "git+https://github.com/arrufat/isocline#4a99434bee4a5ed04c1639514224d48cd55e1405",
-            .hash = "N-V-__8AAHxtEwB16xj2Xz-zx_uklGdTP5C2-GHXDoSzah-8",
+            .url = "git+https://github.com/arrufat/isocline#41bb0c5380950b90440e74215c3e0e4821b8bbce",
+            .hash = "N-V-__8AAJVvEwAkVMvqVhi4hrCdFIzrefNcsl_OrnW1q_E4",
         },
         .pcre2 = .{
             .url = "git+https://github.com/PCRE2Project/pcre2#9ad4a2e956876747a5022bf04614c7e39e71d4ec",

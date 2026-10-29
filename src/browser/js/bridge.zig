@@ -93,28 +93,6 @@ pub fn Builder(comptime T: type) type {
             }
             @compileError("Property for " ++ @typeName(@TypeOf(value)) ++ " hasn't been defined yet");
         }
-
-        const PrototypeChainEntry = @import("TaggedOpaque.zig").PrototypeChainEntry;
-        pub fn prototypeChain() [prototypeChainLength(T)]PrototypeChainEntry {
-            var entries: [prototypeChainLength(T)]PrototypeChainEntry = undefined;
-
-            entries[0] = .{ .offset = 0, .index = JsApiLookup.getId(T.JsApi) };
-
-            if (entries.len == 1) {
-                return entries;
-            }
-
-            var Prototype = T;
-            inline for (entries[1..]) |*entry| {
-                const Next = PrototypeType(Prototype).?;
-                entry.* = .{
-                    .index = JsApiLookup.getId(Next.JsApi),
-                    .offset = Factory.protoOffset(Prototype),
-                };
-                Prototype = Next;
-            }
-            return entries;
-        }
     };
 }
 
@@ -230,9 +208,8 @@ pub const Function = struct {
                 break;
             }
 
-            // A slice of js.Value is always bound as variadic (see
-            // Caller.getArgs) and variadics contribute 0 to length.
-            if (@typeInfo(PT) == .pointer and @typeInfo(PT).pointer.size == .slice and @typeInfo(PT).pointer.child == js.Value) {
+            // a rest parameter contributes 0 to length
+            if (@typeInfo(PT) == .@"struct" and @hasDecl(PT, "js_variadic")) {
                 break;
             }
             count += 1;
@@ -743,10 +720,6 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
 
     const local = &caller.local;
 
-    var hs: js.HandleScope = undefined;
-    hs.init(local.isolate);
-    defer hs.deinit();
-
     const property: []const u8 = js.String.toSlice(.{ .local = local, .handle = @ptrCast(c_name.?) }) catch {
         return js.Intercepted.no;
     };
@@ -755,7 +728,7 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
     switch (local.ctx.global) {
         .frame => |frame| {
             const document = frame.document;
-            if (document.getElementById(property, frame)) |el| {
+            if (document.getElementById(property)) |el| {
                 const js_val = local.zigValueToJs(el, .{}) catch return js.Intercepted.no;
                 var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
                 pc.getReturnValue().set(js_val);
@@ -891,22 +864,6 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
 //         };
 //     }
 // }
-
-// Given a Type, returns the length of the prototype chain, including self
-fn prototypeChainLength(comptime T: type) usize {
-    var l: usize = 1;
-    var Next = T;
-    while (PrototypeType(Next)) |N| {
-        Next = N;
-        l += 1;
-    }
-    return l;
-}
-
-// Given a Type, gets its prototype Type (if any)
-fn PrototypeType(comptime T: type) ?type {
-    return reflect.Proto(T);
-}
 
 fn flattenTypes(comptime Types: []const type) [countFlattenedTypes(Types)]type {
     @setEvalBranchQuota(10_000);
@@ -1155,6 +1112,8 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/element/html/UL.zig"),
     @import("../webapi/element/html/Unknown.zig"),
     @import("../webapi/element/html/ValidityState.zig"),
+    @import("../webapi/ElementInternals.zig"),
+    @import("../webapi/CustomStateSet.zig"),
     @import("../webapi/element/Svg.zig"),
     @import("../webapi/element/svg/Generic.zig"),
     @import("../webapi/element/svg/Graphics.zig"),
@@ -1219,16 +1178,20 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/event/MessageEvent.zig"),
     @import("../webapi/event/ProgressEvent.zig"),
     @import("../webapi/event/NavigationCurrentEntryChangeEvent.zig"),
+    @import("../webapi/event/NavigateEvent.zig"),
     @import("../webapi/event/PageTransitionEvent.zig"),
     @import("../webapi/event/PopStateEvent.zig"),
     @import("../webapi/event/HashChangeEvent.zig"),
     @import("../webapi/event/MediaQueryListEvent.zig"),
+    @import("../webapi/event/AnimationPlaybackEvent.zig"),
     @import("../webapi/event/BeforeUnloadEvent.zig"),
     @import("../webapi/event/StorageEvent.zig"),
     @import("../webapi/event/DeviceMotionEvent.zig"),
     @import("../webapi/event/GamepadEvent.zig"),
     @import("../webapi/event/DeviceOrientationEvent.zig"),
     @import("../webapi/event/TouchEvent.zig"),
+    @import("../webapi/event/Touch.zig"),
+    @import("../webapi/event/TouchList.zig"),
     @import("../webapi/event/UIEvent.zig"),
     @import("../webapi/event/MouseEvent.zig"),
     @import("../webapi/event/PointerEvent.zig"),
@@ -1251,8 +1214,12 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/ServiceWorkerContainer.zig"),
     @import("../webapi/ServiceWorkerRegistration.zig"),
     @import("../webapi/media/MediaError.zig"),
+    @import("../webapi/media/TextTrack.zig"),
     @import("../webapi/media/TextTrackCue.zig"),
+    @import("../webapi/media/TextTrackCueList.zig"),
+    @import("../webapi/media/TextTrackList.zig"),
     @import("../webapi/media/VTTCue.zig"),
+    @import("../webapi/media/VTTRegion.zig"),
     @import("../webapi/animation/Animation.zig"),
     @import("../webapi/EventTarget.zig"),
     @import("../webapi/Location.zig"),
@@ -1299,6 +1266,10 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/geolocation/GeolocationPosition.zig"),
     @import("../webapi/geolocation/GeolocationCoordinates.zig"),
     @import("../webapi/geolocation/GeolocationPositionError.zig"),
+    @import("../webapi/payment/PaymentRequest.zig"),
+    @import("../webapi/payment/PaymentResponse.zig"),
+    @import("../webapi/payment/PaymentRequestUpdateEvent.zig"),
+    @import("../webapi/payment/PaymentMethodChangeEvent.zig"),
     @import("../webapi/CustomElementRegistry.zig"),
     @import("../webapi/ResizeObserver.zig"),
     @import("../webapi/IdleDeadline.zig"),
@@ -1313,6 +1284,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/navigation/Navigation.zig"),
     @import("../webapi/navigation/NavigationHistoryEntry.zig"),
     @import("../webapi/navigation/NavigationActivation.zig"),
+    @import("../webapi/navigation/NavigationDestination.zig"),
     @import("../webapi/canvas/CanvasRenderingContext2D.zig"),
     @import("../webapi/canvas/WebGLRenderingContext.zig"),
     @import("../webapi/canvas/OffscreenCanvas.zig"),
@@ -1320,6 +1292,7 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/canvas/TextMetrics.zig"),
     @import("../webapi/canvas/CanvasGradient.zig"),
     @import("../webapi/canvas/CanvasPattern.zig"),
+    @import("../webapi/canvas/Path2D.zig"),
     @import("../webapi/SubtleCrypto.zig"),
     @import("../webapi/CryptoKey.zig"),
     @import("../webapi/Selection.zig"),
@@ -1329,7 +1302,42 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/XPathEvaluator.zig"),
     @import("../webapi/collections/DOMStringList.zig"),
     @import("../webapi/Sanitizer.zig"),
+    @import("../webapi/Lock.zig"),
+    @import("../webapi/LockManager.zig"),
+    @import("../webapi/webcodecs/encoded_chunk.zig"),
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoColorSpace.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/webcodecs/AudioDecoder.zig"),
+    @import("../webapi/webcodecs/AudioEncoder.zig"),
+    @import("../webapi/webcodecs/VideoDecoder.zig"),
+    @import("../webapi/webcodecs/VideoEncoder.zig"),
+    @import("../webapi/webaudio/AudioBuffer.zig"),
+    @import("../webapi/webaudio/AudioParam.zig"),
+    @import("../webapi/webaudio/PeriodicWave.zig"),
+    @import("../webapi/webaudio/BaseAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioContext.zig"),
+    @import("../webapi/webaudio/OfflineAudioCompletionEvent.zig"),
+    @import("../webapi/webaudio/AudioNode.zig"),
+    @import("../webapi/webaudio/AudioDestinationNode.zig"),
+    @import("../webapi/webaudio/AudioScheduledSourceNode.zig"),
+    @import("../webapi/webaudio/AudioBufferSourceNode.zig"),
+    @import("../webapi/webaudio/ConstantSourceNode.zig"),
+    @import("../webapi/webaudio/OscillatorNode.zig"),
+    @import("../webapi/webaudio/GainNode.zig"),
+    @import("../webapi/webaudio/DynamicsCompressorNode.zig"),
 });
+
+const webcodecs_apis = [_]type{
+    @import("../webapi/webcodecs/encoded_chunk.zig"),
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoColorSpace.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/webcodecs/AudioDecoder.zig"),
+    @import("../webapi/webcodecs/AudioEncoder.zig"),
+    @import("../webapi/webcodecs/VideoDecoder.zig"),
+    @import("../webapi/webcodecs/VideoEncoder.zig"),
+};
 
 // APIs available on EVERY worker global — dedicated, shared and service. This
 // is the WebIDL `[Exposed=Worker]` set, which covers all three. Each kind's
@@ -1397,6 +1405,7 @@ const worker_common_apis = [_]type{
     @import("../webapi/canvas/TextMetrics.zig"),
     @import("../webapi/canvas/CanvasGradient.zig"),
     @import("../webapi/canvas/CanvasPattern.zig"),
+    @import("../webapi/canvas/Path2D.zig"),
     @import("../webapi/net/WebSocket.zig"),
     @import("../webapi/net/EventSource.zig"),
     @import("../webapi/FileReader.zig"),
@@ -1414,6 +1423,8 @@ const worker_common_apis = [_]type{
     @import("../webapi/MessageChannel.zig"),
     @import("../webapi/MessagePort.zig"),
     @import("../webapi/collections/DOMStringList.zig"),
+    @import("../webapi/Lock.zig"),
+    @import("../webapi/LockManager.zig"),
 };
 
 // Additionally available on a dedicated or shared worker, but NOT on a service
@@ -1428,7 +1439,7 @@ const worker_extended_apis = worker_common_apis ++ [_]type{
     @import("../webapi/FileReaderSync.zig"),
 };
 
-pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/DedicatedWorkerGlobalScope.zig")} ++ worker_extended_apis));
+pub const DedicatedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/DedicatedWorkerGlobalScope.zig")} ++ worker_extended_apis ++ webcodecs_apis));
 pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedWorkerGlobalScope.zig")} ++ worker_extended_apis));
 
 pub const ServiceWorkerJsApis = flattenTypes(&([_]type{

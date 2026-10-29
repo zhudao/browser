@@ -1,5 +1,47 @@
 <!DOCTYPE html>
-<body></body>
+<body><script id="worker_transfer_port" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./port-worker.js');
+
+    const channel = new MessageChannel();
+    // queued before the transfer: moves with port2 into the worker
+    channel.port1.postMessage('early');
+
+    const replies = [];
+    channel.port1.onmessage = (e) => {
+      replies.push(e.data);
+      if (replies.length === 1) {
+        channel.port1.postMessage('late');
+      } else {
+        // the worker transferred a port of its own back to us
+        workerPort.postMessage('to worker');
+      }
+    };
+
+    let workerPort = null;
+    worker.onmessage = (e) => {
+      if (e.data.port) {
+        workerPort = e.data.port;
+      } else {
+        state.resolve({ replies, back: e.data.back, ports: e.ports.length });
+      }
+    };
+
+    worker.postMessage({ port: channel.port2 }, [channel.port2]);
+
+    await state.done((result) => {
+      testing.expectEqual(2, result.replies.length);
+      testing.expectEqual('early', result.replies[0].echo);
+      testing.expectEqual(1, result.replies[0].ports);
+      testing.expectEqual(true, result.replies[0].same);
+      testing.expectEqual('late', result.replies[1].echo);
+      testing.expectEqual('to worker', result.back);
+      testing.expectEqual(0, result.ports);
+    });
+  }
+</script>
+</body>
 <script src="../testing.js"></script>
 
 <script id="worker_creation">
@@ -283,6 +325,7 @@
       testing.expectEqual(true, r.permissions_distinct);
       testing.expectEqual('geolocation', r.permission_name);
       testing.expectEqual('prompt', r.permission_state);
+      testing.expectEqual(true, r.permission_is_target);
 
       // StorageManager (transitive: StorageManager -> StorageEstimate)
       testing.expectEqual(0, r.storage_usage);
@@ -584,7 +627,7 @@
     worker.postMessage('throw');
 
     await state.done((data) => {
-      testing.expectEqual('listener,onmessage,reentrant,setTimeout', data.seen.join(','));
+      testing.expectEqual('listener,onmessage,queueMicrotask,reentrant,setTimeout', data.seen.join(','));
       testing.expectEqual(1, data.reentrant);
       worker.terminate();
     });

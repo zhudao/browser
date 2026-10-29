@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
 const ParsedNode = @import("Parser.zig").ParsedNode;
 
 pub extern "c" fn html5ever_parse_document(
@@ -65,11 +66,20 @@ pub extern "c" fn html5ever_parse_document_with_encoding(
     allow_declarative_shadow: bool,
 ) void;
 
+// Namespace of the fragment parse context element, matched by
+// html5ever_parse_fragment.
+pub const ContextNamespace = enum(u8) {
+    html = 0,
+    svg = 1,
+    mathml = 2,
+};
+
 pub extern "c" fn html5ever_parse_fragment(
     html: [*c]const u8,
     len: usize,
     context_name: [*c]const u8,
     context_name_len: usize,
+    context_ns: ContextNamespace,
     doc: *anyopaque,
     ctx: *anyopaque,
     createElementCallback: *const fn (ctx: *anyopaque, data: *anyopaque, QualName, AttributeIterator) callconv(.c) ?*anyopaque,
@@ -223,8 +233,19 @@ pub extern "c" fn xml5ever_parse_document(
     allow_declarative_shadow: bool,
 ) void;
 
+pub extern "c" fn xml5ever_validate_document(
+    xml: [*c]const u8,
+    len: usize,
+    ctx: *anyopaque,
+    parseErrorCallback: *const fn (ctx: *anyopaque, StringSlice) callconv(.c) void,
+) void;
+
+// 0: no reference starts with `name`, 1: `name` is a prefix of one,
+// 2: `name` is one, its codepoints are in `out` (out[1] == 0 for a single one).
+pub extern "c" fn html5ever_named_character_reference(name: [*]const u8, len: usize, out: *[2]u32) u8;
+
 // General encoding api
-const EncodingInfo = extern struct {
+pub const EncodingInfo = extern struct {
     found: u8,
     handle: ?*anyopaque,
     name_len: usize,
@@ -240,7 +261,51 @@ const EncodingInfo = extern struct {
         }
         return self.name_ptr[0..self.name_len];
     }
+
+    /// The encoding `label` names, if it names one.
+    pub fn forLabel(label: ?[]const u8) ?EncodingInfo {
+        const l = label orelse return null;
+        const info = encoding_for_label(l.ptr, l.len);
+        return if (info.isValid()) info else null;
+    }
+
+    pub fn utf8() EncodingInfo {
+        return forLabel("utf-8").?;
+    }
+
+    pub fn isUtf8(self: *const EncodingInfo) bool {
+        return std.mem.eql(u8, self.name(), "UTF-8");
+    }
+
+    pub fn isUtf16(self: *const EncodingInfo) bool {
+        const n = self.name();
+        return std.mem.eql(u8, n, "UTF-16LE") or std.mem.eql(u8, n, "UTF-16BE");
+    }
 };
+
+/// `input` as valid UTF-8 without a BOM: `input` itself when it already is
+/// and `encoding` is UTF-8, else decoded with `decodeToUtf8`.
+pub fn validUtf8(allocator: std.mem.Allocator, encoding: EncodingInfo, input: []const u8) ![]const u8 {
+    // A UTF-16 BOM is never valid UTF-8, so only the UTF-8 one needs a check.
+    if (encoding.isUtf8() and
+        !std.mem.startsWith(u8, input, "\xEF\xBB\xBF") and
+        std.unicode.utf8ValidateSlice(input))
+    {
+        return input;
+    }
+    return decodeToUtf8(allocator, encoding.handle.?, input);
+}
+
+/// Decodes `input` from the encoding `handle` names into UTF-8. A BOM
+/// switches to the encoding it marks and is dropped.
+pub fn decodeToUtf8(allocator: std.mem.Allocator, handle: *anyopaque, input: []const u8) ![]const u8 {
+    if (input.len == 0) {
+        return "";
+    }
+    const out = try allocator.alloc(u8, encoding_max_utf8_buffer_length(handle, input.len));
+    const result = encoding_decode(handle, input.ptr, input.len, out.ptr, out.len, 1);
+    return out[0..result.bytes_written];
+}
 
 const DecodeResult = extern struct {
     had_errors: u8,
@@ -284,6 +349,13 @@ pub extern "c" fn encoding_decoder_decode(
 ) DecodeResult;
 
 pub extern "c" fn encoding_decoder_free(decoder: *anyopaque) void;
+
+pub extern "c" fn encoding_decoder_max_utf8_buffer_length(decoder: *anyopaque, input_len: usize) usize;
+
+// A decoder in caller-owned memory, never freed (see lib.rs).
+pub extern "c" fn encoding_decoder_size() usize;
+pub extern "c" fn encoding_decoder_align() usize;
+pub extern "c" fn encoding_decoder_init(handle: *anyopaque, out: *anyopaque) u8;
 
 // Encoding API (UTF-8 to legacy encoding with NCR fallback)
 const EncodeResult = extern struct {

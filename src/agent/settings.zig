@@ -31,7 +31,7 @@ const string = @import("../string.zig");
 const auth = @import("auth/auth.zig");
 const Candidate = zenai.provider.Candidate;
 
-pub const api_keys_hint = "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN, AI_GATEWAY_API_KEY, MISTRAL_API_KEY, or OPENROUTER_API_KEY (Vertex AI: VERTEX_API_KEY, or GOOGLE_CLOUD_PROJECT via gcloud; Codex: a ChatGPT subscription via /provider codex)";
+pub const api_keys_hint = "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, HF_TOKEN, AI_GATEWAY_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY, or XAI_API_KEY (Vertex AI: VERTEX_API_KEY, or GOOGLE_CLOUD_PROJECT via gcloud; Codex: a ChatGPT subscription via /provider codex)";
 
 /// Determine which provider to use and read its env key. Returns null
 /// only when no `--provider` was given AND no env key exists (the caller
@@ -451,6 +451,20 @@ test "parseRemembered: search_engine field round-trips" {
     defer arena.deinit();
     const remembered = parseRemembered(testing.allocator, arena.allocator(), ".{ .model = \"m\", .search_engine = .brave }").?;
     try testing.expect(remembered.search_engine == .brave);
+}
+
+test "parseRemembered: effort .null round-trips as a value, not an absent field" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.zon.stringify.serialize(Remembered{ .model = "m", .effort = .null }, .{}, &w);
+    var src: [257]u8 = undefined;
+    @memcpy(src[0..w.buffered().len], w.buffered());
+    src[w.buffered().len] = 0;
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const remembered = parseRemembered(testing.allocator, arena.allocator(), src[0..w.buffered().len :0]).?;
+    try testing.expect(remembered.effort.? == .null);
 }
 
 test "resolveSearchEngine: default auto, remembered wins" {

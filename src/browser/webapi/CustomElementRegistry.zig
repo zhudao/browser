@@ -45,14 +45,8 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
 
     // Parse and validate extends option
     const extends_tag: ?Element.Tag = if (options.extends) |extends_name| blk: {
-        const tag = std.meta.stringToEnum(Element.Tag, extends_name) orelse return error.NotSupported;
-
-        // Can't extend custom elements
-        if (tag == .custom) {
-            return error.NotSupported;
-        }
-
-        break :blk tag;
+        // null for custom elements, unknown names and Tag groupings (heading, media)
+        break :blk Element.Tag.parseForMatch(extends_name) orelse return error.NotSupported;
     } else null;
 
     // Do not use getOrPut here to hold the GetOrPut entry until we need to write
@@ -78,13 +72,14 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
             var js_arr = observed_attrs.toArray();
             for (0..js_arr.len()) |i| {
                 const attr_val = js_arr.get(@intCast(i)) catch continue;
-                const attr_name = attr_val.toStringSliceWithAlloc(frame.arena) catch continue;
-                definition.observed_attributes.put(frame.arena, attr_name, {}) catch continue;
+                const attr_name = attr_val.toStringSliceWithAlloc(frame.page_arena) catch continue;
+                definition.observed_attributes.put(frame.page_arena, attr_name, {}) catch continue;
             }
         }
     }
 
-    // Read disabledFeatures static property: ["shadow"] makes attachShadow throw.
+    // Read disabledFeatures static property: ["shadow"] makes attachShadow throw
+    // ["internals"] makes attachInternals throw.
     if (constructor.getPropertyValue("disabledFeatures") catch null) |disabled| {
         if (disabled.isArray()) {
             var js_arr = disabled.toArray();
@@ -93,12 +88,18 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
                 const feature = val.toSSO(false) catch continue;
                 if (feature.eql(comptime .wrap("shadow"))) {
                     definition.disable_shadow = true;
+                } else if (feature.eql(comptime .wrap("internals"))) {
+                    definition.disable_internals = true;
                 }
             }
         }
     }
 
-    const gop = try self._definitions.getOrPut(frame.arena, owned_name);
+    if (constructor.getPropertyValue("formAssociated") catch null) |form_associated| {
+        definition.form_associated = form_associated.toBool();
+    }
+
+    const gop = try self._definitions.getOrPut(frame.page_arena, owned_name);
     if (gop.found_existing) {
         return error.NotSupported;
     }
@@ -163,7 +164,7 @@ pub fn whenDefined(self: *CustomElementRegistry, name: []const u8, frame: *Frame
 
     try validateName(name);
 
-    const gop = try self._when_defined.getOrPut(frame.arena, name);
+    const gop = try self._when_defined.getOrPut(frame.page_arena, name);
     if (gop.found_existing) {
         return local.toLocal(gop.value_ptr.*).promise();
     }
@@ -275,6 +276,12 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
     const connected = node.isConnected();
     custom._connected_callback_invoked = connected;
     custom._disconnected_callback_invoked = connected == false;
+
+    if (definition.form_associated) {
+        try custom.registerFormAssociated(frame);
+        custom._upgrade_in_progress = false;
+        custom.formStateChanged(frame);
+    }
 }
 
 fn upgradeFailed(custom: *Custom) void {
@@ -332,7 +339,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "CustomElementRegistry";
         pub var class_id: bridge.ClassId = undefined;
-        pub const prototype_chain = bridge.prototypeChain();
     };
 
     pub const define = bridge.function(CustomElementRegistry.define, .{ .ce_reactions = true });
@@ -344,5 +350,13 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: CustomElementRegistry" {
+    if (comptime lp.IS_DEBUG) {
+        // Our reaction stack is per frame. The test opens the scope in the
+        // caller's frame, but attributeChange queues the reaction on the
+        // element's frame. When those differ, the reaction goes into the
+        // backup queue. We should probably move it from the Frame to the Page.
+        // this only logs in debug
+        testing.expectLog(&.{ .bug, .bug, .bug });
+    }
     try testing.htmlRunner("custom_elements", .{});
 }

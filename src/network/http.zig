@@ -30,6 +30,11 @@ const repeat = @import("../string.zig").repeat;
 
 const log = lp.log;
 const posix = std.posix;
+const Allocator = std.mem.Allocator;
+
+// Tests run several processes, each with its own ephemeral test servers, while
+// fixtures keep addressing the fixed ports. Routes those to the real ones.
+pub var test_connect_to: ?*libcurl.CurlSList = null;
 
 pub const readfunc_pause = libcurl.curl_readfunc_pause;
 pub const writefunc_error = libcurl.curl_writefunc_error;
@@ -70,7 +75,7 @@ pub const Header = struct {
         value: []const u8,
     };
 
-    pub fn normalize(self: Header, allocator: std.mem.Allocator) !Header {
+    pub fn normalize(self: Header, allocator: Allocator) !Header {
         return .{
             .name = try std.ascii.allocLowerString(allocator, self.name),
             .value = try allocator.dupe(u8, self.value),
@@ -277,6 +282,11 @@ pub const Connection = struct {
         return self;
     }
 
+    // Survives curl_easy_reset, so once per easy is enough.
+    pub fn setDnsShare(self: *const Connection, share: *const DnsShare) !void {
+        try libcurl.curl_easy_setopt(self._easy, .share, share.handle);
+    }
+
     pub fn deinit(self: *Connection) void {
         self.clearHeaders();
         libcurl.curl_easy_cleanup(self._easy);
@@ -344,7 +354,7 @@ pub const Connection = struct {
     // "name;" when the value is empty — curl reads "name:" as
     // remove-this-header and the ";" form as send-an-empty-value. curl
     // copies the string, so `allocator` only backs the transient join.
-    pub fn addHeader(self: *Connection, allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    pub fn addHeader(self: *Connection, allocator: Allocator, name: []const u8, value: []const u8) !void {
         const joined = if (value.len == 0)
             try allocator.printSentinel("{s};", .{name}, 0)
         else
@@ -392,6 +402,12 @@ pub const Connection = struct {
     pub fn setConnectOnly(self: *const Connection, connect_only: bool) !void {
         const value: c_long = if (connect_only) 2 else 0;
         try libcurl.curl_easy_setopt(self._easy, .connect_only, value);
+    }
+
+    // Keep a proxy's CONNECT response out of the header callback, so it only
+    // sees the origin's.
+    pub fn setSuppressConnectHeaders(self: *const Connection) !void {
+        try libcurl.curl_easy_setopt(self._easy, .suppress_connect_headers, true);
     }
 
     // Close this connection when the transfer ends instead of returning it to
@@ -457,6 +473,10 @@ pub const Connection = struct {
         // even if we don't support it, and then it won't be decompressed.
         // empty string means: use whatever's available
         try libcurl.curl_easy_setopt(self._easy, .accept_encoding, "");
+
+        if (comptime lp.IS_TEST) {
+            try libcurl.curl_easy_setopt(self._easy, .connect_to, test_connect_to);
+        }
 
         // proxy
         const http_proxy = config.httpProxy();
@@ -631,6 +651,13 @@ pub const Connection = struct {
         return @intCast(@max(0, size));
     }
 
+    // Bytes of every response header received, status lines included.
+    pub fn getHeaderSize(self: *const Connection) !u64 {
+        var size: c_long = undefined;
+        try libcurl.curl_easy_getinfo(self._easy, .header_size, &size);
+        return @intCast(@max(0, size));
+    }
+
     pub fn getHttpVersion(self: *const Connection) !libcurl.CurlHttpVersion {
         var version: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .http_version, &version);
@@ -656,7 +683,7 @@ pub const Connection = struct {
     }
 
     // Copies the response headers, names lowercased, into `allocator`.
-    pub fn collectResponseHeaders(self: *const Connection, allocator: std.mem.Allocator) ![]const Header {
+    pub fn collectResponseHeaders(self: *const Connection, allocator: Allocator) ![]const Header {
         var list: std.ArrayList(Header) = .empty;
         var prev: ?*libcurl.CurlHeader = null;
         while (libcurl.curl_easy_nextheader(self._easy, .header, -1, prev)) |h| {
@@ -711,6 +738,60 @@ pub const Connection = struct {
     }
 };
 
+// A DNS cache, using curl_share. Connection sharing isn't support and TLS
+// is limited to 25 hosts (so caching it would be worse than then 25 host per
+// multi we currently have).
+pub const DnsShare = struct {
+    handle: *libcurl.CurlSH,
+    dns_mutex: std.Io.Mutex = .init,
+    share_mutex: std.Io.Mutex = .init,
+
+    pub fn init(allocator: Allocator) !*DnsShare {
+        // needs to be on the heap, libcurl takes the address as user_data
+        const self = try allocator.create(DnsShare);
+        errdefer allocator.destroy(self);
+
+        const handle = libcurl.curl_share_init() orelse return error.FailedToInitializeShare;
+        errdefer libcurl.curl_share_cleanup(handle) catch {};
+
+        self.* = .{ .handle = handle };
+        try libcurl.curl_share_setopt(handle, .share, .dns);
+        try libcurl.curl_share_setopt(handle, .lock_function, &lock);
+        try libcurl.curl_share_setopt(handle, .unlock_function, &unlock);
+        try libcurl.curl_share_setopt(handle, .user_data, self);
+        return self;
+    }
+
+    // Every easy using the share must be cleaned up first.
+    pub fn deinit(self: *DnsShare, allocator: Allocator) void {
+        libcurl.curl_share_cleanup(self.handle) catch |err| {
+            // An easy still points at us: leak rather than free under it.
+            log.err(.http, "curl_share_cleanup", .{ .err = err });
+            return;
+        };
+        allocator.destroy(self);
+    }
+
+    fn lock(_: ?*libcurl.Curl, data: libcurl.CurlLockData, _: libcurl.CurlLockAccess, ptr: ?*anyopaque) callconv(.c) void {
+        const self: *DnsShare = @ptrCast(@alignCast(ptr));
+        self.mutexFor(data).lockUncancelable(lp.io);
+    }
+
+    fn unlock(_: ?*libcurl.Curl, data: libcurl.CurlLockData, ptr: ?*anyopaque) callconv(.c) void {
+        const self: *DnsShare = @ptrCast(@alignCast(ptr));
+        self.mutexFor(data).unlock(lp.io);
+    }
+
+    fn mutexFor(self: *DnsShare, data: libcurl.CurlLockData) *std.Io.Mutex {
+        return switch (data) {
+            .dns => &self.dns_mutex,
+            .share => &self.share_mutex,
+            // curl only locks the types we share
+            _ => unreachable,
+        };
+    }
+};
+
 pub const Handles = struct {
     multi: *libcurl.CurlM,
 
@@ -719,9 +800,12 @@ pub const Handles = struct {
         errdefer libcurl.curl_multi_cleanup(multi) catch {};
 
         try libcurl.curl_multi_setopt(multi, .max_host_connections, config.httpMaxHostOpen());
-        // Default is 4x the attached easy handles, i.e. ~0 between page loads,
-        // so keepalive connections were evicted on every cross-site navigation.
-        try libcurl.curl_multi_setopt(multi, .max_connects, 4 * @as(u32, config.httpMaxConcurrent()));
+        // --http-max-concurrent is dynamic (based on --cdp-max-connections in
+        // serve), so we don't want this to be based on that, since it could
+        // result in an unexpected large # of keepalive connection. Instead, we
+        // hard-code 160, which used to be the default when --cdp-max-connections
+        // was fixed (and it seemed to be safe/work well, so why mess with it?)
+        try libcurl.curl_multi_setopt(multi, .max_connects, 160);
 
         return .{ .multi = multi };
     }

@@ -298,6 +298,13 @@ fn resolveParsedLength(parsed: Parsed, element: *Element, direction: Direction, 
     return parsed.value * factor;
 }
 
+/// Resolves one length as written in an attribute, in user units relative to
+/// `element`. Null when it doesn't parse.
+pub fn resolve(raw: []const u8, element: *Element, direction: Direction, frame: *Frame) ?f64 {
+    const parsed = parse(raw) catch return null;
+    return resolveParsedLength(parsed, element, direction, frame, 0);
+}
+
 fn fontSize(self: *const Length, frame: *Frame) f64 {
     const element = self._element orelse return StyleManager.DEFAULT_FONT_SIZE;
     return elementFontSize(element, frame);
@@ -331,7 +338,7 @@ fn fromShared(unit: units.Unit) ?Unit {
         .in => .in,
         .pt => .pt,
         .pc => .pc,
-        .vh, .vw, .deg, .rad, .grad, .turn => null,
+        .rem, .vh, .vw, .deg, .rad, .grad, .turn => null,
     };
 }
 
@@ -371,7 +378,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "SVGLength";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

@@ -5,6 +5,7 @@
     \\
     \\The commands are:
     \\  agent       starts an interactive AI agent that can browse the web
+    \\  completion  prints a shell completion script (bash, fish, zsh)
     \\  fetch       fetches the specified URL
     \\  help        displays this message
     \\  mcp         starts an MCP (Model Context Protocol) server (stdio or HTTP)
@@ -45,6 +46,10 @@
     \\          cookies.txt format written by curl and wget). The format is
     \\          detected from the file's contents.
     \\          Defaults to no cookie loading.
+    \\  --cookie-jar <PATH>
+    \\          Path to a JSON file to save cookies to when a CDP browser context
+    \\          closes (write-only). With several clients, the last to close wins.
+    \\          Defaults to no cookie saving.
     \\  --disable-metrics
     \\          Disables the /metrics endpoint (Prometheus text format).
     \\          Defaults to false (the endpoint is exposed).
@@ -67,6 +72,16 @@
     \\              cdp        Chrome DevTools Protocol (WebSocket on /).
     \\              webdriver  WebDriver BiDi (WebSocket on /session) plus the
     \\                         classic WebDriver session endpoints.
+    \\  --remote-allow-origins <ORIGIN>
+    \\          Origin (e.g. http://localhost:3000) allowed in the Origin header
+    \\          of CDP and BiDi WebSocket upgrades, or * to allow any. Can be
+    \\          passed multiple times. Upgrades without an Origin header are
+    \\          always accepted.
+    \\          Defaults to none, rejecting any upgrade that sends an Origin.
+    \\  --unix-socket <PATH>
+    \\          Listen on this Unix-domain socket (mode 0600) instead of TCP.
+    \\          Must be absolute. Cannot be combined with --host, --port or
+    \\          --advertise-host.
     ,
     .fetch =
     \\usage: {0s} fetch <url>... [OPTIONS] [COMMON_OPTIONS]
@@ -96,6 +111,8 @@
     \\                                 PNG image (base64 with --json).
     \\              semantic_tree      JSON-serialized semantic tree.
     \\              semantic_tree_text Pruned plain-text semantic tree.
+    \\              structured_data    JSON-LD, OpenGraph, Twitter card, meta
+    \\                                 and link tags as JSON.
     \\  --dump-max-bytes <INT>
     \\          Soft cap on the dumped html or markdown, in bytes. Output is cut
     \\          at a UTF-8 boundary and a '[truncated]' marker is appended.
@@ -123,6 +140,16 @@
     \\          "error" field: null, or the name of the navigation, wait or
     \\          dump failure for that URL. One failed URL does not stop the
     \\          others; the process exits 1 if any URL failed.
+    \\  --markdown-alternate
+    \\          With --dump markdown, when a page links a markdown version of
+    \\          itself (<link rel="alternate" type="text/markdown">), dump that
+    \\          file instead of converting the page. The file is the author's
+    \\          and can differ from the rendered page. Falls back to converting
+    \\          the page when there is no such link or it does not load as
+    \\          markdown (text/markdown, or text/plain since many servers send
+    \\          .md files that way). The alternate's URL is logged; with
+    \\          --json, "url" is where the markdown came from. The alternate
+    \\          loads within what is left of --wait-ms. Defaults to false.
     \\  --metrics
     \\          Write metrics (Prometheus text format) to stdout on exit, after
     \\          any --dump output.
@@ -198,6 +225,11 @@
     \\  --host <HOST>
     \\          Host to bind when --port is set (e.g. 0.0.0.0 for all interfaces).
     \\          Defaults to "127.0.0.1".
+    \\  --http-session-timeout <INT>
+    \\          Seconds before an idle HTTP session (--port) is closed. A later
+    \\          request with its Mcp-Session-Id gets 404, so the client starts
+    \\          a new session. The default session is never closed.
+    \\          Defaults to 0, which disables it (sessions live until closed).
     \\  --port <INT>
     \\          Serve MCP over HTTP on this port instead of stdio. Clients POST
     \\          JSON-RPC to /mcp; route requests to a session with the
@@ -316,8 +348,12 @@
     \\          Write one JSON line per step to PATH: each model call (latency,
     \\          input, cached and output tokens) and each tool call (arguments,
     \\          latency, result size, page URL and HTTP status), then a summary.
-    \\          Arguments keep their $LP_* placeholders; results are not written.
-    \\          Overwrites PATH if it exists.
+    \\          Arguments keep their $LP_* placeholders; results are not written
+    \\          unless --trace-results is set. Overwrites PATH if it exists.
+    \\  --trace-results
+    \\          Also write each tool result's text to the --trace file, as the
+    \\          model received it. Pages can be large and may hold personal
+    \\          data, so this is off by default. Requires --trace.
     \\  --url <URL>
     \\          Open this page before the first turn. With --task it saves the
     \\          model a turn spent navigating; with --save the opening
@@ -370,6 +406,18 @@
     \\          Checks whether a newer release of {0s} is available. When one is
     \\          found, prints the running version, the latest release, and how to
     \\          update.
+    ,
+    .completion =
+    \\usage: {0s} completion <bash | fish | zsh>
+    \\
+    \\Prints a shell completion script for {0s} to stdout.
+    \\
+    \\Examples:
+    \\  {0s} completion fish | source
+    \\  {0s} completion fish > ~/.config/fish/completions/{0s}.fish
+    \\  {0s} completion bash > ~/.local/share/bash-completion/completions/{0s}
+    \\  {0s} completion zsh > ~/.zfunc/_{0s}
+    \\          then add `fpath=(~/.zfunc $fpath)` before `compinit` in ~/.zshrc
     ,
     .help =
     \\usage: {0s} help
@@ -429,14 +477,19 @@
     \\          Defaults to none enabled.
     \\  --load-resources <RESOURCE>
     \\          Sub-resource to actually request. Can be passed multiple times.
-    \\          Defaults to requesting none of them.
+    \\          Defaults to stylesheet for mcp and agent, and to none of them
+    \\          otherwise. Passing it replaces the default.
     \\          Allowed values:
+    \\             beacon      Send navigator.sendBeacon requests. Page navigation
+    \\                         cancels inflight beacons.
+    \\
     \\             iframe      When enabled, <iframe> elements are fully loaded.
     \\
     \\             image       <img> sources, so that load/error reflects the real
-    \\                         HTTP status. Only the response headers are read;
-    \\                         images are never decoded, so naturalWidth and
-    \\                         naturalHeight stay 0. Delays the window load event.
+    \\                         HTTP status. Images are never decoded: only the
+    \\                         first 16KB is read, for naturalWidth and
+    \\                         naturalHeight (PNG, GIF, JPEG and WebP; 0 for
+    \\                         other formats). Delays the window load event.
     \\
     \\             stylesheet  Fetch external <link rel=stylesheet> resources so
     \\                         their rules contribute to computed styles (and
@@ -447,6 +500,8 @@
     \\                         disabled, the Worker constructor still returns a
     \\                         Worker, but no script fetch is initiated and the
     \\                         Worker never runs.
+    \\
+    \\             none        Request none of them, overriding the default.
     \\  --http-cache-dir <PATH>
     \\          Directory used as a filesystem cache for network resources. Omitting
     \\          this disables caching.
@@ -460,7 +515,7 @@
     \\          Time in ms to establish an HTTP connection before timing out. 0 means
     \\          never.
     \\          Defaults to 8000.
-    \\  --http-curves
+    \\  --http-curves <CURVES>
     \\          Colon-separated key exchange groups offered in the TLS handshake,
     \\          in preference order, e.g. "X25519:P-256:P-384". Passed to
     \\          libcurl's CURLOPT_SSL_EC_CURVES.
@@ -477,8 +532,10 @@
     \\          perfectly well what you are doing.
     \\          Script set headers via CDP or JS can't override a CLI set header.
     \\  --http-max-concurrent <INT>
-    \\          Maximum number of concurrent HTTP requests.
-    \\          Defaults to 40.
+    \\          Maximum number of concurrent HTTP requests, shared by every
+    \\          session.
+    \\          Defaults to 40. For serve, defaults to 8 per
+    \\          --cdp-max-connections with a min of 40 and a max of 256.
     \\  --http-max-host-open <INT>
     \\          Maximum open connections to a given host:port.
     \\          Defaults to 6.
@@ -572,6 +629,9 @@
     \\          Defaults to [a very generous] 30000, disable by setting to 0.
     \\  --web-bot-auth-domain <DOMAIN>
     \\          Your domain, e.g. yourdomain.com.
+    \\          Sends Signature-Agent: "https://<DOMAIN>". The key directory
+    \\          is served at /.well-known/http-message-signatures-directory
+    \\          on that origin.
     \\  --web-bot-auth-key-file <PATH>
     \\          Path to the Ed25519 private key PEM file.
     \\  --web-bot-auth-keyid <STRING>

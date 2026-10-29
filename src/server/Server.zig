@@ -61,6 +61,7 @@ const WS_READ_BUDGET = 256 * 1024;
 app: *App,
 io_engine: IOEngine,
 listener: posix.socket_t,
+unix_path: ?[:0]const u8,
 
 listener_paused: bool,
 
@@ -70,6 +71,7 @@ listener_paused: bool,
 max_connections: usize,
 
 advertise_host: ?[]const u8,
+remote_allow_origins: []const []const u8,
 
 // the protocols (cdp/bidi) we support
 protocols: Protocols,
@@ -122,7 +124,12 @@ bidi_session_url: []const u8,
 
 json_version_response: []const u8,
 
-pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
+pub const Address = union(enum) {
+    ip: sys_net.IpAddress,
+    unix: [:0]const u8, // Absolute path, validated by Config
+};
+
+pub fn init(app: *App, address: Address) !*Server {
     const config = app.config;
     const allocator = app.allocator;
 
@@ -132,47 +139,42 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
     var scratch = try std.Io.Writer.Allocating.initCapacity(allocator, 8192);
     errdefer scratch.deinit();
 
-    var json_version_response: []const u8 = "";
-    var bidi_session_url: []const u8 = "";
-
     const max_connections = fdBudget(config);
 
-    const listener = blk: {
-        const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
-        const l = try sys_net.socket(sys_net.family(&address), flags, posix.IPPROTO.TCP);
-        errdefer sys_net.close(l);
-
-        try posix.setsockopt(l, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-        if (@hasDecl(posix.TCP, "NODELAY")) {
-            try posix.setsockopt(l, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
-        }
-
-        const sa = sys_net.sockaddrFromAddress(&address);
-        try sys_net.bind(l, sa.ptr(), sa.len);
-        {
-            // look this up incase --port 0 was used
-            var bound: posix.sockaddr.storage = undefined;
-            var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-            try sys_net.getsockname(l, @ptrCast(&bound), &bound_len);
-            const bound_address = sys_net.addressFromSockaddr(@ptrCast(&bound));
-
-            json_version_response = try http.buildJSONVersionResponse(app, bound_address.getPort());
-            errdefer allocator.free(json_version_response);
-
-            bidi_session_url = try allocator.print("ws://{s}:{d}/session/", .{ config.advertiseHost(), bound_address.getPort() });
-            errdefer allocator.free(bidi_session_url);
-
-            try sys_net.listen(l, config.maxPendingConnections());
-            log.note(.note, "server running", .{
-                .address = bound_address,
-                .max_connections = max_connections,
-                .max_browser_connections = config.maxConnections(),
-            });
-        }
-
-        break :blk l;
+    const listener = switch (address) {
+        .ip => |ip| try listenIp(ip, config.maxPendingConnections()),
+        .unix => |path| try listenUnix(path, config.maxPendingConnections()),
     };
-    errdefer sys_net.close(listener);
+    const unix_path: ?[:0]const u8 = switch (address) {
+        .ip => null,
+        .unix => |path| path,
+    };
+    errdefer closeListener(listener, unix_path);
+
+    const ws_url = switch (address) {
+        .ip => try allocator.print("ws://{s}:{d}/", .{ config.advertiseHost(), (try sys_net.boundAddress(listener)).getPort() }),
+        .unix => |path| try allocator.print("ws+unix://{s}:/", .{path}),
+    };
+    defer allocator.free(ws_url);
+
+    const json_version_response = try http.buildJSONVersionResponse(app, ws_url);
+    errdefer allocator.free(json_version_response);
+
+    const bidi_session_url = try allocator.print("{s}session/", .{ws_url});
+    errdefer allocator.free(bidi_session_url);
+
+    switch (address) {
+        .ip => log.note(.note, "server running", .{
+            .address = try sys_net.boundAddress(listener),
+            .max_connections = max_connections,
+            .max_browser_connections = config.maxConnections(),
+        }),
+        .unix => |path| log.note(.note, "server running", .{
+            .path = path,
+            .max_connections = max_connections,
+            .max_browser_connections = config.maxConnections(),
+        }),
+    }
 
     var http_connection_pool = try Connection.Pool.init(app);
     errdefer http_connection_pool.deinit();
@@ -207,6 +209,7 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
         .app = app,
         .io_engine = io_engine,
         .listener = listener,
+        .unix_path = unix_path,
         .listener_paused = false,
         .scratch = scratch,
         .request_arena = std.heap.ArenaAllocator.init(allocator),
@@ -227,8 +230,56 @@ pub fn init(app: *App, address: sys_net.IpAddress) !*Server {
         .shutdown_begun = false,
         .worker_wg = .{},
         .advertise_host = config.explicitAdvertiseHost(),
+        .remote_allow_origins = config.remoteAllowOrigins(),
     };
     return self;
+}
+
+fn listenIp(address: sys_net.IpAddress, backlog: u31) !posix.socket_t {
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const l = try sys_net.socket(sys_net.family(&address), flags, posix.IPPROTO.TCP);
+    errdefer sys_net.close(l);
+
+    try posix.setsockopt(l, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    if (@hasDecl(posix.TCP, "NODELAY")) {
+        try posix.setsockopt(l, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
+    }
+
+    const sa = sys_net.sockaddrFromAddress(&address);
+    try sys_net.bind(l, sa.ptr(), sa.len);
+    try sys_net.listen(l, backlog);
+    return l;
+}
+
+// An existing file at `path` fails the bind with AddressInUse: it may be
+// another server's socket, so it is never removed.
+fn listenUnix(path: [:0]const u8, backlog: u31) !posix.socket_t {
+    var sa = std.mem.zeroes(posix.sockaddr.un);
+    lp.assert(path.len < sa.path.len, "unix socket path too long", .{ .len = path.len });
+    sa.family = posix.AF.UNIX;
+    @memcpy(sa.path[0..path.len], path);
+
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const l = try sys_net.socket(posix.AF.UNIX, flags, 0);
+    errdefer sys_net.close(l);
+
+    try sys_net.bind(l, @ptrCast(&sa), @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1));
+    errdefer std.Io.Dir.cwd().deleteFile(lp.io, path) catch {};
+
+    // Not atomic with the bind, but connecting needs write permission,
+    // which a umask rarely grants to anyone but the owner.
+    if (std.c.chmod(path.ptr, 0o600) != 0) {
+        return error.SocketPermissions;
+    }
+    try sys_net.listen(l, backlog);
+    return l;
+}
+
+fn closeListener(listener: posix.socket_t, unix_path: ?[:0]const u8) void {
+    sys_net.close(listener);
+    if (unix_path) |path| {
+        std.Io.Dir.cwd().deleteFile(lp.io, path) catch {};
+    }
 }
 
 pub fn deinit(self: *Server) void {
@@ -249,7 +300,7 @@ pub fn deinit(self: *Server) void {
     self.http_connection_pool.deinit();
     allocator.free(self.json_version_response);
     allocator.free(self.bidi_session_url);
-    sys_net.close(self.listener);
+    closeListener(self.listener, self.unix_path);
     self.io_engine.deinit();
     allocator.destroy(self);
 }
@@ -348,9 +399,12 @@ fn accept(self: *Server, now: u64) !void {
             }
         };
         errdefer sys_net.close(socket);
-        configureSocket(socket);
-
-        const peer = sys_net.addressFromSockaddr(@ptrCast(&address));
+        // A Unix socket has neither TCP options nor a peer IP.
+        var peer: sys_net.IpAddress = .{ .ip4 = .unspecified(0) };
+        if (self.unix_path == null) {
+            configureSocket(socket);
+            peer = sys_net.addressFromSockaddr(@ptrCast(&address));
+        }
         if (comptime lp.IS_DEBUG) {
             log.debug(.serve, "client connected", .{ .address = peer });
         }
@@ -1339,6 +1393,9 @@ pub const Worker = struct {
             log.err(.serve, "worker init", .{ .err = err });
             self.releaseConnection();
         };
+        // The connection's browser, pages and isolate are freed: hand that
+        // memory back, or the process keeps its largest page's footprint.
+        lp.malloc_tuning.trim();
     }
 
     fn _start(self: *Worker, origin: Origin) !void {
@@ -1429,7 +1486,7 @@ const WorkerRequest = struct {
 
 const testing = @import("../testing.zig");
 test "server: buildJSONVersionResponse" {
-    const res = try http.buildJSONVersionResponse(testing.test_app, testing.test_app.config.port());
+    const res = try http.buildJSONVersionResponse(testing.test_app, "ws://127.0.0.1:9222/");
     defer testing.test_app.allocator.free(res);
 
     // The response includes the build version, so check structure rather than exact bytes.
@@ -1444,6 +1501,10 @@ test "server: buildJSONVersionResponse" {
     try testing.expect(std.mem.find(u8, res, "\"User-Agent\": \"Lightpanda/") != null);
     try testing.expect(std.mem.find(u8, res, "\"Lightpanda-Version\": \"" ++ lp.build_config.version ++ "\"") != null);
     try testing.expect(std.mem.find(u8, res, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9222/\"") != null);
+
+    const unix = try http.buildJSONVersionResponse(testing.test_app, "ws+unix:///tmp/a\"b.sock:/");
+    defer testing.test_app.allocator.free(unix);
+    try testing.expect(std.mem.find(u8, unix, "\"webSocketDebuggerUrl\": \"ws+unix:///tmp/a\\\"b.sock:/\"}") != null);
 }
 
 test "Client: http header past the initial buffer" {
@@ -1816,6 +1877,7 @@ test "server: HTTP session bootstrap" {
     // What Selenium does before it speaks BiDi: a POST /session
     // that hands back the websocket URL, then a DELETE on quit.
     const session_id = try createHTTPSession("{\"capabilities\":{\"firstMatch\":[{}],\"alwaysMatch\":{\"browserName\":\"firefox\",\"webSocketUrl\":true}}}", true);
+    errdefer deleteHTTPSession(&session_id, true) catch {};
 
     var c = try createTestClient();
     defer c.deinit();
@@ -1947,6 +2009,7 @@ test "server: HTTP session idle timeout disabled" {
     server.session_timeout_ms = null;
 
     const session_id = try createHTTPSession("{\"capabilities\":{}}", false);
+    errdefer deleteHTTPSession(&session_id, true) catch {};
 
     // never idle-listed, so nothing reaps it: it's still there to DELETE
     lp.io.sleep(.fromMilliseconds(50), .awake) catch {};
@@ -1956,16 +2019,22 @@ test "server: HTTP session idle timeout disabled" {
 test "server: HTTP session ended before its worker attached" {
     // The mailbox is alive from spawn: a DELETE that lands while the worker
     // is still starting up is a plain push, drained on its first tick.
-    // worker_pool.live is the loop's; the gauge is the cross-thread view of it
-    const gauge = &lp.metrics.serve_active_connections;
-    const live = gauge.get(.bidi);
+    // A deleted session's worker exits after the 200, so an earlier test's
+    // can still be winding down: a snapshot of the gauge would count it.
+    try waitForNoBidiWorkers();
 
     const session_id = try createHTTPSession("{\"capabilities\":{}}", false);
     try deleteHTTPSession(&session_id, true);
 
     // the worker exited and gave its slot back
+    try waitForNoBidiWorkers();
+}
+
+/// worker_pool.live is the loop's; the gauge is the cross-thread view of it.
+fn waitForNoBidiWorkers() !void {
+    const gauge = &lp.metrics.serve_active_connections;
     var attempts: usize = 0;
-    while (gauge.get(.bidi) != live) : (attempts += 1) {
+    while (gauge.get(.bidi) != 0) : (attempts += 1) {
         try testing.expect(attempts < 200);
         lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
@@ -2043,6 +2112,15 @@ test "server: HTTP page commands" {
         const body = responseBody(try sessionCommand(&c, "GET", &session_id, "/window/handles", ""));
         try testing.expectEqual(try testing.arena_allocator.print("{{\"value\":[\"{s}\"]}}", .{handle}), body);
     }
+
+    // The W3C switch-to-window command accepts only the existing handle.
+    const select_current = try testing.arena_allocator.print("{{\"handle\":\"{s}\"}}", .{handle});
+    try testing.expectEqual("{\"value\":null}", responseBody(try sessionCommand(&c, "POST", &session_id, "/window", select_current)));
+    // A wrong handle must not create or switch to a new context.
+    const bad = try sessionCommand(&c, "POST", &session_id, "/window", "{\"handle\":\"not-a-window\"}");
+    try testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(std.mem.find(u8, responseBody(bad), "\"no such window\"") != null);
+    try testing.expectEqual(try testing.arena_allocator.print("{{\"value\":\"{s}\"}}", .{handle}), responseBody(try sessionCommand(&c, "GET", &session_id, "/window", "")));
 
     const url = "http://127.0.0.1:9582/src/browser/tests/bidi/input.html";
     try testing.expectEqual("{\"value\":null}", responseBody(try sessionCommand(&c, "POST", &session_id, "/url", "{\"url\":\"" ++ url ++ "\"}")));
@@ -2336,7 +2414,7 @@ test "server: HTTP element input" {
         try testing.expectEqual("{\"value\":true}", try elementCommand(&c, &session_id, opt_b, "/selected"));
         const opt_a = try findElement(&c, &session_id, "css selector", "#opt_a");
         try testing.expectEqual("{\"value\":false}", try elementCommand(&c, &session_id, opt_a, "/selected"));
-        try testing.expectEqual("{\"value\":\"blur@area focus@pick click@opt_b input@pick change@pick\"}", try executeSync(&c, &session_id, take_events, "[]"));
+        try testing.expectEqual("{\"value\":\"change@area blur@area focus@pick click@opt_b input@pick change@pick\"}", try executeSync(&c, &session_id, take_events, "[]"));
     }
 
     // a click that navigates is answered once the new page has loaded
@@ -2741,6 +2819,7 @@ test "server: HTTP command errors" {
     }
 
     const session_id = try createHTTPSession("{\"capabilities\":{}}", false);
+    errdefer deleteHTTPSession(&session_id, true) catch {};
 
     // routing errors are the loop's, in W3C form. A known path with the wrong
     // method is an unknown command like any other.
@@ -2798,13 +2877,9 @@ fn createHTTPSession(body: []const u8, expect_ws_url: bool) ![36]u8 {
     var c = try createTestClient();
     defer c.deinit();
 
-    // the body can arrive after the headers
-    var head_buf: [128]u8 = undefined;
-    try sys_net.writeAll(c.socket, try std.mem.print(&head_buf, "POST /session HTTP/1.1\r\n" ++
+    const res = try c.httpRequest(try testing.arena_allocator.print("POST /session HTTP/1.1\r\n" ++
         "Content-Type: application/json;charset=UTF-8\r\n" ++
-        "Content-Length: {d}\r\n\r\n", .{body.len}));
-    lp.io.sleep(.fromMilliseconds(20), .awake) catch {};
-    const res = try c.httpRequest(body);
+        "Content-Length: {d}\r\n\r\n{s}", .{ body.len, body }));
     try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200 OK\r\n"));
 
     const json = res[std.mem.find(u8, res, "\r\n\r\n").? + 4 ..];
@@ -2820,7 +2895,8 @@ fn createHTTPSession(body: []const u8, expect_ws_url: bool) ![36]u8 {
     try testing.expectEqual(false, capabilities.get("acceptInsecureCerts").?.bool);
     if (expect_ws_url) {
         const ws_url = capabilities.get("webSocketUrl").?.string;
-        try testing.expectEqual("ws://127.0.0.1:9583/session/", ws_url[0 .. ws_url.len - 36]);
+        const expected = try testing.arena_allocator.print("ws://127.0.0.1:{d}/session/", .{testing.test_cdp_port});
+        try testing.expectEqual(expected, ws_url[0 .. ws_url.len - 36]);
         try testing.expectEqual(id, ws_url[ws_url.len - 36 ..]);
     } else {
         try testing.expectEqual(null, capabilities.get("webSocketUrl"));
@@ -3066,7 +3142,8 @@ test "server: get /json/version" {
         try testing.expect(std.mem.startsWith(u8, res1, "HTTP/1.1 200 OK\r\n"));
         try testing.expect(std.mem.find(u8, res1, "\"Browser\": \"Lightpanda/") != null);
         try testing.expect(std.mem.find(u8, res1, "\"Protocol-Version\": \"1.3\"") != null);
-        try testing.expect(std.mem.find(u8, res1, "\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9583/\"") != null);
+        const ws_url = try testing.arena_allocator.print("\"webSocketDebuggerUrl\": \"ws://127.0.0.1:{d}/\"", .{testing.test_cdp_port});
+        try testing.expect(std.mem.find(u8, res1, ws_url) != null);
     }
 
     {
@@ -3232,7 +3309,7 @@ const MockCDP = struct {
 };
 
 fn createTestClient() !TestClient {
-    const address: sys_net.IpAddress = .{ .ip4 = .loopback(9583) };
+    const address: sys_net.IpAddress = .{ .ip4 = .loopback(testing.test_cdp_port) };
     const socket = try sys_net.connect(&address);
 
     const timeout = std.mem.toBytes(posix.timeval{
@@ -3386,23 +3463,19 @@ const TestClient = struct {
 
 // A server of our own, bound to an ephemeral port and never run(): these
 // tests drive its handlers by hand to reproduce what one event batch does.
-// The real test server (port 9583) is shared and can't be torn down.
+// The real test server is shared and can't be torn down.
 const LoopTest = struct {
     server: *Server,
     address: sys_net.IpAddress,
 
     fn init() !LoopTest {
-        const server = try Server.init(testing.test_app, .{ .ip4 = .loopback(0) });
+        const server = try Server.init(testing.test_app, .{ .ip = .{ .ip4 = .loopback(0) } });
         errdefer server.deinit();
         server.protocols = .{ .cdp = true, .webdriver = true };
         // run() does this; runOnce() on its own would never see an accept
         try server.io_engine.monitorListener(server.listener);
 
-        var bound: posix.sockaddr.storage = undefined;
-        var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        try sys_net.getsockname(server.listener, @ptrCast(&bound), &bound_len);
-
-        return .{ .server = server, .address = sys_net.addressFromSockaddr(@ptrCast(&bound)) };
+        return .{ .server = server, .address = try sys_net.boundAddress(server.listener) };
     }
 
     fn deinit(self: *LoopTest) void {
@@ -3615,4 +3688,33 @@ test "server: http connections stay ordered by deadline" {
 
     http.disconnect(lt.server, conn_a);
     http.disconnect(lt.server, conn_b);
+}
+
+test "server: unix listener accepts a client and removes owned socket on shutdown" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const absolute_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(absolute_dir);
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/cdp.sock", .{absolute_dir}, 0);
+    defer testing.allocator.free(path);
+
+    const server = try Server.init(testing.test_app, .{ .unix = path });
+    var live = true;
+    defer if (live) server.deinit();
+    try testing.expectEqual(0, std.c.access(path.ptr, 0));
+    try testing.expect(std.mem.indexOf(u8, server.json_version_response, "\"ws+unix://") != null);
+    try testing.expectError(error.AddressInUse, Server.init(testing.test_app, .{ .unix = path }));
+    try server.io_engine.monitorListener(server.listener);
+
+    const client = try sys_net.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer sys_net.close(client);
+    var address: posix.sockaddr.un = std.mem.zeroes(posix.sockaddr.un);
+    address.family = posix.AF.UNIX;
+    @memcpy(address.path[0..path.len], path);
+    try testing.expectEqual(0, std.c.connect(client, @ptrCast(&address), @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1)));
+    try server.accept(lp.datetime.milliTimestamp(.boot));
+    try testing.expect(server.http_connections.first != null);
+    server.deinit();
+    live = false;
+    try testing.expect(std.c.access(path.ptr, 0) != 0);
 }

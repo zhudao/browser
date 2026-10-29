@@ -32,7 +32,6 @@ const Mime = @import("../../browser/Mime.zig");
 const Frame = @import("../../browser/Frame.zig");
 const Browser = @import("../../browser/Browser.zig");
 const Session = @import("../../browser/Session.zig");
-const Label = @import("../../browser/webapi/element/html/Label.zig");
 
 const WS = @import("../WS.zig");
 const Link = @import("../Link.zig");
@@ -66,6 +65,10 @@ allocator: Allocator,
 
 // when true, any target creation must be attached.
 target_auto_attach: bool = false,
+
+// Target.setDiscoverTargets: when true, page target changes are reported
+// via Target.targetInfoChanged.
+target_discover: bool = false,
 
 session_id_gen: SessionIdGen = .{},
 browser_session_id_gen: BrowserSessionIdGen = .{},
@@ -262,6 +265,13 @@ fn dispatchStartupCommand(command: *Command, method: []const u8) !void {
         return dispatchCommand(command, method);
     }
 
+    // The placeholder session has no page behind it: an empty
+    // result would look like success while nothing happened.
+    // Say so, and point at the way to get a real target.
+    if (std.mem.eql(u8, method, "Page.navigate")) {
+        return command.sendError(-32000, "No page on the STARTUP session; create a real target with Target.createTarget", .{});
+    }
+
     return command.sendResult(null, .{});
 }
 
@@ -311,6 +321,7 @@ fn dispatchCommand(command: *Command, method: []const u8) !void {
         },
         8 => switch (@as(u64, @bitCast(domain[0..8].*))) {
             asUint(u64, "Security") => return @import("domains/security.zig").processMessage(command),
+            asUint(u64, "Debugger") => return @import("domains/debugger.zig").processMessage(command),
             else => {},
         },
         9 => switch (@as(u72, @bitCast(domain[0..9].*))) {
@@ -489,6 +500,10 @@ pub const BrowserContext = struct {
     // (chromedp's keyDown/char/keyUp split), as Chrome does.
     suppress_next_char: bool = false,
 
+    // Input.setInterceptDrags. Nothing starts a drag from mouse input yet, so
+    // no Input.dragIntercepted is ever due.
+    intercept_drags: bool = false,
+
     security_origin: []const u8,
     page_life_cycle_events: bool,
     secure_context_type: []const u8,
@@ -507,6 +522,9 @@ pub const BrowserContext = struct {
     // can use the existing Frame/js.Context as-is.
     main_world_touched: bool = false,
 
+    // Runtime.exceptionThrown's exceptionDetails.exceptionId.
+    next_exception_id: u32 = 1,
+
     // Scripts registered via Page.addScriptToEvaluateOnNewDocument.
     // Evaluated in each new document after navigation completes.
     scripts_on_new_document: std.ArrayList(ScriptOnNewDocument) = .empty,
@@ -520,6 +538,8 @@ pub const BrowserContext = struct {
 
     intercept_state: InterceptState,
     fetch_session_id: ?[]const u8 = null,
+
+    download_session_id: ?[]const u8 = null,
 
     // Request bodies retained for Network.getRequestPostData, which can be
     // called after the transfer is gone. Capped at max_post_data_size.
@@ -595,6 +615,7 @@ pub const BrowserContext = struct {
         try notification.register(.frame_navigated_within_document, self, onFrameNavigatedWithinDocument);
         try notification.register(.frame_navigate_failed, self, onFrameNavigateFailed);
         try notification.register(.frame_child_frame_created, self, onFrameChildFrameCreated);
+        try notification.register(.frame_child_frame_detached, self, onFrameChildFrameDetached);
         try notification.register(.frame_destroyed, self, onFrameDestroyed);
         try notification.register(.frame_dom_content_loaded, self, onFrameDOMContentLoaded);
         try notification.register(.frame_loaded, self, onFrameLoaded);
@@ -638,6 +659,10 @@ pub const BrowserContext = struct {
         self.notification.unregisterAll(self);
         self.clearCapturedResponses();
 
+        if (self.cdp.app.config.cookieJarFile()) |cookie_jar_path| {
+            lp.cookies.saveToFile(&self.session.cookie_jar, cookie_jar_path);
+        }
+
         // If the session has a frame, we need to clear it first. The page
         // context is always nested inside of the isolated world context,
         // so we need to shutdown the page one first.
@@ -663,6 +688,7 @@ pub const BrowserContext = struct {
             browser.http_client.clearUserAgentOverride();
         }
         browser.http_client.clearAcceptLanguageOverride();
+        browser.clearPermissions();
         self.intercept_state.deinit();
     }
 
@@ -723,12 +749,15 @@ pub const BrowserContext = struct {
         }
     }
 
-    pub fn nodeWriter(self: *BrowserContext, root: *const NodeRegistry.Node, opts: Node.Writer.Opts) Node.Writer {
+    pub fn nodeWriter(self: *BrowserContext, root: *const NodeRegistry.Node, opts: Node.Writer.Opts) !Node.Writer {
         return .{
             .root = root,
             .depth = opts.depth,
             .exclude_root = opts.exclude_root,
+            .pierce = opts.pierce,
             .registry = &self.node_registry,
+            // shadow roots are tracked per Page, any of its frames will do
+            .frame = self.mainFrame() orelse return error.FrameNotLoaded,
         };
     }
 
@@ -739,16 +768,7 @@ pub const BrowserContext = struct {
         // cross-frame queries produces names/visibility from the wrong document.
         const main_frame = self.mainFrame() orelse return error.FrameNotLoaded;
         const frame = root.dom.ownerFrame(main_frame) orelse return error.InvalidNodeId;
-        const label_index = try frame.call_arena.create(Label.LabelByForIndex);
-        label_index.* = .{};
-        return .{
-            .frame = frame,
-            .root = root,
-            .registry = &self.node_registry,
-            .label_index = label_index,
-            .temp_arena = temp_arena,
-            .filter = opts.filter,
-        };
+        return .init(frame, root, &self.node_registry, temp_arena, opts);
     }
 
     // The root frame of this context's live Page.
@@ -856,6 +876,7 @@ pub const BrowserContext = struct {
         try self.intercept_state.setPatterns(patterns);
         self.fetch_session_id = session_id;
         try self.notification.register(.http_request_intercept, self, onHttpRequestIntercept);
+        try self.notification.register(.http_response_intercept, self, onHttpResponseIntercept);
         if (authRequests) {
             try self.notification.register(.http_request_auth_required, self, onHttpRequestAuthRequired);
         }
@@ -902,6 +923,7 @@ pub const BrowserContext = struct {
 
     fn fetchDisable(self: *BrowserContext) void {
         self.notification.unregister(.http_request_intercept, self);
+        self.notification.unregister(.http_response_intercept, self);
         self.notification.unregister(.http_request_auth_required, self);
         self.intercept_state.clearPatterns();
         self.fetch_session_id = null;
@@ -927,12 +949,43 @@ pub const BrowserContext = struct {
         self.notification.unregister(.console_message, self);
     }
 
+    // The Log domain is enabled per session, so the session is the receiver:
+    // the context itself already listens to these events for Network.
+    pub fn logEnable(self: *BrowserContext, attached: *AttachedSession) !void {
+        try self.notification.register(.http_response_header_done, attached, onLogResponseHeaderDone);
+        errdefer self.notification.unregister(.http_response_header_done, attached);
+        try self.notification.register(.http_request_fail, attached, onLogRequestFail);
+    }
+
+    pub fn logDisable(self: *BrowserContext, attached: *AttachedSession) void {
+        self.notification.unregister(.http_response_header_done, attached);
+        self.notification.unregister(.http_request_fail, attached);
+    }
+
+    fn onLogResponseHeaderDone(ctx: *anyopaque, msg: *const Notification.ResponseHeaderDone) !void {
+        const attached: *AttachedSession = @ptrCast(@alignCast(ctx));
+        const self = attached.bc;
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/log.zig").httpResponseHeaderDone(arena, self, attached.id, msg);
+    }
+
+    fn onLogRequestFail(ctx: *anyopaque, msg: *const Notification.RequestFail) !void {
+        const attached: *AttachedSession = @ptrCast(@alignCast(ctx));
+        const self = attached.bc;
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/log.zig").httpRequestFail(arena, self, attached.id, msg);
+    }
+
     pub fn runtimeEnable(self: *BrowserContext) !void {
         try self.notification.register(.runtime_console_message, self, onRuntimeConsoleMessage);
+        try self.notification.register(.exception_thrown, self, onExceptionThrown);
     }
 
     pub fn runtimeDisable(self: *BrowserContext) void {
         self.notification.unregister(.runtime_console_message, self);
+        self.notification.unregister(.exception_thrown, self);
     }
 
     // Registers for the download notifications dispatched by Frame when a
@@ -940,11 +993,13 @@ pub const BrowserContext = struct {
     pub fn downloadEventsEnable(self: *BrowserContext) !void {
         try self.notification.register(.download_will_begin, self, onDownloadWillBegin);
         try self.notification.register(.download_progress, self, onDownloadProgress);
+        try self.notification.register(.download_data, self, onDownloadData);
     }
 
     pub fn downloadEventsDisable(self: *BrowserContext) void {
         self.notification.unregister(.download_will_begin, self);
         self.notification.unregister(.download_progress, self);
+        self.notification.unregister(.download_data, self);
     }
 
     fn onDownloadWillBegin(ctx: *anyopaque, msg: *const Notification.DownloadWillBegin) !void {
@@ -955,6 +1010,11 @@ pub const BrowserContext = struct {
     fn onDownloadProgress(ctx: *anyopaque, msg: *const Notification.DownloadProgress) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         return @import("domains/browser.zig").downloadProgress(self, msg);
+    }
+
+    fn onDownloadData(ctx: *anyopaque, msg: *const Notification.DownloadData) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        return @import("domains/lp.zig").downloadData(self, msg);
     }
 
     pub fn webmcpEnable(self: *BrowserContext) !void {
@@ -1019,6 +1079,11 @@ pub const BrowserContext = struct {
         return @import("domains/page.zig").frameChildFrameCreated(self, msg);
     }
 
+    fn onFrameChildFrameDetached(ctx: *anyopaque, msg: *const Notification.FrameChildFrameDetached) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        return @import("domains/page.zig").frameChildFrameDetached(self, msg);
+    }
+
     fn onFrameNetworkIdle(ctx: *anyopaque, msg: *const Notification.FrameNetworkIdle) !void {
         const self: *BrowserContext = @ptrCast(@alignCast(ctx));
         return @import("domains/page.zig").frameNetworkIdle(self, msg);
@@ -1053,6 +1118,13 @@ pub const BrowserContext = struct {
         const arena = self.acquireNotificationArena();
         defer self.releaseNotificationArena();
         try @import("domains/fetch.zig").requestIntercept(arena, self, msg);
+    }
+
+    fn onHttpResponseIntercept(ctx: *anyopaque, msg: *const Notification.ResponseIntercept) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        try @import("domains/fetch.zig").responseIntercept(arena, self, msg);
     }
 
     fn onHttpRequestFail(ctx: *anyopaque, msg: *const Notification.RequestFail) !void {
@@ -1172,6 +1244,13 @@ pub const BrowserContext = struct {
         return @import("domains/runtime.zig").consoleMessage(arena, self, msg);
     }
 
+    fn onExceptionThrown(ctx: *anyopaque, msg: *const Notification.ExceptionThrown) !void {
+        const self: *BrowserContext = @ptrCast(@alignCast(ctx));
+        const arena = self.acquireNotificationArena();
+        defer self.releaseNotificationArena();
+        return @import("domains/runtime.zig").exceptionThrown(arena, self, msg);
+    }
+
     fn acquireNotificationArena(self: *BrowserContext) Allocator {
         self.cdp.notification_depth += 1;
         return self.notification_arena;
@@ -1242,6 +1321,17 @@ pub const BrowserContext = struct {
     }
 
     fn destroySession(self: *BrowserContext, attached: *AttachedSession) void {
+        if (self.download_session_id) |download_session_id| {
+            if (std.mem.eql(u8, download_session_id, attached.id)) {
+                // Like Chrome, the download behavior goes away with the
+                // session that set it.
+                self.download_session_id = null;
+                self.session.download_behavior = .deny;
+                self.session.download_events_enabled = false;
+                self.downloadEventsDisable();
+            }
+        }
+        self.notification.unregisterAll(attached);
         attached.inspector_session.deinit();
         self.cdp.allocator.destroy(attached);
     }
@@ -1647,6 +1737,19 @@ test "cdp: STARTUP sessionId" {
     }
 }
 
+test "cdp: Page.navigate on the STARTUP session returns -32000" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Page.navigate",
+        .sessionId = "STARTUP",
+        .params = .{ .url = "https://example.com" },
+    });
+    try ctx.expectSentError(-32000, "No page on the STARTUP session; create a real target with Target.createTarget", .{ .id = 1 });
+}
+
 test "cdp: disconnect latches so the worker keeps exiting" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -1721,4 +1824,36 @@ test "cdp: syncRequest short-circuits after disconnect" {
         .shutdown_callback = HttpClient.noopShutdown,
     }, null);
     try testing.expectError(error.ClientDisconnected, transfer.submitSync(.{}));
+}
+
+test "cdp: --cookie-jar saves on dispose and --cookie loads it back" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testing.tmpPath(&tmp, "cookies.json");
+
+    const opts = &testing.base.test_config.mode.serve;
+    defer {
+        opts.cookie = null;
+        opts.cookie_jar = null;
+    }
+    opts.cookie = path;
+    opts.cookie_jar = path;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    {
+        // no file yet: the context starts with an empty jar
+        const bc = try ctx.loadBrowserContext(.{});
+        try testing.expectEqual(0, bc.session.cookie_jar.len);
+        try bc.session.cookie_jar.populateFromResponse("https://example.com/", "sid=abc; Path=/; Max-Age=3600; HttpOnly");
+        ctx.cdp().disposeBrowserContext();
+    }
+
+    // a new context (a reconnect, or a restart) starts logged in
+    const bc = try ctx.loadBrowserContext(.{});
+    const jar = &bc.session.cookie_jar;
+    try testing.expectEqual(1, jar.len);
+    var it = jar.iterator();
+    try testing.expectEqualSlices(u8, "abc", it.next().?.value);
 }
