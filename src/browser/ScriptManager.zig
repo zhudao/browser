@@ -278,18 +278,17 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
             break :blk .async;
         }
 
-        // Check for defer or module (before checking dynamic script default)
-        if (kind == .module or element.getAttributeInterned("defer") != null) {
-            break :blk .@"defer";
+        if (comptime from_parser) {
+            // dynamic script ignores defre
+            if (kind == .module or element.getAttributeInterned("defer") != null) {
+                break :blk .@"defer";
+            }
+            break :blk .normal;
         }
 
-        // For dynamically-inserted scripts (not from parser), default to async
-        // unless async was explicitly set.
-        if (comptime !from_parser) {
-            break :blk if (script_element._force_async) .async else .ordered;
-        }
-
-        break :blk .normal;
+        // Dynamically-inserted: defer has no effect. Async by default, in
+        // insertion order once force-async is cleared.
+        break :blk if (script_element._force_async) .async else .ordered;
     };
 
     if (comptime lp.IS_DEBUG) {
@@ -357,8 +356,8 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
     if (mode == .normal) {
         // Blocking: fetch synchronously and evaluate before the parser resumes.
 
-        // A consumed preload (waitForPreload below) is owned by us: its buffer
-        // is borrowed by `script`, so it must outlive eval.
+        // A consumed preload (waitForPreload below) is owned by us: its script
+        // cache is borrowed by `script`, so it must outlive eval.
         var consumed_preload: ?*Script = null;
         defer if (consumed_preload) |p| {
             p.deinit();
@@ -370,9 +369,11 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
             defer self.base.endEvaluationWindow(was_evaluating);
 
             if (self.waitForPreload(remote_url)) |pre| {
-                // There was a preloaded script, we borrow it's source and status
+                // There was a preloaded script: take its source (both get
+                // deinit'd) and borrow its status and script cache.
                 consumed_preload = pre;
                 script.source = pre.source;
+                pre.source = .{ .remote = .empty };
                 script.encoding = pre.encoding;
                 script.script_cache = pre.script_cache;
                 script.status = pre.status;
@@ -396,8 +397,8 @@ pub fn addFromElement(self: *ScriptManager, comptime from_parser: bool, script_e
 
                 const response = try transfer.submitSync(.{});
 
-                // Take the body's arena rather than releasing it: `source`
-                // has to outlive this call, up to script.deinit().
+                // Take the body and its arena rather than releasing them:
+                // `source` has to outlive this call, up to script.deinit().
                 script.source_arena = response.arena;
                 script.source = .{ .remote = response.body };
                 script.setContentType(response.content_type);
