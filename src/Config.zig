@@ -243,9 +243,10 @@ pub const LoadResources = packed struct(u6) {
     none: bool = false,
 };
 
-pub const ExperimentalFeatures = packed struct(u2) {
+pub const ExperimentalFeatures = packed struct(u3) {
     cors: bool = false, // ignored, kept only for backward compatibility.
     serviceworker: bool = false,
+    privatecache: bool = false,
 };
 
 pub const DisabledFeatures = packed struct(u1) {
@@ -513,7 +514,6 @@ pub const Commands = cli.Builder(.{
 const RunMode = Commands.Enum;
 pub const Mode = Commands.Union;
 pub const Agent = @FieldType(Mode, "agent");
-const Serve = @FieldType(Mode, "serve");
 
 mode: Mode,
 // The command as typed. Mirrors `mode`, except `run` normalizes to `.agent`

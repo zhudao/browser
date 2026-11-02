@@ -911,6 +911,10 @@ pub fn setAttributeSafe(self: *Element, name: String, value: String, frame: *Fra
     _ = try self._attributes.putSafe(name, value, self, frame);
 }
 
+pub fn setInertStyleAttribute(self: *Element, value: String, frame: *Frame) !void {
+    try self._attributes.putInertStyle(value, self, frame);
+}
+
 pub fn getShadowRoot(self: *Element, frame: *Frame) ?*ShadowRoot {
     const shadow_root = self.hostedShadowRoot(frame) orelse return null;
     if (shadow_root._mode == .closed) return null;
@@ -1651,6 +1655,15 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
         }
     }
 
+    // An iframe without a size is 300x150, like any replaced element without
+    // an intrinsic size. Its content is hit-tested inside this box.
+    if (tag == .iframe) {
+        return .{ .value = switch (axis) {
+            .width => 300.0,
+            .height => 150.0,
+        }, .explicit = true };
+    }
+
     return .{ .value = 5.0 };
 }
 
@@ -1862,7 +1875,7 @@ pub fn getScrollWidth(self: *Element, frame: *Frame) f64 {
     }
 
     const owner = self.ownerFrame(frame) orelse return self.getElementAxis(frame, .width).value;
-    return @max(layout.boxWidth(self, owner), layout.contentWidth(self, .clipped, owner));
+    return @max(layout.boxWidth(self, owner), layout.contentWidth(self, .scrollable, owner));
 }
 
 /// Null where we can't prove a limit, which leaves the offset unbounded:
@@ -2074,9 +2087,10 @@ fn countSubtreeNodes(node: *Node, frame: *const Frame) f64 {
     return count;
 }
 
-// The horizontal position follows the same single-row assumption as
-// contentAxis: an element sits to the right of the visible element
-// siblings before it.
+// An element sits to the right of the visible element siblings before it on
+// its line. A block-level box takes a line of its own at its parent's left
+// edge, as it fills the parent's width (layout.boxWidth); only a flex row's
+// items, sized by their content, share a line whatever their display.
 
 // translateX is commonly used to shift elements around, e.g. in a carousel to
 // shift things around. So we honor any transform: translateX inline styles.
@@ -2096,18 +2110,34 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
                 x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
             }
         }
-        var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
-        while (siblings.next()) |s| {
-            if (s == current) break;
-            if (s.is(Element)) |el| {
-                if (!style_manager.hasDisplayNone(el)) {
-                    x += el.getElementAxis(frame, .width).value;
-                }
-            }
-        }
+        x += lineOffset(current, parent, style_manager, frame);
         current = parent;
     }
 
+    return x;
+}
+
+fn lineOffset(node: *Node, parent: *Node, style_manager: *StyleManager, frame: *Frame) f64 {
+    const el = node.is(Element) orelse return 0;
+    const in_row = style_manager.isFlexRowItem(el);
+    if (in_row == false and style_manager.isBlockLevel(el)) {
+        return 0;
+    }
+
+    var x: f64 = 0.0;
+    var siblings: TreeWalker.FlatChildren = .init(parent, .{ .frame = frame });
+    while (siblings.next()) |s| {
+        if (s == node) break;
+        const sibling = s.is(Element) orelse continue;
+        if (style_manager.hasDisplayNone(sibling)) {
+            continue;
+        }
+        if (in_row == false and style_manager.isBlockLevel(sibling)) {
+            x = 0;
+            continue;
+        }
+        x += sibling.getElementAxis(frame, .width).value;
+    }
     return x;
 }
 

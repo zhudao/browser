@@ -1537,7 +1537,7 @@ fn iframeCompletedLoading(self: *Frame, iframe: *IFrame, delays_load: bool) void
         else => false,
     };
     if (parsing_html and (iframe.srcAttribute().len > 0 or iframe.hasSrcdoc())) {
-        self.queueElementEvent(Factory.protoOf(iframe), .load) catch |err| {
+        self.queueElementEvent(iframe.asHtml(), .load) catch |err| {
             log.err(.frame, "iframe queue load", .{ .err = err, .url = iframe.srcAttribute() });
         };
         if (delays_load) {
@@ -2181,7 +2181,7 @@ pub fn scriptAddedCallback(self: *Frame, comptime from_parser: bool, script: *El
         }
         // parser-inserted scripts have force-async set to false, but only if
         // they have src or non-empty content
-        if (script._src.len > 0 or script_node.firstChild() != null) {
+        if (script._src != null or script_node.firstChild() != null) {
             script._force_async = false;
         }
     }
@@ -2439,6 +2439,12 @@ pub fn domChanged(self: *Frame) void {
 /// layout observers. Both are no-ops unless something they track changed.
 pub fn renderingChanged(self: *Frame) void {
     self.styleChanged();
+    self.layoutObserversChanged();
+}
+
+/// A change that can move a box without changing any selector match or
+/// cascaded value, like an inline transform: only the layout observers look.
+pub fn layoutObserversChanged(self: *Frame) void {
     observers.scheduleIntersectionChecks(self);
     observers.scheduleResizeChecks(self);
 }
@@ -2549,11 +2555,11 @@ pub fn queueElementEvent(self: *Frame, element: *Element.Html, kind: QueuedEvent
 }
 
 pub fn queueImageEvent(self: *Frame, image: *Element.Html.Image, kind: QueuedEvent.Kind) !void {
-    try self.queueEvent(.{ .element = Factory.protoOf(image), .kind = kind, .generation = image._generation });
+    try self.queueEvent(.{ .element = image.asHtml(), .kind = kind, .generation = image._generation });
 }
 
 fn queueLinkEvent(self: *Frame, link: *Element.Html.Link, kind: QueuedEvent.Kind, generation: u32) !void {
-    try self.queueEvent(.{ .element = Factory.protoOf(link), .kind = kind, .generation = generation });
+    try self.queueEvent(.{ .element = link.asHtml(), .kind = kind, .generation = generation });
 }
 
 fn queueEvent(self: *Frame, event: QueuedEvent) !void {
@@ -2648,7 +2654,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
 
     if (session.load_resources.stylesheet == false) {
         self.page.status.noteSkipped(.stylesheet);
-        return self.queueLoad(Factory.protoOf(link));
+        return self.queueLoad(link.asHtml());
     }
 
     // Fragment-parsed links (innerHTML, DOMParser, ...) may not be attached.
@@ -3684,7 +3690,7 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
     }
 
     if (node.is(Element.Html.Script)) |script| {
-        if ((comptime from_parser == false) and script._src.len == 0) {
+        if ((comptime from_parser == false) and script._src == null) {
             // Script was added via JavaScript without a src attribute.
             // Only skip if it has no inline content either — scripts with
             // textContent/text should still execute per spec.
