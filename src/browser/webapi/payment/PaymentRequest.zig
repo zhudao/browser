@@ -152,7 +152,7 @@ pub fn init(
 
     const id = if (details.id) |id| try arena.dupe(u8, id) else blk: {
         const uuid = try arena.alloc(u8, 36);
-        @import("../../../id.zig").uuidv4(uuid);
+        @import("../../../id.zig").uuidv4(@ptrCast(uuid));
         break :blk uuid;
     };
 
@@ -300,7 +300,7 @@ pub fn abort(_: *PaymentRequest) !js.Promise {
     return error.InvalidStateError;
 }
 
-pub fn canMakePayment(self: *PaymentRequest, exec: *const Execution) !js.Promise {
+fn canMakePayment(self: *PaymentRequest, exec: *const Execution) !js.Promise {
     if (self._closed) {
         return error.InvalidStateError;
     }
@@ -308,7 +308,7 @@ pub fn canMakePayment(self: *PaymentRequest, exec: *const Execution) !js.Promise
 }
 
 // Dropped from the spec; Chrome still ships it.
-pub fn hasEnrolledInstrument(self: *PaymentRequest, exec: *const Execution) !js.Promise {
+fn hasEnrolledInstrument(self: *PaymentRequest, exec: *const Execution) !js.Promise {
     return self.canMakePayment(exec);
 }
 

@@ -26,6 +26,8 @@ const Factory = @import("../../../Factory.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+const DOMTokenList = @import("../../collections.zig").DOMTokenList;
+const String = lp.String;
 
 const Style = @This();
 
@@ -89,8 +91,43 @@ pub fn styleAddedCallback(self: *Style, frame: *Frame) !void {
     try frame.queueLoad(self.asHtml());
 }
 
+// The disabled IDL attribute has no content attribute: it reads and writes
+// the associated sheet's disabled flag, and does nothing without a sheet.
+fn getDisabled(self: *Style, frame: *Frame) !bool {
+    const sheet = try self.getSheet(frame) orelse return false;
+    return sheet._disabled;
+}
+
+fn setDisabled(self: *Style, disabled: bool, frame: *Frame) !void {
+    const sheet = try self.getSheet(frame) orelse return;
+    sheet.setDisabled(disabled, frame);
+}
+
+fn getBlocking(self: *Style, frame: *Frame) !*DOMTokenList {
+    return self.asElement().getTokenList(.blocking, frame);
+}
+
+fn setBlocking(self: *Style, value: String, frame: *Frame) !void {
+    const list = try self.getBlocking(frame);
+    try list.setValue(value, frame);
+}
+
 pub fn getType(self: *const Style) []const u8 {
     return self.asConstElement().getAttributeInterned("type") orelse "";
+}
+
+// The element's text changed. Spec says we should create a new sheet. For now
+// we keep the existing one..avoids over-allocation on consecutive writes.
+pub fn childrenChanged(self: *Style, frame: *Frame) void {
+    const node = self.asNode();
+    if (node.isConnected() == false) {
+        return;
+    }
+    if (self._sheet) |sheet| {
+        sheet._css_rules = null;
+    }
+    const owner = node.ownerFrame(frame) orelse return;
+    owner._style_manager.sheetModified();
 }
 
 pub const JsApi = struct {
@@ -104,10 +141,10 @@ pub const JsApi = struct {
     const reflect = Element.Reflect(Style);
     pub const nonce = reflect.string("nonce");
 
-    pub const blocking = reflect.string("blocking");
+    pub const blocking = bridge.accessor(Style.getBlocking, Style.setBlocking, .{ .ce_reactions = true });
     pub const media = reflect.string("media");
     pub const @"type" = reflect.string("type");
-    pub const disabled = reflect.boolean("disabled");
+    pub const disabled = bridge.accessor(Style.getDisabled, Style.setDisabled, .{});
     pub const sheet = bridge.accessor(Style.getSheet, null, .{});
 };
 

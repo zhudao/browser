@@ -42,6 +42,7 @@ const DOMImplementation = @import("DOMImplementation.zig");
 const StyleSheetList = @import("css/StyleSheetList.zig");
 const FontFaceSet = @import("css/FontFaceSet.zig");
 const Selection = @import("Selection.zig");
+const ModelContext = @import("ModelContext.zig");
 const Sanitizer = @import("Sanitizer.zig");
 const XPathResult = @import("XPathResult.zig");
 const XPathExpression = @import("XPathExpression.zig");
@@ -85,11 +86,11 @@ _active_element: ?*Element = null,
 _style_sheets: ?*StyleSheetList = null,
 _implementation: ?*DOMImplementation = null,
 _fonts: ?*FontFaceSet = null,
-_write_insertion_point: ?*Node = null,
 _script_created_parser: ?Parser.Streaming = null,
 _close_requested: bool = false,
 // an execCommand is running: a nested one is refused
 _exec_command_running: bool = false,
+_exec_command_settings: exec_command.Settings = .{},
 _design_mode: bool = false,
 _adopted_style_sheets: ?js.Object.Global = null,
 _selection: Selection = .{ ._rc = .init(1) },
@@ -855,6 +856,12 @@ fn getFonts(self: *Document, frame: *Frame) !*FontFaceSet {
     return fonts;
 }
 
+/// Null for a document without a browsing context, like one from DOMParser.
+fn getModelContext(self: *const Document) !?*ModelContext {
+    const frame = self._frame orelse return null;
+    return frame.window.getModelContext();
+}
+
 fn adoptNode(self: *Document, node: *Node, frame: *Frame) !*Node {
     if (node._type == .document) {
         return error.NotSupported;
@@ -1421,7 +1428,8 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
     // Collect all children to insert (to avoid iterator invalidation)
     var children_to_insert: std.ArrayList(*Node) = .empty;
 
-    var it = if (first.is(Element.Html.Html) == null) fragment_node.childrenIterator() else first.childrenIterator();
+    const container = if (first.is(Element.Html.Html) == null) fragment_node else first;
+    var it = container.childrenIterator();
     while (it.next()) |child| {
         try children_to_insert.append(arena.allocator(), child);
     }
@@ -1430,34 +1438,27 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
         return;
     }
 
-    // Determine insertion point:
-    // - If _write_insertion_point is set and still parented correctly, continue from there
-    // - Otherwise, start after the script (first write, or previous insertion point was removed)
     // parseFragment above can synchronously execute a parser-blocking script
     // (e.g. <script src=...> with from_parser=true). That script's side
     // effects can detach `script` from `parent` — for instance, by writing
     // to parent.innerHTML — leaving us nowhere sensible to splice in.
-    var insert_after: ?*Node = blk: {
-        if (self._write_insertion_point) |wip| {
-            if (wip._parent == parent) {
-                break :blk wip;
-            }
-        }
-        if (script.asNode()._parent == parent) {
-            break :blk script.asNode();
-        }
+    if (script.asNode()._parent != parent) {
         return;
-    };
+    }
 
     for (children_to_insert.items) |child| {
+        if (child._parent != container) {
+            // JS run by an earlier insertion moved it out of the container
+            continue;
+        }
         // Clear parent pointer (child is currently parented to fragment/HTML wrapper)
         child._parent = null;
-        try frame.insertNodeRelative(parent, child, .{ .after = insert_after.? }, .{});
-        insert_after = child;
+
+        // always append, JS run earlier might have deatched the previous node
+        try frame.appendNode(parent, child, .{});
     }
 
     frame.domChanged();
-    self._write_insertion_point = children_to_insert.last().?;
 }
 
 pub fn open(self: *Document, call_frame: *Frame) !*Document {
@@ -1641,16 +1642,20 @@ fn queryCommandEnabled(self: *Document, command: []const u8) bool {
     return exec_command.isEnabled(self, command);
 }
 
-// No supported command has a state or value yet.
-fn queryCommandState(_: *const Document, _: []const u8) bool {
+fn queryCommandIndeterm(_: *const Document, _: []const u8) bool {
+    // No supported command is ever indeterminate.
     return false;
 }
 
-fn queryCommandValue(_: *const Document, _: []const u8) []const u8 {
-    return "";
+fn queryCommandState(self: *const Document, command: []const u8) bool {
+    return exec_command.queryState(self, command);
 }
 
-pub fn hasFocus(self: *Document) bool {
+fn queryCommandValue(self: *const Document, command: []const u8) []const u8 {
+    return exec_command.queryValue(self, command);
+}
+
+fn hasFocus(self: *Document) bool {
     var top = self._frame orelse return false;
     while (top.parent) |parent| {
         top = parent;
@@ -2044,6 +2049,7 @@ pub const JsApi = struct {
     pub const activeElement = bridge.accessor(Document.getActiveElement, null, .{});
     pub const styleSheets = bridge.accessor(Document.getStyleSheets, null, .{});
     pub const fonts = bridge.accessor(Document.getFonts, null, .{});
+    pub const modelContext = bridge.accessor(Document.getModelContext, null, .{});
     pub const contentType = bridge.accessor(Document.getContentType, null, .{});
     pub const domain = bridge.accessor(Document.getDomain, Document.setDomain, .{});
     pub const cookie = bridge.accessor(Document.getCookie, Document.setCookie, .{});
@@ -2154,8 +2160,9 @@ pub const JsApi = struct {
     pub const fullscreenElement = bridge.accessor(Document.getFullscreenElement, null, .{});
     pub const exitFullscreen = bridge.function(Document.exitFullscreen, .{});
     pub const execCommand = bridge.function(Document.execCommand, .{});
+
+    pub const queryCommandIndeterm = bridge.function(Document.queryCommandIndeterm, .{});
     pub const queryCommandEnabled = bridge.function(Document.queryCommandEnabled, .{});
-    pub const queryCommandIndeterm = bridge.function(Document.queryCommandState, .{});
     pub const queryCommandState = bridge.function(Document.queryCommandState, .{});
     pub const queryCommandSupported = bridge.function(Document.queryCommandSupported, .{});
     pub const queryCommandValue = bridge.function(Document.queryCommandValue, .{});

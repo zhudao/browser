@@ -729,6 +729,9 @@ fn rebuildIfDirty(self: *StyleManager) !void {
 
     const sheets = self.frame.document._style_sheets orelse return;
     for (sheets._sheets.items) |sheet| {
+        if (sheet._disabled) {
+            continue;
+        }
         const before = self.next_doc_order;
         self.parseSheet(build_arena.allocator(), sheet) catch |err| {
             log.err(.browser, "StyleManager parseSheet", .{ .err = err });
@@ -1727,7 +1730,7 @@ fn addNestedCssomRules(self: *StyleManager, build_arena: Allocator, parent: *CSS
 /// last in cascade order, so it joins the buckets directly. Anything else
 /// takes the rebuild path.
 pub fn ruleInserted(self: *StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) void {
-    if (self.dirty) {
+    if (self.dirty or sheet._disabled) {
         // The pending rebuild reads the sheet's rules and picks it up.
         return;
     }
@@ -2144,7 +2147,7 @@ const SpaceCollapse = enum(u3) {
 };
 
 /// text-wrap-mode
-pub const WrapMode = enum(u2) {
+const WrapMode = enum(u2) {
     inherit,
     wrap,
     nowrap,

@@ -360,20 +360,6 @@ pub fn getIncumbent(self: *Context) *Frame {
     };
 }
 
-pub fn stringToPersistedFunction(
-    self: *Context,
-    function_body: []const u8,
-    comptime parameter_names: []const []const u8,
-    extensions: []const *const v8.Object,
-) !js.Function.Global {
-    var ls: js.Local.Scope = undefined;
-    self.localScope(&ls);
-    defer ls.deinit();
-
-    const js_function = try ls.local.compileFunction(function_body, parameter_names, extensions);
-    return js_function.persist();
-}
-
 // `cacheable` is about our module map. `script_cache` is the HTTP cache entry
 // the source came from, see compileModule.
 pub fn module(self: *Context, comptime want_result: bool, local: *const js.Local, src: []const u8, url: []const u8, position: js.Local.SourcePosition, cacheable: bool, script_cache: ?HttpClient.ScriptCache) !(if (want_result) ModuleEntry else void) {
@@ -1032,10 +1018,14 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
                         .status = @tagName(mod.getStatus()),
                         .note = "please report this issue: https://github.com/lightpanda-io/browser/issues",
                     });
-                } else if (comptime lp.IS_DEBUG) {
+                    _ = resolver.reject("module evaluation", "Module evaluation failed");
+                    return promise;
+                }
+                if (comptime lp.IS_DEBUG) {
                     std.debug.assert(mod.getStatus() == .kErrored);
                 }
-                _ = resolver.reject("module evaluation", "Module evaluation failed");
+                // e.g. it threw when a module script imported it statically
+                resolver.reject("module evaluation", mod.getException());
                 return promise;
             };
             lp.assert(evaluated.isPromise(), "Context._dynamicModuleCallback non-promise", .{});
@@ -1103,7 +1093,29 @@ fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptM
                 .caught = caught,
                 .specifier = state.specifier,
             });
-            _ = local.toLocal(state.resolver).reject("dynamic compilation failure", caught.exception orelse "");
+            // Reject with what the module threw.
+            const thrown: ?js.Value = thrown: {
+                if (self.env.terminatePending()) {
+                    break :thrown null;
+                }
+                if (try_catch.exceptionValue()) |exception| {
+                    // Either parse or link error.
+                    break :thrown exception;
+                }
+                if (err == error.EvaluationError) {
+                    // Evaluating doesn't throw! V8 keeps what the module (or
+                    // one of its dependencies) threw on the module.
+                    const mod = self.module_cache.get(state.specifier).?.module.?;
+                    break :thrown local.toLocal(mod).getException();
+                }
+                break :thrown null;
+            };
+            const resolver = local.toLocal(state.resolver);
+            if (thrown) |exception| {
+                resolver.reject("dynamic module failure", exception);
+            } else {
+                resolver.reject("dynamic compilation failure", caught.exception orelse "");
+            }
             return;
         };
     };
@@ -1171,10 +1183,8 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
             }
 
             defer l.runMicrotasks();
-            _ = l.toLocal(s.resolver).reject("catch callback", js.Value{
-                .local = l,
-                .handle = v8.v8__FunctionCallbackInfo__Data(callback_handle).?,
-            });
+            // the rejection reason, e.g. what the module's top-level await threw
+            _ = l.toLocal(s.resolver).reject("catch callback", info.getArg(0, l));
         }
     }.callback, @ptrCast(state));
 
