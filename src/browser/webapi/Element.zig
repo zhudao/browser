@@ -302,6 +302,7 @@ pub fn getTagNameLower(self: *const Element) []const u8 {
                     .embed => "embed",
                     .fieldset => "fieldset",
                     .font => "font",
+                    .frame => "frame",
                     .frameset => "frameset",
                     .form => "form",
                     .generic => he.subtype(Html.Generic)._tag_name.str(),
@@ -386,6 +387,7 @@ pub fn getTagNameSpec(self: *const Element, allocator: Allocator) []const u8 {
                 .embed => "EMBED",
                 .fieldset => "FIELDSET",
                 .font => "FONT",
+                .frame => "FRAME",
                 .frameset => "FRAMESET",
                 .form => "FORM",
                 .generic => upperTag(he.subtype(Html.Generic)._tag),
@@ -829,21 +831,25 @@ pub fn isDisabled(self: *const Element) bool {
         return true;
     }
 
-    // <option> takes a different inheritance path: per HTML
-    // "concept-option-disabled" an option is disabled when its parent is an
-    // <optgroup disabled>. It does NOT inherit from <select disabled> or
-    // an ancestor <fieldset disabled>.
-    if (self.getTag() == .option) {
-        if (self.asConstNode()._parent) |parent_node| {
-            if (parent_node.is(Element)) |parent_el| {
-                if (parent_el.getTag() == .optgroup and
-                    parent_el.getAttributeInterned("disabled") != null)
-                {
+    // <option> and <optgroup> inherit from their owner <select> (itself
+    // disabled by an ancestor <fieldset>), and an option also from its
+    // <optgroup>. whatwg/html#12205.
+    const tag = self.getTag();
+    if (tag == .option or tag == .optgroup) {
+        const parent = self.asConstNode()._parent orelse return false;
+        if (tag == .option) {
+            var node: ?*Node = parent;
+            while (node) |n| : (node = n._parent) {
+                if (n.is(Html.Select) != null) break;
+                const optgroup = n.is(Html.OptGroup) orelse continue;
+                if (optgroup.asElement().getAttributeInterned("disabled") != null) {
                     return true;
                 }
+                break;
             }
         }
-        return false;
+        const pos = Html.Select.listPosition(parent) orelse return false;
+        return pos.select.asElement().isDisabled();
     }
 
     const element_node = self.asConstNode();
@@ -2453,79 +2459,25 @@ pub fn getTag(self: *const Element) Tag {
     return switch (self._type) {
         .html => blk: {
             const he = self.subtype(Html);
+            // Single-tag types share the tag's value (see Html.Type)
+            const raw = @backingInt(he._type);
+            if (raw < tag_count) {
+                break :blk @fromBackingInt(@intCast(raw));
+            }
             break :blk switch (he._type) {
-                .anchor => .a,
-                .area => .area,
-                .base => .base,
-                .div => .div,
-                .dl => .dl,
-                .embed => .embed,
-                .form => .form,
-                .p => .p,
-                .custom => .custom,
-                .data => .data,
-                .datalist => .datalist,
-                .details => .details,
-                .dialog => .dialog,
-                .directory => .dir,
-                .iframe => .iframe,
-                .img => .img,
-                .br => .br,
-                .button => .button,
-                .canvas => .canvas,
-                .fieldset => .fieldset,
-                .font => .font,
-                .frameset => .frameset,
-                .heading => he.subtype(Html.Heading)._tag,
-                .label => .label,
-                .legend => .legend,
-                .li => .li,
-                .map => .map,
-                .marquee => .marquee,
-                .ul => .ul,
-                .ol => .ol,
-                .object => .object,
-                .optgroup => .optgroup,
-                .output => .output,
-                .picture => .picture,
-                .param => .param,
-                .pre => .pre,
                 .generic => he.subtype(Html.Generic)._tag,
+                .heading => he.subtype(Html.Heading)._tag,
                 .media => switch (he.subtype(Html.Media)._type) {
                     .audio => .audio,
                     .video => .video,
                     .generic => .media,
                 },
-                .meter => .meter,
                 .mod => he.subtype(Html.Mod)._tag,
-                .progress => .progress,
                 .quote => he.subtype(Html.Quote)._tag,
-                .script => .script,
-                .select => .select,
-                .slot => .slot,
-                .source => .source,
-                .span => .span,
-                .option => .option,
-                .table => .table,
-                .table_caption => .caption,
                 .table_cell => he.subtype(Html.TableCell)._tag,
                 .table_col => he.subtype(Html.TableCol)._tag,
-                .table_row => .tr,
                 .table_section => he.subtype(Html.TableSection)._tag,
-                .template => .template,
-                .textarea => .textarea,
-                .time => .time,
-                .track => .track,
-                .input => .input,
-                .link => .link,
-                .meta => .meta,
-                .hr => .hr,
-                .style => .style,
-                .title => .title,
-                .body => .body,
-                .html => .html,
-                .head => .head,
-                .unknown => .unknown,
+                else => unreachable,
             };
         },
         .svg => self.subtype(Svg).getTag(),
@@ -2535,6 +2487,8 @@ pub fn getTag(self: *const Element) Tag {
 pub fn ownerFrame(self: *const Element, frame: *const Frame) ?*Frame {
     return self.asConstNode().ownerFrame(frame);
 }
+
+pub const tag_count = @typeInfo(Tag).@"enum".field_names.len;
 
 pub const Tag = enum {
     a,
@@ -2581,6 +2535,7 @@ pub const Tag = enum {
     fieldset,
     figcaption,
     figure,
+    frame,
     frameset,
     form,
     font,
@@ -2749,11 +2704,9 @@ pub const Tag = enum {
             .param,
             .rp,
             .script,
-            .source,
             .style,
             .template,
             .title,
-            .track,
             => true,
             else => false,
         };
@@ -3079,6 +3032,28 @@ test "Element: scroll extent" {
     // offset stays unbounded.
     try text.setScrollTop(9999, frame);
     try testing.expectEqual(9999, text.getScrollTop(frame));
+}
+
+test "Element: getTag for every tag name" {
+    // getTag casts Html.Type to Tag, so the two enums must stay aligned. Names
+    // that aren't HTML elements (svg tags, internal ones) create an unknown
+    // element.
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var matched: usize = 0;
+    inline for (@typeInfo(Tag).@"enum".field_names) |name| {
+        const el = try frame.window._document.createElement(name, null, frame);
+        const tag = el.getTag();
+        if (tag == @field(Tag, name)) {
+            matched += 1;
+        } else if (tag != .unknown) {
+            std.debug.print("createElement(\"{s}\") has tag {t}\n", .{ name, tag });
+            return error.TagMismatch;
+        }
+    }
+    // Most names are HTML elements, so the check above isn't vacuous
+    try testing.expect(matched > 100);
 }
 
 test "Element: div chain slot size" {

@@ -914,8 +914,8 @@ fn readMarkdownAlternate(arena: std.mem.Allocator, session: *lp.Session, frame: 
 /// The node a read tool works on: the selector match, the registry node, or
 /// the whole document. All three live in the current frame.
 pub fn resolveScope(session: *lp.Session, registry: *NodeRegistry, page: *lp.Frame, selector: ?[]const u8, node_id: ?NodeRegistry.Id) ToolError!*DOMNode {
-    if (selector == null and node_id == null) return page.document.asNode();
-    return (try resolveTarget(session, registry, selector, node_id)).node;
+    if (selector) |sel| return (try resolveBySelector(session, sel)).node;
+    return (try resolveOptionalNode(registry, node_id)) orelse page.document.asNode();
 }
 
 const HtmlParams = struct {
@@ -1812,7 +1812,7 @@ fn execPress(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeRegi
         target_node = resolved.node;
     } else {
         page = try requireFrame(session);
-        target_node = try resolveOptionalNode(registry, args.backendNodeId);
+        if (args.backendNodeId) |id| target_node = try resolveActionNode(registry, id);
     }
 
     const scope = beginAction(session);
@@ -2206,8 +2206,16 @@ fn performGoto(session: *lp.Session, registry: *NodeRegistry, url: [:0]const u8,
 
 fn resolveNodeAndPage(session: *lp.Session, registry: *NodeRegistry, node_id: NodeRegistry.Id) ToolError!NodeAndPage {
     const page = try requireFrame(session);
+    const node = try resolveActionNode(registry, node_id);
+    return .{ .node = node, .page = page, .target = .{ .backend_node_id = node_id } };
+}
+
+/// A re-render leaves the id registered on a detached node; acting on it would
+/// miss the live page.
+fn resolveActionNode(registry: *NodeRegistry, node_id: NodeRegistry.Id) ToolError!*DOMNode {
     const node = registry.lookup_by_id.get(node_id) orelse return ToolError.NodeNotFound;
-    return .{ .node = node.dom, .page = page, .target = .{ .backend_node_id = node_id } };
+    if (!node.dom.isConnected()) return ToolError.NodeNotFound;
+    return node.dom;
 }
 
 pub fn resolveBySelector(session: *lp.Session, selector: []const u8) ToolError!NodeAndPage {
@@ -2245,6 +2253,25 @@ test "call: an argument diagnosis is in-band but counts as invalid_params" {
     const bad_enum = call(arena.allocator(), testing.test_session, &registry, "waitForState", args, .{ .source = .user });
     try std.testing.expect((try bad_enum).is_error);
     try std.testing.expectEqual(.invalid_params, telemetryOutcome(bad_enum));
+}
+
+test "waitForState: a state the page never reaches times out" {
+    var registry: NodeRegistry = .init(std.testing.allocator);
+    defer registry.deinit();
+
+    // A 5s timer keeps the page from reaching done, long after it reaches load.
+    var page = try testing.pageTest("runner/late_fetch.html", .{ .wait_until_done = false });
+    defer page.close();
+
+    const aa = testing.arena_allocator;
+    const load = try std.json.parseFromSliceLeaky(std.json.Value, aa, "{\"state\":\"load\",\"timeout\":2000}", .{});
+    const loaded = try call(aa, page.session, &registry, "waitForState", load, .{ .source = .user });
+    try std.testing.expectEqualStrings("Page reached load.", loaded.text);
+
+    const done = try std.json.parseFromSliceLeaky(std.json.Value, aa, "{\"state\":\"done\",\"timeout\":200}", .{});
+    const timed_out = call(aa, page.session, &registry, "waitForState", done, .{ .source = .user });
+    try std.testing.expectError(error.Timeout, timed_out);
+    try std.testing.expectEqual(.timeout, telemetryOutcome(timed_out));
 }
 
 test "tree and nodeDetails read the node's own frame" {
@@ -2748,7 +2775,7 @@ test "markdown: a same-url page whose navigation failed is navigated again" {
 
     const aa = testing.arena_allocator;
     const args = try std.json.parseFromSliceLeaky(std.json.Value, aa,
-        \\{"url":"http://localhost:1/"}
+        \\{"url":"http://localhost:65534/"}
     , .{});
     try std.testing.expect((try call(aa, session, &registry, "goto", args, .{ .source = .user })).is_error);
     try std.testing.expect((try call(aa, session, &registry, "markdown", args, .{ .source = .user })).is_error);

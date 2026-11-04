@@ -576,6 +576,12 @@ pub fn deinit(self: *Frame) void {
     self._local_arena.release();
 }
 
+// Frees what local_arena holds. For Zig code that runs outside a JS call
+// (CDP, fetch), where no Caller resets it.
+pub fn resetLocalArena(self: *Frame) void {
+    self._local_arena.reset(if (comptime lp.IS_DEBUG) 0 else JS.Caller.LOCAL_ARENA_RETAIN);
+}
+
 pub fn viewportChanged(self: *Frame) void {
     var i: usize = 0;
     while (i < self._media_query_lists.items.len) : (i += 1) {
@@ -1069,6 +1075,18 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
         // don't defer this, the caller is responsible for freeing it on error
         arena.release();
         return;
+    }
+
+    // A frame that got its about:blank window while iframe loading was off
+    // loads nothing else while it stays off; fragment navigations still run.
+    if (target.iframe) |iframe| {
+        const document_url = resolved_url[0 .. std.mem.indexOfScalar(u8, resolved_url, '#') orelse resolved_url.len];
+        if (iframe._blank_only and !target._session.load_resources.iframe and !URL.isAboutBlank(document_url)) {
+            target.page.status.noteSkipped(.iframe);
+            // don't defer this, the caller is responsible for freeing it on error
+            arena.release();
+            return;
+        }
     }
 
     if (URL.isFetchable(resolved_url) == false) {
@@ -2204,12 +2222,6 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     if (iframe._executed) {
         return;
     }
-    if (self._session.load_resources.iframe == false) {
-        self.page.status.noteSkipped(.iframe);
-        iframe._executed = true;
-        return;
-    }
-
     const src = blk: {
         if (iframe.hasSrcdoc()) {
             // srcdoc takes precedence over src, even when empty
@@ -2227,6 +2239,15 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
         }
         break :blk src;
     };
+
+    // With iframe loading off, an iframe that needs no request still gets its
+    // about:blank window, as scripts expect one right after insertion.
+    const loading = self._session.load_resources.iframe;
+    if (loading == false and !URL.isAboutBlank(src)) {
+        self.page.status.noteSkipped(.iframe);
+        iframe._executed = true;
+        return;
+    }
 
     if (iframe._window != null) {
         // This frame is being re-navigated. We need to do this through a
@@ -2258,6 +2279,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
         self._pending_loads += 1;
     }
     new_frame.iframe = iframe;
+    iframe._blank_only = !loading;
     iframe._window = new_frame.window;
     errdefer iframe._window = null;
 
@@ -4229,6 +4251,10 @@ test "WebApi: Frames" {
     try testing.htmlRunner("frames", .{});
 }
 
+test "WebApi: Frames with iframe loading off" {
+    try testing.htmlRunner("frames/loading_off", .{ .load_resources = .{ .worker = true, .iframe = false } });
+}
+
 test "WebApi: Frame Blob" {
     testing.silenceLog(&.{ .frame, .browser, .js });
     try testing.htmlRunner("frames/blob", .{});
@@ -4393,7 +4419,7 @@ test "Frame: a failed navigation commits an error document over the superseded o
     defer page.close();
     const frame = page.frame().?;
 
-    try testing.expectEqualSlices(u8, "http://127.0.0.1:1/unreachable", frame.url);
+    try testing.expectEqualSlices(u8, "http://127.0.0.1:65534/unreachable", frame.url);
     try testing.expectEqual(.complete, frame._load_state);
 
     var ls: JS.Local.Scope = undefined;
