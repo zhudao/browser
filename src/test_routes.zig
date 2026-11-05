@@ -33,6 +33,10 @@ const TestHTTPServer = @import("TestHTTPServer.zig");
 var sse_flag = std.atomic.Value(bool).init(false);
 var sse_reconnect_hits = std.atomic.Value(usize).init(0);
 
+// /auth/proxy/*: a proxy retry carries nothing the origin can see, so this
+// tells the challenge (first request) from the retry (second).
+var auth_proxy_challenged = std.atomic.Value(bool).init(false);
+
 /// A `/src/browser/tests/` load with `held=1` in its query waits while this is
 /// set, so a test can keep a load in flight exactly as long as it needs.
 pub var hold_loads = std.atomic.Value(bool).init(false);
@@ -145,6 +149,7 @@ pub fn handle(req: *std.http.Server.Request) !void {
         cache_set_cookie_count = 0;
         sse_flag.store(false, .release);
         sse_reconnect_hits.store(0, .release);
+        auth_proxy_challenged.store(false, .release);
         {
             beacon_mutex.lockUncancelable(lp.io);
             defer beacon_mutex.unlock(lp.io);
@@ -289,6 +294,15 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/redirect-bad-port")) {
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://127.0.0.1:22/" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/redirect-cross-origin-x-hop")) {
         return req.respond("", .{
             .status = .found,
@@ -307,6 +321,27 @@ pub fn handle(req: *std.http.Server.Request) !void {
             .status = .found,
             .extra_headers = &.{
                 .{ .name = "Location", .value = location },
+            },
+        });
+    }
+
+    // The way back from /redirect-cross-origin/: to the same path on 127.0.0.1.
+    if (std.mem.startsWith(u8, path, "/redirect-127/")) {
+        var location_buf: [1024]u8 = undefined;
+        const location = try std.mem.print(&location_buf, "http://127.0.0.1:9582/{s}", .{path["/redirect-127/".len..]});
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = location },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/set-cookie-lax")) {
+        return req.respond("<p>lax", .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html" },
+                .{ .name = "Set-Cookie", .value = "xsite_redirect_lax=1; SameSite=Lax" },
             },
         });
     }
@@ -493,6 +528,50 @@ pub fn handle(req: *std.http.Server.Request) !void {
                 .{ .name = "WWW-Authenticate", .value = "Basic realm=\"test\"" },
             },
         });
+    }
+
+    // /auth/{server,proxy}/{same,cross}: challenges the first request (401
+    // or 407), then redirects the retry to /echo-authorization on this host
+    // (same) or the other loopback host (cross).
+    if (std.mem.startsWith(u8, path, "/auth/")) {
+        const rest = path["/auth/".len..];
+        const proxy = std.mem.startsWith(u8, rest, "proxy/");
+        const challenge = if (proxy) !auth_proxy_challenged.swap(true, .acq_rel) else blk: {
+            var it = req.iterateHeaders();
+            while (it.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "authorization")) break :blk false;
+            }
+            break :blk true;
+        };
+        if (challenge) {
+            return req.respond("No", .{
+                .status = if (proxy) .proxy_auth_required else .unauthorized,
+                .extra_headers = &.{
+                    .{ .name = if (proxy) "Proxy-Authenticate" else "WWW-Authenticate", .value = "Basic realm=\"test\"" },
+                },
+            });
+        }
+        if (proxy) auth_proxy_challenged.store(false, .release);
+        const host = if (std.mem.endsWith(u8, rest, "/cross")) "localhost" else "127.0.0.1";
+        var location_buf: [64]u8 = undefined;
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = try std.mem.print(&location_buf, "http://{s}:9582/echo-authorization", .{host}) },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/echo-authorization")) {
+        var it = req.iterateHeaders();
+        var value: []const u8 = "NONE";
+        while (it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
+                value = header.value;
+                break;
+            }
+        }
+        return req.respond(value, .{});
     }
 
     if (std.mem.eql(u8, path, "/xhr/500")) {
@@ -990,6 +1069,32 @@ pub fn handle(req: *std.http.Server.Request) !void {
         });
     }
 
+    if (std.mem.eql(u8, path, "/cors_expose_headers_listed")) {
+        // Cross-origin response listing X-Secret in Access-Control-Expose-Headers
+        // (it must stay visible), alongside X-Hidden, which isn't listed
+        // (it must stay hidden even though the response is otherwise allowed).
+        return req.respond("", .{
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "Access-Control-Expose-Headers", .value = "X-Secret" },
+                .{ .name = "X-Secret", .value = "s3cr3t" },
+                .{ .name = "X-Hidden", .value = "shh" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/cors_expose_headers_unlisted")) {
+        // Same custom header, but not listed in Access-Control-Expose-Headers:
+        // it must be hidden from a cross-origin caller, even though the
+        // response allows the origin.
+        return req.respond("", .{
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "X-Secret", .value = "s3cr3t" },
+            },
+        });
+    }
+
     if (std.mem.eql(u8, path, "/set_cookie")) {
         return req.respond("", .{
             .extra_headers = &.{
@@ -1016,6 +1121,36 @@ pub fn handle(req: *std.http.Server.Request) !void {
             .status = .found,
             .extra_headers = &.{
                 .{ .name = "Location", .value = "http://localhost:9582/echo_headers" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_a_b_a")) {
+        // 302 to the localhost alias, which itself 302s back to 127.0.0.1 —
+        // an A -> B -> A chain. Even though the final URL is back on the
+        // requesting origin, the hop through B must leave the response
+        // permanently CORS-tainted (response.type === 'cors' in fetch,
+        // cross-origin header stripping in XHR), not reset to "basic".
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Location", .value = "http://localhost:9582/redirect_b_a" },
+            },
+        });
+    }
+
+    if (std.mem.eql(u8, path, "/redirect_b_a")) {
+        // Second hop of the A -> B -> A chain: back to the original origin,
+        // landing on an endpoint that exposes one header and withholds
+        // another. If the chain were wrongly reset to "basic" on return to
+        // A, the hidden header would wrongly become visible. Once
+        // cross-origin-tainted, every response in the chain — including this
+        // redirect itself — must pass the CORS check, so it needs ACAO.
+        return req.respond("", .{
+            .status = .found,
+            .extra_headers = &.{
+                .{ .name = "Access-Control-Allow-Origin", .value = origin(req) orelse "*" },
+                .{ .name = "Location", .value = "http://127.0.0.1:9582/cors_expose_headers_listed" },
             },
         });
     }

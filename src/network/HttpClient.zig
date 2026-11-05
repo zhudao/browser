@@ -31,6 +31,7 @@ const WebSocket = @import("../browser/webapi/net/WebSocket.zig");
 const Cookie = @import("../browser/webapi/storage/Cookie.zig");
 const Performance = @import("../browser/webapi/Performance.zig");
 const GlobalScope = @import("../browser/global_scope.zig").GlobalScope;
+const Attribution = @import("../browser/js/Attribution.zig");
 
 const http = @import("http.zig");
 const Network = @import("Network.zig");
@@ -443,22 +444,6 @@ fn isUrlBlocked(self: *const Client, transfer: *const Transfer) bool {
     return if (self.network.adblocker) |*blocker| blocker.isBlocked(transfer) else false;
 }
 
-/// The Fetch standard forbids a request to one of the "bad ports" (22, 25,
-/// 110, 143, ...): they are the services a page has no business speaking to,
-/// so reaching them from script turns the browser into a port scanner. The
-/// list lives in `http.isBadPort`; WebSocket already consulted it, but every
-/// other caller — fetch, XHR, subresources, navigation, redirect targets —
-/// went straight to the network. Checked in the pipeline so a redirect hop is
-/// covered too.
-fn isBadPortUrl(url: []const u8) bool {
-    const port = URL.getPort(url);
-    if (port.len == 0) {
-        // No explicit port: the scheme's default is never a bad port.
-        return false;
-    }
-    return http.isBadPort(std.fmt.parseInt(u16, port, 10) catch return false);
-}
-
 fn adblockSourceUrl(transfer: *const Transfer) ?[]const u8 {
     var owner: *const Owner = transfer.owner orelse return null;
     if (transfer.req.resource_type == .document) {
@@ -732,10 +717,6 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
         };
         owned.cookie_origin = null;
 
-        if (req.basic_auth_credentials) |c| {
-            owned.basic_auth_credentials = try arena.dupeSentinel(u8, c, 0);
-        }
-
         const raw_origin: ?[]const u8 = req.origin orelse if (owner) |o| o.scope.origin() else null;
         owned.origin = if (raw_origin) |origin| try arena.dupe(u8, origin) else null;
         if (req.initiator_origin) |origin| {
@@ -789,6 +770,13 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
     if (owner) |o| {
         o.addTransfer(transfer);
         transfer.owner = o;
+        const task = o.scope.beginRequestTask(transfer.req.url, transfer.req.resource_type);
+        transfer._task = task;
+
+        switch (transfer.req.resource_type) {
+            .eventsource, .download => {}, // Open-ended: they'd hold settled forever.
+            else => transfer._settle_hold = o.scope.settle().hold(task),
+        }
     }
 
     return transfer;
@@ -1136,7 +1124,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
 
             // Internal transfers (robots.txt, the CORS preflight fetch) are
             // browser bookkeeping, not a page-chosen destination.
-            if (transfer.req.internal == false and isBadPortUrl(transfer.req.url)) {
+            if (transfer.req.internal == false and http.isBadPortUrl(transfer.req.url)) {
                 log.info(.http, "blocked unsafe port", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UnsafePort);
             }
@@ -1508,6 +1496,7 @@ const SyncContext = struct {
     headers: std.ArrayList(http.Header) = .empty,
     content_type: ?[]const u8 = null,
     script_cache: ?ScriptCache = null,
+    cross_origin: bool = false,
 
     // Holds everything but the body (content type, headers, script cache).
     // Acquired on first use. Ownership moves to the SyncResponse.
@@ -1518,6 +1507,7 @@ const SyncContext = struct {
         lp.assert(transfer.responseStatus() != null, "HttpClient.SyncRequest.headerCallback", .{ .value = transfer.responseStatus() });
         self.status = transfer.responseStatus().?;
         self.status_text = transfer.res.status_text;
+        self.cross_origin = transfer._cors_cross_origin;
 
         // A streamed body's length is 0 here, but its content type is still wanted.
         const body_len = transfer.bodyLen();
@@ -2213,7 +2203,6 @@ pub const Request = struct {
     resource_type: ResourceType,
     redirect: RedirectMode = .follow,
     referrer_policy: ?referrer.Policy = null,
-    basic_auth_credentials: ?[:0]const u8 = null,
     credentials_mode: CredentialsMode,
     request_mode: RequestMode,
     timeout_ms: u32 = 0,
@@ -2318,6 +2307,7 @@ const SyncResponse = struct {
     content_type: ?[]const u8, // always captured (most callers need it)
     script_cache: ?ScriptCache, // see Transfer.script_cache
     arena: ?*lp.Arena, // see SyncContext.arena
+    cross_origin: bool, // snapshot of Transfer._cors_cross_origin, captured before the transfer may be freed
 
     pub fn deinit(self: *SyncResponse) void {
         self.body.deinit();
@@ -2615,6 +2605,7 @@ pub const Owner = struct {
     }
 
     fn removeTransfer(self: *Owner, t: *Transfer) void {
+        t._settle_hold.release();
         self.transfers.remove(&t.owner_node);
     }
 
@@ -2672,6 +2663,11 @@ pub const Transfer = struct {
 
     _auth_challenge: ?http.AuthChallenge = null,
 
+    // "user:password" from Fetch.continueWithAuth. Proxy credentials must
+    // never reach a server. Server ones are dropped on a cross-origin redirect
+    _server_credentials: ?[:0]const u8 = null,
+    _proxy_credentials: ?[:0]const u8 = null,
+
     // What declining _auth_challenge fails with (a refused CONNECT), instead
     // of delivering the response. Set when the challenge is offered to CDP.
     _auth_declined_err: ?anyerror = null,
@@ -2713,6 +2709,12 @@ pub const Transfer = struct {
     // Response came from the http cache; drives the served-from-cache
     // notification at delivery.
     _from_cache: bool = false,
+
+    // Work started by the callback of this request are attributed to it
+    _task: ?Attribution.Tag = null,
+
+    // The hold to release for settling the load
+    _settle_hold: Attribution.Hold = .{},
 
     // What the cache wants from this transfer's response.
     _cache_intent: CacheIntent = .none,
@@ -3023,12 +3025,18 @@ pub const Transfer = struct {
                 .content_type = sync_ctx.content_type,
                 .script_cache = sync_ctx.script_cache,
                 .arena = sync_ctx.arena,
+                .cross_origin = sync_ctx.cross_origin,
             },
             .err => |e| return e,
         }
     }
 
     pub fn deinit(self: *Transfer) void {
+        if (comptime lp.IS_DEBUG) {
+            if (self._task) |task| {
+                log.debug(.attribution, "request done", .{ .id = task });
+            }
+        }
         if (self._retired) {
             // transfer.deinit should be called once. But _retired and the graveyard
             // are a safety net born out of UAFs.
@@ -3123,6 +3131,13 @@ pub const Transfer = struct {
     fn logScope(self: *const Transfer) log.PageScope {
         const owner = self.owner orelse return log.enterPage(null);
         return owner.logScope();
+    }
+
+    fn taskScope(self: *const Transfer) ?GlobalScope.TaskScope {
+        // Only set when newRequest had an owner (unit tests fake owner.scope).
+        const task = self._task orelse return null;
+        const owner = self.owner orelse return null;
+        return owner.scope.enterTask(task);
     }
 
     // Fail this transfer with `err`. Fires error_callback once (latched
@@ -3361,6 +3376,9 @@ pub const Transfer = struct {
         }
 
         self._outcome_delivered = true;
+
+        const task_scope = self.taskScope();
+        defer if (task_scope) |ts| ts.exit();
         self.req.error_callback(self.req.ctx, err);
     }
 
@@ -3724,10 +3742,15 @@ pub const Transfer = struct {
             return;
         }
         const jar = self.cookie_jar orelse return;
+        var same_site: ?bool = null;
         for (headers) |hdr| {
-            if (std.mem.eql(u8, hdr.name, "set-cookie")) {
-                try jar.populateFromResponse(self.req.url, hdr.value);
+            if (!std.mem.eql(u8, hdr.name, "set-cookie")) {
+                continue;
             }
+            if (same_site == null) {
+                same_site = self.requestKind() != .subresource or Cookie.areSameSite(self.cookie_origin, URL.getHostname(self.req.url));
+            }
+            try jar.populateFromResponseInContext(self.req.url, hdr.value, same_site.?);
         }
     }
 
@@ -3916,21 +3939,19 @@ pub const Transfer = struct {
             try conn.setTimeout(0);
         }
 
-        // add credentials
-        if (req.basic_auth_credentials) |creds| {
-            if (self._auth_challenge != null and self._auth_challenge.?.source == .proxy) {
-                try conn.setProxyCredentials(creds);
-            } else {
-                try conn.setCredentials(creds);
-            }
+        if (self._proxy_credentials) |creds| {
+            try conn.setProxyCredentials(creds);
+        }
+        if (self._server_credentials) |creds| {
+            try conn.setCredentials(creds);
         }
     }
 
     pub fn reset(self: *Transfer) void {
         // Note: do NOT reset _auth_challenge or _redirect_count here. They
-        // span retries — _auth_challenge tells makeRequest whether to use
-        // setProxyCredentials vs setCredentials; _redirect_count caps the
-        // total hops. The rest of the response state is per-attempt.
+        // span retries: _auth_challenge tells updateCredentials which slot
+        // the answer goes in; _redirect_count caps the total hops. The rest
+        // of the response state is per-attempt.
         self._notified_fail = false;
         self._tries += 1;
         self.res.buffer.clearRetainingCapacity();
@@ -4060,11 +4081,12 @@ pub const Transfer = struct {
         }
 
         // When the redirect target is not same-origin with the current URL,
-        // the Authorization header must not follow the request to the new
-        // origin.
+        // the server's credentials (header or continueWithAuth) must not
+        // follow the request to the new origin.
         // _auth_challenge is always cleared thanks to detectAuthChallenge.
         if (!URL.isSameOrigin(url, req.url)) {
             transfer.removeHeader("Authorization");
+            transfer._server_credentials = null;
         }
 
         transfer.redirectTaint(url);
@@ -4129,7 +4151,16 @@ pub const Transfer = struct {
     }
 
     pub fn updateCredentials(self: *Transfer, userpwd: [:0]const u8) void {
-        self.req.basic_auth_credentials = userpwd;
+        // Only an auth-stage pause takes credentials, and it always has a
+        // challenge. Without one there's no telling which slot is safe, so
+        // keep nothing.
+        std.debug.assert(self._auth_challenge != null);
+        const challenge = self._auth_challenge orelse return;
+        if (challenge.source == .proxy) {
+            self._proxy_credentials = userpwd;
+        } else {
+            self._server_credentials = userpwd;
+        }
     }
 
     const RequestHeader = struct {
@@ -4607,6 +4638,9 @@ pub const Transfer = struct {
     fn deliver(transfer: *Transfer) void {
         const page_scope = transfer.logScope();
         defer page_scope.exit();
+
+        const task_scope = transfer.taskScope();
+        defer if (task_scope) |ts| ts.exit();
 
         // A streaming batch is delivered while the conn is still inflight;
         // that state is restored after the batch unless it turned terminal.
@@ -5200,25 +5234,6 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
     client.network = &test_network;
 }
 
-test "HttpClient: isBadPortUrl rejects the Fetch bad ports" {
-    // Ports from https://fetch.spec.whatwg.org/#bad-port
-    try testing.expect(isBadPortUrl("http://example.com:22/"));
-    try testing.expect(isBadPortUrl("https://example.com:25/x"));
-    try testing.expect(isBadPortUrl("http://127.0.0.1:110/"));
-    try testing.expect(isBadPortUrl("http://example.com:143/"));
-    try testing.expect(isBadPortUrl("ws://example.com:5060/"));
-
-    // Ordinary ports and the scheme defaults are fine.
-    try testing.expect(!isBadPortUrl("http://example.com/"));
-    try testing.expect(!isBadPortUrl("https://example.com:443/"));
-    try testing.expect(!isBadPortUrl("http://127.0.0.1:9582/xhr"));
-    try testing.expect(!isBadPortUrl("ws://127.0.0.1:9584/"));
-
-    // An unparsable or out-of-range port is left to the transport to reject.
-    try testing.expect(!isBadPortUrl("http://example.com:abc/"));
-    try testing.expect(!isBadPortUrl("http://example.com:99999/"));
-}
-
 test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
     var pool = ArenaPool.init(testing.allocator, .{});
     defer pool.deinit();
@@ -5615,6 +5630,62 @@ test "HttpClient: Fetch header overrides restore after one hop" {
     // idempotent once restored
     transfer.restoreInterceptHeaders();
     try testing.expectEqual(2, transfer.req_headers.items.len);
+}
+
+test "HttpClient: only a same-site request or a top-level navigation sets SameSite cookies" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const set_cookies = [_]http.Header{
+        .{ .name = "set-cookie", .value = "strict=1; SameSite=Strict" },
+        .{ .name = "set-cookie", .value = "lax=1; SameSite=Lax" },
+        .{ .name = "set-cookie", .value = "default=1" },
+        .{ .name = "set-cookie", .value = "none=1; SameSite=None; Secure" },
+    };
+
+    var top_url: [:0]const u8 = "https://attacker.example/";
+    var top = testOwner(&top_url, null);
+    var frame_url: [:0]const u8 = "https://victim.example/frame";
+    var frame = testOwner(&frame_url, &top);
+
+    const Case = struct { owner: *Owner, resource_type: Request.ResourceType, method: Method = .GET, top: [:0]const u8, stored: []const u8 };
+    const cases = [_]Case{
+        // A cross-site iframe's document and a cross-site fetch.
+        .{ .owner = &frame, .resource_type = .document, .top = "https://attacker.example/", .stored = "none" },
+        .{ .owner = &top, .resource_type = .xhr, .top = "https://attacker.example/", .stored = "none" },
+        // A top-level navigation, whoever started it.
+        .{ .owner = &top, .resource_type = .document, .top = "https://attacker.example/", .stored = "strict lax default none" },
+        .{ .owner = &top, .resource_type = .document, .method = .POST, .top = "https://attacker.example/", .stored = "strict lax default none" },
+        // Same-site: an iframe and a fetch.
+        .{ .owner = &frame, .resource_type = .document, .top = "https://www.victim.example/", .stored = "strict lax default none" },
+        .{ .owner = &top, .resource_type = .xhr, .top = "https://www.victim.example/", .stored = "strict lax default none" },
+    };
+
+    for (cases) |case| {
+        top_url = case.top;
+        const arena = try pool.acquire(.small, "test");
+        defer arena.release();
+        var jar = CookieJar.init(testing.allocator, null);
+        defer jar.deinit();
+
+        var transfer = testTransfer(arena);
+        transfer.req.url = "https://victim.example/";
+        transfer.req.credentials_mode = .include;
+        transfer.req.resource_type = case.resource_type;
+        transfer.req.method = case.method;
+        transfer.owner = case.owner;
+        transfer.cookie_origin = case.owner.siteForCookies();
+        transfer.cookie_jar = &jar;
+        try transfer.applySetCookies(&set_cookies);
+
+        var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(testing.allocator);
+        for (jar.siteCookies("victim.example")) |c| {
+            if (names.items.len > 0) try names.append(testing.allocator, ' ');
+            try names.appendSlice(testing.allocator, c.name);
+        }
+        try testing.expectEqual(case.stored, names.items);
+    }
 }
 
 test "HttpClient: Owner.siteForCookies" {
