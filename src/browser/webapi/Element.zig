@@ -22,10 +22,11 @@ const lp = @import("lightpanda");
 const js = @import("../js/js.zig");
 const dump = @import("../dump.zig");
 const Frame = @import("../Frame.zig");
+const layout = @import("../layout.zig");
 const Factory = @import("../Factory.zig");
 const StyleManager = @import("../StyleManager.zig");
-const layout = @import("../layout.zig");
 const text_measure = @import("../text_measure.zig");
+const user_input = @import("../frame/user_input.zig");
 
 const CSS = @import("CSS.zig");
 const Node = @import("Node.zig");
@@ -825,6 +826,13 @@ pub fn hasDisabledConcept(self: *const Element) bool {
     };
 }
 
+/// Chrome's IsDisabledFormControl: a disabled control, where trusted mouse
+/// events stop. A disabled <fieldset> disables its descendants but is not one
+/// itself.
+pub fn isDisabledFormControl(self: *const Element) bool {
+    return self.getTag() != .fieldset and self.isDisabled();
+}
+
 pub fn isDisabled(self: *const Element) bool {
     if (!self.hasDisabledConcept()) {
         return false;
@@ -1344,7 +1352,17 @@ pub fn isFocusable(self: *Element, frame: *Frame) bool {
     return self.isVisible(frame);
 }
 
+/// What focusing an editing host does to the selection.
+pub const FocusCaret = enum {
+    none,
+    restore,
+};
+
 pub fn focus(self: *Element, frame: *Frame) !void {
+    return self.focusWith(.restore, frame);
+}
+
+pub fn focusWith(self: *Element, caret: FocusCaret, frame: *Frame) !void {
     if (self.asNode().isConnected() == false) {
         // a disconnected node cannot take focus
         return;
@@ -1368,6 +1386,11 @@ pub fn focus(self: *Element, frame: *Frame) !void {
     doc.setActiveElement(self, owner);
 
     const old_related: ?*EventTarget = if (old_active) |old| try blurFocusedArea(old, new_target, owner) else null;
+
+    if (caret == .restore) {
+        // Place caret before the focus events fire
+        try user_input.caretOnFocus(self, owner);
+    }
 
     const FocusEvent = @import("event/FocusEvent.zig");
 
