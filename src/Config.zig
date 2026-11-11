@@ -243,10 +243,11 @@ pub const LoadResources = packed struct(u6) {
     none: bool = false,
 };
 
-pub const ExperimentalFeatures = packed struct(u3) {
+pub const ExperimentalFeatures = packed struct(u4) {
     cors: bool = false, // ignored, kept only for backward compatibility.
     serviceworker: bool = false,
     privatecache: bool = false,
+    animation: bool = false,
 };
 
 const DisabledFeatures = packed struct(u1) {
@@ -884,7 +885,7 @@ pub fn advertiseHost(self: *const Config) []const u8 {
 
 // The --advertise-host value when the operator set one. Unlike
 // advertiseHost() there is no fallback: only an explicit choice may widen the
-// WebSocket Host check (see isAllowedHost in server/http.zig).
+// Host check (see isAllowedHost in server/http.zig).
 pub fn explicitAdvertiseHost(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
         .serve => |opts| opts.advertise_host,

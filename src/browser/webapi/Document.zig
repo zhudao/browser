@@ -191,8 +191,7 @@ fn setDesignMode(self: *Document, value: []const u8, frame: *Frame) void {
         return;
     if (on != self._design_mode) {
         self._design_mode = on;
-        // :read-write now matches differently
-        frame.styleChanged();
+        Frame.change.documentStateChanged(.design_mode, frame);
     }
 }
 
@@ -828,8 +827,9 @@ pub fn setActiveElement(self: *Document, element: ?*Element, frame: *Frame) void
     if (self._active_element == element) {
         return;
     }
+    const old = self._active_element;
     self._active_element = element;
-    frame.styleChanged();
+    Frame.change.focusChanged(old, element, frame);
 }
 
 pub fn getStyleSheets(self: *Document, frame: *Frame) !*StyleSheetList {
@@ -890,7 +890,6 @@ pub fn append(self: *Document, nodes: js.Variadic(Node.NodeOrText), frame: *Fram
     try validateDocumentNodes(self, nodes.values);
 
     const parent = self.asNode();
-    frame.domChanged();
 
     for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(self);
@@ -914,7 +913,6 @@ pub fn prepend(self: *Document, nodes: js.Variadic(Node.NodeOrText), frame: *Fra
     try validateDocumentNodes(self, nodes.values);
 
     const parent = self.asNode();
-    frame.domChanged();
 
     var i = nodes.values.len;
     while (i > 0) {
@@ -1361,7 +1359,13 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
         break :blk joined.items;
     };
 
-    if (self._current_script == null or frame._load_state != .parsing) {
+    const inline_write = self._current_script != null and switch (frame._load_state) {
+        .parsing => true,
+        // a deferred script, unless it explicitly opened the document
+        .interactive => self._script_created_parser == null,
+        else => false,
+    };
+    if (inline_write == false) {
         if (self._script_created_parser == null or looksLikeNewDocument(html)) {
             _ = try self.open(frame);
         }
@@ -1452,8 +1456,6 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
         // always append, JS run earlier might have deatched the previous node
         try frame.appendNode(parent, child, .{});
     }
-
-    frame.domChanged();
 }
 
 pub fn open(self: *Document, call_frame: *Frame) !*Document {
