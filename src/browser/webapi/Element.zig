@@ -810,6 +810,12 @@ pub fn hasAttributeInterned(self: *const Element, comptime name: []const u8) boo
     return self._attributes.hasInterned(name);
 }
 
+/// Only HTML elements take the inert attribute. This is the element's own
+/// attribute; Node.isInert also checks its flat-tree ancestors.
+pub fn hasInertAttribute(self: *const Element) bool {
+    return self._namespace == .html and self.hasAttributeSafe(comptime .wrap("inert"));
+}
+
 // Per HTML "concept-fe-disabled", only listed elements participate in the
 // disabled concept. Anything else (e.g. <div disabled>) has no disabled
 // state and never matches :disabled / :enabled.
@@ -1101,7 +1107,7 @@ pub fn getOrCreateStyle(self: *Element, frame: *Frame) !*CSSStyleProperties {
     const page = frame.page;
     const gop = try page.element_styles.getOrPut(page.arena, self);
     if (!gop.found_existing) {
-        gop.value_ptr.* = try CSSStyleProperties.init(self, false, owner);
+        gop.value_ptr.* = try CSSStyleProperties.init(.{ .inline_style = self }, owner);
     }
     self._flags.has_inline_style = true;
     return gop.value_ptr.*;
@@ -2133,13 +2139,13 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
     const style_manager = &owner._style_manager;
 
     if (self.inlineStyle(frame)) |style| {
-        x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+        x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getKnownPropertyValue(.transform, frame));
     }
 
     while (current.flatParent(frame)) |parent| {
         if (parent.is(Element)) |el| {
             if (el.inlineStyle(frame)) |style| {
-                x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getPropertyValue("transform", frame));
+                x += CSS.parseTranslateX(style.asCSSStyleDeclaration().getKnownPropertyValue(.transform, frame));
             }
         }
         x += lineOffset(current, parent, style_manager, frame);
