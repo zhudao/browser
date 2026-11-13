@@ -29,6 +29,7 @@ const lp = @import("lightpanda");
 
 const Frame = @import("../Frame.zig");
 const observers = @import("observers.zig");
+const StyleManager = @import("../StyleManager.zig");
 
 const Node = @import("../webapi/Node.zig");
 const CData = @import("../webapi/CData.zig");
@@ -37,57 +38,92 @@ const Element = @import("../webapi/Element.zig");
 const String = lp.String;
 
 pub fn attributeSet(element: *Element, name: String, old: ?String, new: String, frame: *Frame) void {
-    _ = element;
     if (old) |o| {
         if (o.eql(new)) {
             // Nothing that reads attributes can tell.
             return;
         }
     }
-    attributeChanged(name, frame);
+    // By pointer: a short String's str() points into it
+    attributeChanged(element, name, if (old) |*o| o.str() else null, new.str(), frame);
 }
 
 /// A style attribute write no selector can see (see Attribute.List.putInertStyle).
 pub fn inertStyleSet(element: *Element, frame: *Frame) void {
-    _ = element;
-    layoutObserversChanged(frame);
+    if (detachedHandled(element.asNode(), frame) == false) {
+        layoutObserversChanged(frame);
+    }
 }
 
 pub fn attributeRemoved(element: *Element, name: String, old: String, frame: *Frame) void {
-    _ = element;
-    _ = old;
-    attributeChanged(name, frame);
+    attributeChanged(element, name, old.str(), null, frame);
 }
 
-fn attributeChanged(name: String, frame: *Frame) void {
-    if (frame._style_manager.readsAttribute(name.str())) {
-        // the style manager is tracking selectors with this attribute
-        renderingChanged(frame);
-    }
-
+fn attributeChanged(element: *Element, name: String, old: ?[]const u8, new: ?[]const u8, frame: *Frame) void {
     frame.page.dom_version += 1;
+    // A frameless document (DOMParser, XHR) has no styles
+    const owner = element.ownerFrame(frame) orelse return;
+    if (owner._style_manager.readsAttribute(name.str()) == false) {
+        // no selector reads it, and neither does the engine
+        return;
+    }
+    if (detachedHandled(element.asNode(), frame)) {
+        return;
+    }
+    if (name.eql(comptime .wrap("style"))) {
+        if (owner._style_manager.styleAttributeChanged(element, old, new)) {
+            layoutObserversChanged(frame);
+            return;
+        }
+    } else if (name.eql(comptime .wrap("class"))) {
+        if (owner._style_manager.classChanged(element, old, new)) {
+            // the stylemanager handled the classChange (maybe it was a noop
+            // maybe there was an optimized path). Whatever the case, we don't
+            // need to signal a rendering change.
+            layoutObserversChanged(frame);
+            return;
+        }
+    }
+    renderingChanged(frame);
 }
 
 pub fn childInserted(parent: *Node, child: *Node, frame: *Frame) void {
-    _ = parent;
-    _ = child;
-    domChanged(frame);
+    treeChanged(parent, child, child.previousSibling(), child.nextSibling(), .inserted, frame);
 }
 
 pub fn childRemoved(parent: *Node, child: *Node, previous_sibling: ?*Node, next_sibling: ?*Node, frame: *Frame) void {
-    _ = parent;
-    _ = child;
-    _ = previous_sibling;
-    _ = next_sibling;
-    domChanged(frame);
+    treeChanged(parent, child, previous_sibling, next_sibling, .removed, frame);
+}
+
+fn treeChanged(parent: *Node, child: *Node, previous: ?*Node, next: ?*Node, op: StyleManager.TreeChange, frame: *Frame) void {
+    frame.page.dom_version += 1;
+    if (detachedHandled(parent, frame)) {
+        // A removed child takes its entries along, out of parent's tree
+        if (op == .inserted or detachedHandled(child, frame)) {
+            return;
+        }
+        styleChanged(frame);
+        return;
+    }
+    if (parent.ownerFrame(frame)) |owner| {
+        if (owner._style_manager.treeChanged(parent, child, previous, next, op) == false) {
+            // style manager wasn't able to restrict the change to a part of
+            // the tree, we need to invalidate everything
+            styleChanged(frame);
+        }
+    }
+    layoutObserversChanged(frame);
 }
 
 /// Not domChanged: live collections keep their cursors mid-parse, and the
 /// parser's root memo stays valid (an insertion never changes an existing
 /// node's root).
 pub fn parserInserted(parent: *Node, child: *Node, frame: *Frame) void {
-    _ = parent;
     _ = child;
+    // During a parse insert, only a fragment can be detached.
+    if (frame._parse_mode == .fragment and detachedHandled(parent, frame)) {
+        return;
+    }
     styleChanged(frame);
 }
 
@@ -97,7 +133,10 @@ pub fn parserInserted(parent: *Node, child: *Node, frame: *Frame) void {
 /// Matters when `parent` is live (innerHTML); a detached fragment's caller
 /// inserts through the leaves anyway.
 pub fn fragmentParsed(parent: *Node, frame: *Frame) void {
-    _ = parent;
+    if (detachedHandled(parent, frame)) {
+        frame.page.dom_version += 1;
+        return;
+    }
     domChanged(frame);
 }
 
@@ -105,9 +144,10 @@ pub fn fragmentParsed(parent: *Node, frame: *Frame) void {
 /// stamp moves. Not renderingChanged: the layout observers only react to
 /// connectivity, which a text edit can't change.
 pub fn textChanged(cdata: *CData, old: String, frame: *Frame) void {
-    _ = cdata;
     _ = old;
-    styleChanged(frame);
+    if (detachedHandled(cdata.asNode(), frame) == false) {
+        styleChanged(frame);
+    }
 }
 
 pub const State = enum {
@@ -123,10 +163,12 @@ pub const State = enum {
 };
 
 pub fn stateChanged(element: *Element, state: State, frame: *Frame) void {
-    _ = element;
+    const handled = detachedHandled(element.asNode(), frame);
     switch (state) {
-        .value, .checked, .indeterminate, .defined => styleChanged(frame),
-        .selectedness, .popover_open => domChanged(frame),
+        .value, .checked, .indeterminate, .defined => if (handled == false) styleChanged(frame),
+        .selectedness, .popover_open => if (handled) {
+            frame.page.dom_version += 1;
+        } else domChanged(frame),
     }
 }
 
@@ -157,17 +199,30 @@ pub fn rulesChanged(frame: *Frame) void {
 
 /// The host's children leave the flat tree until a slot takes them.
 pub fn shadowAttached(host: *Element, frame: *Frame) void {
-    _ = host;
-    renderingChanged(frame);
+    if (detachedHandled(host.asNode(), frame) == false) {
+        renderingChanged(frame);
+    }
 }
 
 /// A slotted node inherits from its slot.
 pub fn slotAssignmentChanged(slot: *Element.Html.Slot, frame: *Frame) void {
-    _ = slot;
-    renderingChanged(frame);
+    if (detachedHandled(slot.asNode(), frame) == false) {
+        renderingChanged(frame);
+    }
 }
 
-// The primitives.
+// A change inside a detached tree can only ever reach cached styles of that
+// tree. No selector, not even the powerful :has, can can cross that. Powerful
+// opportunity to optimize here, as it significantly narrows what caches we
+// need to invalidate.
+fn detachedHandled(node: *Node, frame: *Frame) bool {
+    if (node.isConnected()) {
+        return false;
+    }
+    // A frameless document (DOMParser, XHR) has no StyleManager
+    const owner = node.ownerFrame(frame) orelse return true;
+    return owner._style_manager.detachedChanged(node);
+}
 
 fn domChanged(frame: *Frame) void {
     frame.page.dom_version += 1;

@@ -212,8 +212,11 @@ fn deleteRule(self: *CSSStyleSheet, index: u32, frame: *Frame) !void {
     if (index >= self._store.length()) {
         return error.IndexSizeError;
     }
+    const reads = StyleManager.readsRule(&self._store.entries()[index]);
     try self.removeRule(&self._store, index, frame);
-    self.rulesModified(frame);
+    if (reads) {
+        self.rulesModified(frame);
+    }
 }
 
 pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!js.Promise {
@@ -269,7 +272,7 @@ fn parseInto(self: *CSSStyleSheet, text: []const u8, mode: enum { append, replac
 fn parseRule(self: *CSSStyleSheet, parsed_rule: Parser.Rule, frame: *Frame) CSSError!Entry {
     return switch (parsed_rule) {
         .style => |s| self.parseStyleRule(s.selector, s.block, 0, frame),
-        .at_rule => |a| self.parseAtRule(a.keyword, a.text, frame),
+        .at_rule => |a| self.parseAtRule(a, 0, false, frame),
     };
 }
 
@@ -285,30 +288,72 @@ fn parseStyleRule(self: *CSSStyleSheet, selector: []const u8, block: []const u8,
     if (depth >= StyleManager.MAX_AT_RULE_NESTING or std.mem.findScalar(u8, block, '{') == null) {
         return entry;
     }
-    var it = Parser.parseStyleBlock(block);
-    while (it.nextItem()) |item| {
-        var nested = switch (item) {
-            .declaration => continue,
-            .rule => |r| try self.parseStyleRule(r.selector, r.block, depth + 1, frame),
-            .at_rule => |a| try self.parseAtRule(a.keyword, a.text, frame),
-        };
-        errdefer self.freeEntry(&nested, frame);
-        // Created on the first nested rule: most rules have none.
-        const children = entry._children orelse blk: {
-            const children = try RuleStore.init(allocator, self);
-            entry._children = children;
-            break :blk children;
-        };
-        try children.append(allocator, nested);
-    }
-    if (entry._children) |children| {
-        try children.trim(allocator);
-    }
+    try self.parseNestedRules(&entry, block, depth, frame);
     return entry;
 }
 
-fn parseAtRule(self: *CSSStyleSheet, keyword: []const u8, text: []const u8, frame: *Frame) CSSError!Entry {
-    return Entry.init(frame._factory.storageAllocator(), .ofAtRule(keyword), text, try self.nextRuleId());
+/// An at-rule. For grouping ones (@media, @supports, @layer) we keep the prelude
+/// as text, and the block as children rules. For all others, we keep the source
+/// as written.
+fn parseAtRule(self: *CSSStyleSheet, rule: Parser.AtRule, depth: u8, in_style: bool, frame: *Frame) CSSError!Entry {
+    const allocator = frame._factory.storageAllocator();
+    const kind: RuleStore.Kind = .ofAtRule(rule.keyword);
+    const body = switch (kind) {
+        .media, .supports, .layer => rule.block,
+        else => null,
+    } orelse return Entry.init(allocator, kind, rule.text, try self.nextRuleId());
+
+    var entry = try Entry.initPrelude(allocator, kind, rule.prelude, try self.nextRuleId());
+    errdefer self.freeEntry(&entry, frame);
+    entry._children = try RuleStore.init(allocator, self);
+
+    if (depth >= StyleManager.MAX_AT_RULE_NESTING) {
+        return entry;
+    }
+    if (in_style) {
+        entry._block = try CSSStyleDeclaration.parseBlock(body, frame);
+        try self.parseNestedRules(&entry, body, depth, frame);
+        return entry;
+    }
+    var it = Parser.parseStylesheet(body);
+    while (it.next()) |parsed_rule| {
+        try self.appendChild(&entry, switch (parsed_rule) {
+            .style => |r| try self.parseStyleRule(r.selector, r.block, depth + 1, frame),
+            .at_rule => |a| try self.parseAtRule(a, depth + 1, false, frame),
+        }, frame);
+    }
+    try entry._children.?.trim(allocator);
+    return entry;
+}
+
+/// The rules in a style block (a style rule's, or that of an at-rule nested
+/// in one), as children of `entry`.
+fn parseNestedRules(self: *CSSStyleSheet, entry: *Entry, block: []const u8, depth: u8, frame: *Frame) CSSError!void {
+    var it = Parser.parseStyleBlock(block);
+    while (it.nextItem()) |item| {
+        try self.appendChild(entry, switch (item) {
+            .declaration => continue,
+            .rule => |r| try self.parseStyleRule(r.selector, r.block, depth + 1, frame),
+            .at_rule => |a| try self.parseAtRule(a, depth + 1, true, frame),
+        }, frame);
+    }
+    if (entry._children) |children| {
+        try children.trim(frame._factory.storageAllocator());
+    }
+}
+
+/// Takes ownership of `child`: freed if it can't be appended.
+fn appendChild(self: *CSSStyleSheet, entry: *Entry, child: Entry, frame: *Frame) CSSError!void {
+    var owned = child;
+    errdefer self.freeEntry(&owned, frame);
+    const allocator = frame._factory.storageAllocator();
+    // A style rule's is created on its first nested rule: most have none.
+    const children = entry._children orelse blk: {
+        const children = try RuleStore.init(allocator, self);
+        entry._children = children;
+        break :blk children;
+    };
+    try children.append(allocator, owned);
 }
 
 fn nextRuleId(self: *CSSStyleSheet) !u32 {
@@ -414,6 +459,7 @@ pub const JsApi = struct {
 };
 
 const testing = @import("../../../testing.zig");
+const CSSStyleProperties = @import("CSSStyleProperties.zig");
 test "WebApi: CSSStyleSheet" {
     testing.silenceLog(&.{.js});
     try testing.htmlRunner("css/stylesheet.html", .{});
@@ -433,4 +479,57 @@ test "WebApi: layer order cascade" {
 
 test "WebApi: CSS nesting" {
     try testing.htmlRunner("css/nesting.html", .{});
+}
+
+test "CSSStyleSheet: a rule write or delete the cascade doesn't read skips the rebuild" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div class=\"a\"></div>");
+    const a = body.firstChild().?.as(Element);
+
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(".a { display: none; color: red } .b { color: blue } .c { transform: none }", frame);
+    _ = try body.appendChild(style_el.asNode(), frame);
+    const sheet = style_el._sheet orelse return error.NoSheet;
+    try sheet.ensureParsed(frame);
+
+    try testing.expectEqual(true, sm.isHidden(a, .{}));
+    try testing.expectEqual(false, sm.dirty);
+
+    const rule = (try sheet.ruleView(&sheet._store, 0, frame)).as(CSSStyleRule);
+    const style = (try CSSStyleProperties.init(.{ .rule = rule }, frame)).asCSSStyleDeclaration();
+
+    try style.setProperty("color", "green", null, frame);
+    _ = try style.removeProperty("color", frame);
+    try style.setProperty("padding", "1px", null, frame);
+    try testing.expectEqual(false, sm.dirty);
+    try testing.expectEqual(true, sm.isHidden(a, .{}));
+
+    // margin-left is read, so a margin write is too
+    try style.setProperty("margin", "1px", null, frame);
+    try testing.expectEqual(true, sm.dirty);
+    try testing.expectEqual(true, sm.isHidden(a, .{}));
+
+    try style.setProperty("--x", "1", null, frame);
+    try testing.expectEqual(true, sm.dirty);
+    try testing.expectEqual(true, sm.isHidden(a, .{}));
+
+    try style.setProperty("display", "block", null, frame);
+    try testing.expectEqual(true, sm.dirty);
+    try testing.expectEqual(false, sm.isHidden(a, .{}));
+
+    try sheet.deleteRule(2, frame);
+    try sheet.deleteRule(1, frame);
+    try testing.expectEqual(false, sm.dirty);
+
+    try sheet.deleteRule(0, frame);
+    try testing.expectEqual(true, sm.dirty);
+    try testing.expectEqual(false, sm.isHidden(a, .{}));
 }
