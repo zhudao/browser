@@ -67,7 +67,7 @@ pub fn boxWidth(self: *Element, owner: *Frame) f64 {
         }
         const width = if (own.explicit) own.value else switch (sizing) {
             .fixed => |width| width,
-            .percent => |fraction| fraction * containingBlockWidth(self, owner),
+            .percent => |percent| @max(0, percent.of(containingBlockWidth(self, owner))),
             .fill => fillWidth(self, owner),
             .grow, .shrink => shrunk: {
                 // The boxes inside it take their width from its content's
@@ -122,7 +122,7 @@ fn flexBase(self: *Element, row_width: f64, owner: *Frame) FlexBase {
     const own = self.getElementAxis(owner, .width);
     const width = if (own.explicit) own.value else switch (style_manager.widthSizing(self)) {
         .fixed => |width| width,
-        .percent => |fraction| fraction * row_width,
+        .percent => |percent| @max(0, percent.of(row_width)),
         .shrink, .grow, .fill => @max(own.value, contentWidth(self, .full, owner)),
         .contents => return .{
             .base = widthContribution(self, .full, owner),
@@ -249,8 +249,9 @@ fn clampWidth(self: *Element, width: f64, comptime of: enum { box, contribution 
 
 fn resolveWidthLimit(self: *Element, limit: StyleManager.BoxLength, resolve_percent: bool, owner: *Frame) ?f64 {
     return switch (limit) {
-        .px => |px| px,
-        .percent => |fraction| if (resolve_percent) fraction * containingBlockWidth(self, owner) else null,
+        // a calc() can go below 0, a limit can't
+        .px => |px| @max(0, px),
+        .percent => |percent| if (resolve_percent) @max(0, percent.of(containingBlockWidth(self, owner))) else null,
     };
 }
 
@@ -563,8 +564,8 @@ pub const Anchor = struct {
             return null;
         }
         const start, const end = switch (axis) {
-            .vertical => .{ style_manager.inset(el, .top), style_manager.inset(el, .bottom) },
-            .horizontal => .{ style_manager.inset(el, .left), style_manager.inset(el, .right) },
+            .vertical => style_manager.insets(el, .top, .bottom),
+            .horizontal => style_manager.insets(el, .left, .right),
         };
         if (start == null and end == null) {
             return null;
@@ -592,8 +593,8 @@ pub fn relativeShift(el: *Element, comptime axis: Axis, owner: *Frame) f64 {
         return 0;
     }
     const start, const end = switch (axis) {
-        .vertical => .{ style_manager.inset(el, .top), style_manager.inset(el, .bottom) },
-        .horizontal => .{ style_manager.inset(el, .left), style_manager.inset(el, .right) },
+        .vertical => style_manager.insets(el, .top, .bottom),
+        .horizontal => style_manager.insets(el, .left, .right),
     };
     const base = style_manager.containingBlock(el);
     if (start) |s| {
@@ -608,7 +609,7 @@ pub fn relativeShift(el: *Element, comptime axis: Axis, owner: *Frame) f64 {
 fn resolveInset(length: StyleManager.BoxLength, base: ?*Element, comptime axis: Axis, owner: *Frame) f64 {
     return switch (length) {
         .px => |px| px,
-        .percent => |fraction| fraction * containingSize(base, axis, owner),
+        .percent => |percent| percent.of(containingSize(base, axis, owner)),
     };
 }
 
@@ -769,7 +770,7 @@ fn gridResumePoint(self: *Element, parent: *Element, owner: *Frame) ?ResumePoint
     return row_start;
 }
 
-/// The declared height, else the content's
+/// The declared height, else the content's (within min-height and max-height)
 pub fn boxHeight(self: *Element, owner: *Frame) f64 {
     const style_manager = &owner._style_manager;
     // Both in one read: a box without its height usually lacks its content's
@@ -781,14 +782,33 @@ pub fn boxHeight(self: *Element, owner: *Frame) f64 {
     defer StyleManager.fill_check.exit(fill);
 
     const own = self.getElementAxis(owner, .height);
-    if (own.explicit or self.isRootContainer()) {
+    if (self.isRootContainer()) {
         style_manager.setCacheLayout(self, .box_height, own.value);
         return own.value;
     }
+    if (own.explicit) {
+        const height = clampHeight(self, own.value, owner);
+        style_manager.setCacheLayout(self, .box_height, height);
+        return height;
+    }
     const content = cached.content orelse measureContentHeight(self, owner);
-    const height = @max(own.value, content);
+    const height = clampHeight(self, @max(own.value, content), owner);
     style_manager.setCacheHeights(self, content, height);
     return height;
+}
+
+fn clampHeight(self: *Element, height: f64, owner: *Frame) f64 {
+    const limits = owner._style_manager.heightLimits(self);
+    var clamped = height;
+    if (limits.max) |max| {
+        // max-height clamps the height
+        clamped = @min(clamped, max);
+    }
+    if (limits.min) |min| {
+        // min-height has the final say
+        clamped = @max(clamped, min);
+    }
+    return clamped;
 }
 
 /// The height the children take
