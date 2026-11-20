@@ -46,13 +46,6 @@ pub fn mapErrorToDOM(err: anyerror) anyerror {
     };
 }
 
-pub fn parseLeaky(arena: Allocator, input: []const u8) ![]const Selector {
-    if (input.len == 0) {
-        return error.SyntaxError;
-    }
-    return Parser.parseList(arena, input);
-}
-
 /// One-off synthesized selectors use the `*Uncached` variants instead.
 /// The result is freed when its entry is evicted, which any later parse can
 /// do: use it right away, never hold it across another parse or into JS.
@@ -117,7 +110,7 @@ fn collectAll(arena: *lp.Arena, selectors: []const Selector, root: *Node, frame:
 
     if (selectors.len == 1) {
         try List.collect(arena.allocator(), root, selectors[0], &nodes, &nth, frame);
-    } else {
+    } else if (selectors.len != 0) {
         try List.collectAny(arena.allocator(), root, selectors, &nodes, &nth, frame);
     }
 
@@ -456,7 +449,7 @@ pub const Combinator = enum {
 pub const Compound = struct {
     parts: []const Part,
 
-    pub fn format(self: Compound, writer: *std.Io.Writer) !void {
+    pub fn format(self: Compound, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         for (self.parts) |part| switch (part) {
             .id => |val| {
                 try writer.writeByte('#');
@@ -471,7 +464,27 @@ pub const Compound = struct {
             .universal => try writer.writeByte('*'),
             .pseudo_class => |val| {
                 try writer.writeByte(':');
-                try writer.writeAll(@tagName(val));
+                const name = switch (val) {
+                    .nth_child_of => "nth-child",
+                    .nth_last_child_of => "nth-last-child",
+                    else => @tagName(val),
+                };
+                for (name) |c| {
+                    try writer.writeByte(if (c == '_') '-' else c);
+                }
+                switch (val) {
+                    .not, .is, .where, .has => |list| try formatArgs(writer, list),
+                    .nth_child, .nth_last_child, .nth_of_type, .nth_last_of_type => |nth| {
+                        try writer.print("({d}n+{d})", .{ nth.a, nth.b });
+                    },
+                    .nth_child_of, .nth_last_child_of => |nth| {
+                        try writer.print("({d}n+{d} of ", .{ nth.pattern.a, nth.pattern.b });
+                        try formatList(writer, nth.selectors);
+                        try writer.writeByte(')');
+                    },
+                    .lang => |lang| try writer.print("({s})", .{lang}),
+                    else => {},
+                }
             },
             .attribute => |attr| {
                 try writer.print("[{f}", .{attr.original_name});
@@ -497,35 +510,83 @@ pub const Compound = struct {
             .never => try writer.writeAll("[never]"),
         };
     }
+
+    fn formatArgs(writer: *std.Io.Writer, list: []const Selector) std.Io.Writer.Error!void {
+        try writer.writeByte('(');
+        try formatList(writer, list);
+        try writer.writeByte(')');
+    }
+
+    fn formatList(writer: *std.Io.Writer, list: []const Selector) std.Io.Writer.Error!void {
+        for (list, 0..) |selector, i| {
+            if (i != 0) {
+                try writer.writeAll(", ");
+            }
+            try selector.format(writer);
+        }
+    }
 };
 
 // A segment represents a compound selector with the combinator that precedes it
 pub const Segment = struct {
-    compound: Compound,
+    _parts: [*]const Part,
+    _len: u16,
     combinator: Combinator,
 
-    pub fn format(self: Segment, writer: *std.Io.Writer) !void {
+    pub fn init(combinator: Combinator, c: Compound) Segment {
+        // parser already enforced that c.parts.len <= Selector.max_len
+        return .{ ._parts = c.parts.ptr, ._len = @intCast(c.parts.len), .combinator = combinator };
+    }
+
+    pub fn compound(self: Segment) Compound {
+        return .{ .parts = self._parts[0..self._len] };
+    }
+
+    pub fn format(self: Segment, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.combinator) {
             .descendant => try writer.writeByte(' '),
             .child => try writer.writeAll(" > "),
             .next_sibling => try writer.writeAll(" + "),
             .subsequent_sibling => try writer.writeAll(" ~ "),
         }
-        return self.compound.format(writer);
+        return self.compound().format(writer);
     }
 };
 
 // A full selector is the first compound plus subsequent segments
 //   "div > p + span" -> { first: [tag(div)], segments: [{child, [tag(p)]}, {next_sibling, [tag(span)]}] }
 pub const Selector = struct {
-    first: Compound,
-    segments: []const Segment,
+    _first: [*]const Part,
+    _segments: [*]const Segment,
+    _first_len: u16,
+    _segments_len: u16,
+
+    /// The most parts a compound and segments a selector can hold
+    pub const max_len = std.math.maxInt(u16);
+
+    pub fn init(first_compound: Compound, following: []const Segment) Selector {
+        // The parser enforces that the inputs are <= max_len
+        return .{
+            ._first = first_compound.parts.ptr,
+            ._segments = following.ptr,
+            ._first_len = @intCast(first_compound.parts.len),
+            ._segments_len = @intCast(following.len),
+        };
+    }
+
+    pub fn first(self: Selector) Compound {
+        return .{ .parts = self._first[0..self._first_len] };
+    }
+
+    pub fn segments(self: Selector) []const Segment {
+        return self._segments[0..self._segments_len];
+    }
 
     pub fn rightmost(self: Selector) Compound {
-        if (self.segments.len == 0) {
-            return self.first;
+        if (self._segments_len == 0) {
+            return self.first();
         }
-        return self.segments[self.segments.len - 1].compound;
+        return self._segments[self._segments_len - 1].compound();
     }
 
     /// Such a selector matches no element.
@@ -534,9 +595,9 @@ pub const Selector = struct {
         return parts[parts.len - 1] == .pseudo_element;
     }
 
-    pub fn format(self: Selector, writer: *std.Io.Writer) !void {
-        try self.first.format(writer);
-        for (self.segments) |segment| {
+    pub fn format(self: Selector, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.first().format(writer);
+        for (self.segments()) |segment| {
             try segment.format(writer);
         }
     }
@@ -546,6 +607,11 @@ pub fn query(selectors: []const Selector, root: *Node, frame: *Frame) !?*Node.El
     var nth: List.NthCache = .{ .allocator = frame.local_arena };
     defer nth.deinit();
 
+    if (selectors.len == 0) {
+        // we have a valid selector, but the parser already decided it couldn't
+        // match anything
+        return null;
+    }
     if (selectors.len != 1) {
         const node = List.initOneAny(root, selectors, &nth, frame) orelse return null;
         return node.is(Node.Element);
@@ -554,8 +620,8 @@ pub fn query(selectors: []const Selector, root: *Node, frame: *Frame) !?*Node.El
     const selector = selectors[0];
     // Fast path: single compound with only an ID selector. With
     // duplicate ids, the general walk below finds the first one under root.
-    if (selector.segments.len == 0 and selector.first.parts.len == 1) {
-        const first = selector.first.parts[0];
+    if (selector.segments().len == 0 and selector.first().parts.len == 1) {
+        const first = selector.first().parts[0];
         if (first == .id) {
             switch (Frame.getUniqueElementByIdFromNode(root, first.id)) {
                 .none => return null,
@@ -643,5 +709,21 @@ test "Selector: classAttributeContains matches a token split" {
             }
         }
         try testing.expectEqual(expected, classAttributeContains(attr, name));
+    }
+}
+
+test "Selector: format prints functional pseudo-class arguments" {
+    const arena = testing.arena_allocator;
+    const cases = [_][2][]const u8{
+        .{ ":where(.a > p, #b)", ":where(.a > p, #b)" },
+        .{ "div:not(.x):is(span ~ em)", "div:not(.x):is(span ~ em)" },
+        .{ "li:nth-child(2n+1 of .c)", "li:nth-child(2n+1 of .c)" },
+        .{ "p:nth-of-type(3)", "p:nth-of-type(0n+3)" },
+        .{ "div:has(> p)", "div:has(:scope > p)" },
+        .{ "p:lang(en)", "p:lang(en)" },
+    };
+    for (cases) |case| {
+        const selectors = try Parser.parseList(arena, case[0]);
+        try testing.expectEqual(case[1], try std.fmt.allocPrint(arena, "{f}", .{selectors[0]}));
     }
 }

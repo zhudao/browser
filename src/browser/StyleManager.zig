@@ -27,6 +27,7 @@ const units = @import("css/units.zig");
 const CssParser = @import("css/Parser.zig");
 const Tokenizer = @import("css/Tokenizer.zig");
 const MediaQuery = @import("css/MediaQuery.zig");
+const supports = @import("css/supports.zig");
 const Animation = @import("css/Animation.zig");
 const properties = @import("css/properties.zig");
 const DeclarationBlock = @import("css/DeclarationBlock.zig");
@@ -375,10 +376,10 @@ fn addStoredRules(self: *StyleManager, build_arena: Allocator, store: *const Rul
                 }
             },
             .media => try self.applyMediaRule(build_arena, entry, depth, layer, nest),
+            .supports => try self.applySupportsRule(build_arena, entry, depth, layer, nest),
             .layer => try self.applyLayerRule(build_arena, entry, depth, layer, nest),
             .keyframes => try self.addKeyframes(entry.text()),
-            // `@supports` isn't evaluated: its rules are dropped. The others
-            // (`@font-face`, …) hold nothing the cascade reads.
+            // The others (`@font-face`, …) hold nothing the cascade reads.
             else => {},
         }
     }
@@ -390,6 +391,17 @@ fn applyMediaRule(self: *StyleManager, build_arena: Allocator, entry: *const Rul
     // Without a block, it's nothing
     const children = entry._children orelse return;
     if (MediaQuery.matches(CssParser.atRulePrelude(entry.text()), self.frame.page.getViewport()) == false) {
+        return;
+    }
+    try self.applyGroupRules(build_arena, entry, children, depth + 1, layer, nest);
+}
+
+/// Apply an `@supports` rule: when its condition holds, its rules as if they
+/// lived where the rule does. A false or invalid condition drops them. The
+/// condition is answered as CSS.supports() answers it.
+fn applySupportsRule(self: *StyleManager, build_arena: Allocator, entry: *const RuleStore.Entry, depth: u8, layer: u16, nest: ?[]const u8) Allocator.Error!void {
+    const children = entry._children orelse return;
+    if (supports.rule(build_arena, CssParser.atRulePrelude(entry.text())) == false) {
         return;
     }
     try self.applyGroupRules(build_arena, entry, children, depth + 1, layer, nest);
@@ -749,22 +761,22 @@ fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *cons
 
 // `nested`: an argument of :not(), :is()..., not a rule's own selector
 fn collectAttributeNames(self: *StyleManager, selector: Selector.Selector, nested: bool) Allocator.Error!void {
-    try self.collectCompoundAttributeNames(selector.first, nested);
-    for (selector.segments, 0..) |segment, i| {
+    try self.collectCompoundAttributeNames(selector.first(), nested);
+    for (selector.segments(), 0..) |segment, i| {
         switch (segment.combinator) {
             .subsequent_sibling => {
                 // `a ~ b`: an element entering or leaving changes b's match
                 // when it can be a. Unless a's own match reads its siblings
                 // (`x + a ~ b`, `a:first-child ~ b`): then anything moving
                 // before it can.
-                const left = if (i == 0) selector.first else selector.segments[i - 1].compound;
-                const reads = nested or readsSiblings(left) or (i != 0 and selector.segments[i - 1].combinator == .next_sibling);
+                const left = if (i == 0) selector.first() else selector.segments()[i - 1].compound();
+                const reads = nested or readsSiblings(left) or (i != 0 and selector.segments()[i - 1].combinator == .next_sibling);
                 try self.siblings.following.add(self.arena.allocator(), if (reads) null else left);
             },
             // counted by nextReach
             .next_sibling, .descendant, .child => {},
         }
-        try self.collectCompoundAttributeNames(segment.compound, nested);
+        try self.collectCompoundAttributeNames(segment.compound(), nested);
     }
 }
 
@@ -980,11 +992,11 @@ fn readsSiblings(compound: Selector.Compound) bool {
             else => continue,
         };
         for (nested) |selector| {
-            if (readsSiblings(selector.first)) {
+            if (readsSiblings(selector.first())) {
                 return true;
             }
-            for (selector.segments) |segment| {
-                if (segment.combinator == .next_sibling or segment.combinator == .subsequent_sibling or readsSiblings(segment.compound)) {
+            for (selector.segments()) |segment| {
+                if (segment.combinator == .next_sibling or segment.combinator == .subsequent_sibling or readsSiblings(segment.compound())) {
                     return true;
                 }
             }
@@ -1000,10 +1012,10 @@ fn readsSiblings(compound: Selector.Compound) bool {
 /// combinator starts over in another sibling list, but whatever it reaches is
 /// under a sibling that's dropped with its subtree. `~` is SiblingReads.later.
 fn nextReach(selector: Selector.Selector) usize {
-    var reach = compoundNextReach(selector.first);
+    var reach = compoundNextReach(selector.first());
     var deepest = reach;
-    for (selector.segments) |segment| {
-        const compound = compoundNextReach(segment.compound);
+    for (selector.segments()) |segment| {
+        const compound = compoundNextReach(segment.compound());
         reach = switch (segment.combinator) {
             .next_sibling => @max(reach + 1, compound),
             .subsequent_sibling, .descendant, .child => compound,
@@ -1177,12 +1189,12 @@ const HasKeys = struct {
             return;
         }
 
-        for (argument.segments) |segment| {
+        for (argument.segments()) |segment| {
             if (segment.combinator != .child) {
                 self.unbounded = true;
             }
         }
-        self.depth = @max(self.depth, argument.segments.len);
+        self.depth = @max(self.depth, argument.segments().len);
 
         if (try self.keys.add(allocator, argument.rightmost()) == false) {
             self.any = true;
@@ -1195,15 +1207,15 @@ const HasKeys = struct {
 
     // Whether a :has() argument's match can change without its subject moving.
     fn reachesOutside(selector: Selector.Selector) bool {
-        if (compoundReachesOutside(selector.first)) {
+        if (compoundReachesOutside(selector.first())) {
             return true;
         }
-        for (selector.segments) |segment| {
+        for (selector.segments()) |segment| {
             switch (segment.combinator) {
                 .next_sibling, .subsequent_sibling => return true,
                 .descendant, .child => {},
             }
-            if (compoundReachesOutside(segment.compound)) {
+            if (compoundReachesOutside(segment.compound())) {
                 return true;
             }
         }
@@ -1316,9 +1328,9 @@ const max_class_attribute_selectors = 256;
 // rule's selector, the enclosing compound's for an :is() argument. `own`:
 // that compound is the rule's subject, `rule_subject` (null: not known).
 fn collectClassReach(self: *StyleManager, selector: Selector.Selector, subject: ClassReach, own: bool, rule_subject: ?Selector.Compound) Allocator.Error!void {
-    const segments = selector.segments;
+    const segments = selector.segments();
     for (0..segments.len + 1) |i| {
-        const compound = if (i == 0) selector.first else segments[i - 1].compound;
+        const compound = if (i == 0) selector.first() else segments[i - 1].compound();
         // The combinator to the compound's right relates it to the subject.
         // In a :has() argument (.full) every compound reaches everything.
         const reach: ClassReach = if (i == segments.len or subject == .full) subject else switch (segments[i].combinator) {
@@ -4410,6 +4422,20 @@ const BucketKey = union(enum) {
     tag: Tag,
     id: []const u8,
     class: []const u8,
+
+    fn rank(self: BucketKey) u2 {
+        return switch (self) {
+            .other => 0,
+            .tag => 1,
+            .class => 2,
+            .id => 3,
+        };
+    }
+
+    // On a tie the later one wins
+    fn orBetter(self: BucketKey, candidate: BucketKey) BucketKey {
+        return if (candidate.rank() >= self.rank()) candidate else self;
+    }
 };
 
 /// Where a group files a rule.
@@ -4438,12 +4464,12 @@ fn placeSelector(selector: Selector.Selector) ?Placement {
 /// The compound a `>` requires the subject's parent to match, looking past
 /// any `+`/`~` chain (siblings share the parent).
 fn parentCompound(selector: Selector.Selector) ?Selector.Compound {
-    var i = selector.segments.len;
+    var i = selector.segments().len;
     while (i > 0) {
         i -= 1;
-        switch (selector.segments[i].combinator) {
+        switch (selector.segments()[i].combinator) {
             .next_sibling, .subsequent_sibling => {},
-            .child => return if (i == 0) selector.first else selector.segments[i - 1].compound,
+            .child => return if (i == 0) selector.first() else selector.segments()[i - 1].compound(),
             .descendant => return null,
         }
     }
@@ -4504,13 +4530,16 @@ const KeyBits = struct {
 /// Optimization. A lone `:where(X)` matches exactly what X does. What changes
 /// is its priority (it has zero specificity). So we need to remain aware of
 /// the :where with respect to the priority, but we can unwrap so that it
-/// hopefully doesn't land in the .other list.
+/// hopefully doesn't land in the .other list. getBucketKey already has some
+/// optimization for :where(...), but unwrapping simple cases provides even
+/// greater optimization benefits, e.g. `:where(.gap > :not(:last-child))` is
+/// keyed by its parent.
 fn unwrapWhere(selector: Selector.Selector) Selector.Selector {
-    if (selector.segments.len != 0 or selector.first.parts.len != 1) {
+    if (selector.segments().len != 0 or selector.first().parts.len != 1) {
         return selector;
     }
 
-    const inner = switch (selector.first.parts[0]) {
+    const inner = switch (selector.first().parts[0]) {
         .pseudo_class => |pc| switch (pc) {
             .where => |list| list,
             else => return selector,
@@ -4524,26 +4553,17 @@ fn unwrapWhere(selector: Selector.Selector) Selector.Selector {
 }
 
 /// Returns the best bucket key for a compound selector, or null if it contains
-/// a dynamic pseudo-class we should skip (hover, active, focus, etc.)
+/// a dynamic pseudo-class we should skip (focus, target, etc.). The parser
+/// already dropped the ones that can never match (hover, active, etc.)
 /// Priority: id > class > tag > other
 fn getBucketKey(compound: Selector.Compound) ?BucketKey {
     var best_key: BucketKey = .other;
 
     for (compound.parts) |part| {
         switch (part) {
-            .id => |id| {
-                best_key = .{ .id = id };
-            },
-            .class => |class| {
-                if (best_key != .id) {
-                    best_key = .{ .class = class };
-                }
-            },
-            .tag => |tag| {
-                if (best_key == .other) {
-                    best_key = .{ .tag = tag };
-                }
-            },
+            .id => |id| best_key = best_key.orBetter(.{ .id = id }),
+            .class => |class| best_key = best_key.orBetter(.{ .class = class }),
+            .tag => |tag| best_key = best_key.orBetter(.{ .tag = tag }),
             .tag_name => {
                 // Custom tag - put in other bucket (can't efficiently look up)
                 // Keep current best_key if we have something better
@@ -4551,8 +4571,17 @@ fn getBucketKey(compound: Selector.Compound) ?BucketKey {
             .pseudo_class => |pc| {
                 // Skip dynamic pseudo-classes - they depend on interaction state
                 switch (pc) {
-                    .hover, .active, .focus, .focus_within, .focus_visible, .visited, .target => {
+                    .focus, .focus_within, .target => {
                         return null; // Skip this selector entirely
+                    },
+                    // The element _has_ to match the argument, so we can key
+                    // this to whatever the argument's subject requires. A list
+                    // (`:where(.a, .b)`) doesn't have to match any, so that
+                    // always lands in .other
+                    .where, .is => |list| if (list.len == 1) {
+                        // An argument we'd skip (`:where(.a:focus)`) gives no key
+                        const inner = getBucketKey(list[0].rightmost()) orelse continue;
+                        best_key = best_key.orBetter(inner);
                     },
                     else => {},
                 }
@@ -4585,11 +4614,11 @@ pub fn computeSpecificity(selector: Selector.Selector) u32 {
     var elements: u32 = 0; // includes elements, pseudo-elements
 
     // Count specificity for first compound
-    countCompoundSpecificity(selector.first, &ids, &classes, &elements);
+    countCompoundSpecificity(selector.first(), &ids, &classes, &elements);
 
     // Count specificity for subsequent segments
-    for (selector.segments) |segment| {
-        countCompoundSpecificity(segment.compound, &ids, &classes, &elements);
+    for (selector.segments()) |segment| {
+        countCompoundSpecificity(segment.compound(), &ids, &classes, &elements);
     }
 
     // Pack into single u32: (ids << 20) | (classes << 10) | elements
@@ -7175,154 +7204,130 @@ test "StyleManager: text-transform without rules skips the memo" {
 
 test "StyleManager: computeSpecificity: element selector" {
     // div -> (0, 0, 1)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .tag = .div }} },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{.{ .tag = .div }} }, &.{});
     try testing.expectEqual(1, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: class selector" {
     // .foo -> (0, 1, 0)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .class = "foo" }} },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{.{ .class = "foo" }} }, &.{});
     try testing.expectEqual(1 << 10, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: id selector" {
     // #bar -> (1, 0, 0)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .id = "bar" }} },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{.{ .id = "bar" }} }, &.{});
     try testing.expectEqual(1 << 20, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: combined selector" {
     // div.foo#bar -> (1, 1, 1)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .tag = .div },
-            .{ .class = "foo" },
-            .{ .id = "bar" },
-        } },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .tag = .div },
+        .{ .class = "foo" },
+        .{ .id = "bar" },
+    } }, &.{});
     try testing.expectEqual((1 << 20) | (1 << 10) | 1, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: universal selector" {
     // * -> (0, 0, 0)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{.universal} },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{.universal} }, &.{});
     try testing.expectEqual(0, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: multiple classes" {
     // .a.b.c -> (0, 3, 0)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .class = "a" },
-            .{ .class = "b" },
-            .{ .class = "c" },
-        } },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .class = "a" },
+        .{ .class = "b" },
+        .{ .class = "c" },
+    } }, &.{});
     try testing.expectEqual(3 << 10, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: descendant combinator" {
     // div span -> (0, 0, 2)
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .tag = .div }} },
-        .segments = &.{
-            .{ .combinator = .descendant, .compound = .{ .parts = &.{.{ .tag = .span }} } },
-        },
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{.{ .tag = .div }} }, &.{
+        .init(.descendant, .{ .parts = &.{.{ .tag = .span }} }),
+    });
     try testing.expectEqual(2, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: :where() has zero specificity" {
     // :where(.foo) -> (0, 0, 0) regardless of what's inside
-    const inner_selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .class = "foo" }} },
-        .segments = &.{},
-    };
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .pseudo_class = .{ .where = &.{inner_selector} } },
-        } },
-        .segments = &.{},
-    };
+    const inner_selector = Selector.Selector.init(.{ .parts = &.{.{ .class = "foo" }} }, &.{});
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .pseudo_class = .{ .where = &.{inner_selector} } },
+    } }, &.{});
     try testing.expectEqual(0, computeSpecificity(selector));
+}
+
+test "StyleManager: placeSelector: keys inside a single-argument :where/:is" {
+    const arena = testing.arena_allocator;
+    const Case = struct { []const u8, Placement };
+    const cases = [_]Case{
+        .{ ":where(.a)", .{ .subject = .{ .class = "a" } } },
+        .{ ".btn :where(.label)", .{ .subject = .{ .class = "label" } } },
+        .{ ":where(.label):where([data-size=small])", .{ .subject = .{ .class = "label" } } },
+        .{ ".x :where(.a .b)", .{ .subject = .{ .class = "b" } } },
+        .{ ":is(div)", .{ .subject = .{ .tag = .div } } },
+        .{ "div:where(#main)", .{ .subject = .{ .id = "main" } } },
+        .{ "#main:where(.a)", .{ .subject = .{ .id = "main" } } },
+        .{ ":where(:where(.a))", .{ .subject = .{ .class = "a" } } },
+        .{ ":where(.a) > [x]", .{ .parent = .{ .class = "a" } } },
+        // unwrapped: the argument's own `>` gives the parent key
+        .{ ":where(.gap > :not(:last-child))", .{ .parent = .{ .class = "gap" } } },
+        .{ ":where([data-x])", .other },
+        .{ ":where(.a, .b)", .other },
+        .{ ":not(.a)", .other },
+        .{ ":where(.a:focus)", .other },
+    };
+    for (cases) |case| {
+        const selectors = try SelectorParser.parseList(arena, case[0]);
+        try testing.expectEqual(case[1], placeSelector(unwrapWhere(selectors[0])).?);
+    }
+
+    // a dynamic pseudo-class outside the argument still skips the rule
+    const focus = try SelectorParser.parseList(arena, ":where(.a):focus");
+    try testing.expectEqual(null, placeSelector(unwrapWhere(focus[0])));
 }
 
 test "StyleManager: computeSpecificity: :not() takes inner specificity" {
     // :not(.foo) -> (0, 1, 0) - takes specificity of .foo
-    const inner_selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .class = "foo" }} },
-        .segments = &.{},
-    };
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .pseudo_class = .{ .not = &.{inner_selector} } },
-        } },
-        .segments = &.{},
-    };
+    const inner_selector = Selector.Selector.init(.{ .parts = &.{.{ .class = "foo" }} }, &.{});
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .pseudo_class = .{ .not = &.{inner_selector} } },
+    } }, &.{});
     try testing.expectEqual(1 << 10, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: :is() takes most specific inner" {
     // :is(.foo, #bar) -> (1, 0, 0) - takes the most specific (#bar)
-    const class_selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .class = "foo" }} },
-        .segments = &.{},
-    };
-    const id_selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .id = "bar" }} },
-        .segments = &.{},
-    };
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .pseudo_class = .{ .is = &.{ class_selector, id_selector } } },
-        } },
-        .segments = &.{},
-    };
+    const class_selector = Selector.Selector.init(.{ .parts = &.{.{ .class = "foo" }} }, &.{});
+    const id_selector = Selector.Selector.init(.{ .parts = &.{.{ .id = "bar" }} }, &.{});
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .pseudo_class = .{ .is = &.{ class_selector, id_selector } } },
+    } }, &.{});
     try testing.expectEqual(1 << 20, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: never-matching attribute keeps attribute weight" {
     // :is([a^=""], div) -> (0, 1, 0): :is() takes its most specific argument,
     // matching or not
-    const never_selector = Selector.Selector{
-        .first = .{ .parts = &.{.never} },
-        .segments = &.{},
-    };
-    const tag_selector = Selector.Selector{
-        .first = .{ .parts = &.{.{ .tag = .div }} },
-        .segments = &.{},
-    };
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .pseudo_class = .{ .is = &.{ never_selector, tag_selector } } },
-        } },
-        .segments = &.{},
-    };
+    const never_selector = Selector.Selector.init(.{ .parts = &.{.never} }, &.{});
+    const tag_selector = Selector.Selector.init(.{ .parts = &.{.{ .tag = .div }} }, &.{});
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .pseudo_class = .{ .is = &.{ never_selector, tag_selector } } },
+    } }, &.{});
     try testing.expectEqual(1 << 10, computeSpecificity(selector));
 }
 
 test "StyleManager: computeSpecificity: pseudo-class (general)" {
     // :hover -> (0, 1, 0) - pseudo-classes count as class-level
-    const selector = Selector.Selector{
-        .first = .{ .parts = &.{
-            .{ .pseudo_class = .hover },
-        } },
-        .segments = &.{},
-    };
+    const selector = Selector.Selector.init(.{ .parts = &.{
+        .{ .pseudo_class = .hover },
+    } }, &.{});
     try testing.expectEqual(1 << 10, computeSpecificity(selector));
 }
 
@@ -7850,6 +7855,42 @@ test "StyleManager: memo: a class change drops what its selectors reach" {
     // In a :has() argument: everything
     try i.setAttribute(comptime .wrap("class"), comptime .wrap("k"), frame);
     try testing.expect(frame.page.style_version != version);
+}
+
+test "StyleManager: a selector no element can match isn't tracked" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div class='menu live' data-open><p class=item></p><b class=y></b></div>");
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(
+        \\.menu:hover .item { display: none }
+        \\[data-open]:active > .item { display: none }
+        \\:is(.menu:hover, .menu:focus-visible) ~ p { display: none }
+        \\.live:not(:hover) .y { display: none }
+    , frame);
+    _ = try body.appendChild(style_el.asNode(), frame);
+    const div = body.firstChild().?;
+    const item = div.firstChild().?.as(Element);
+    const y = item.asNode().nextSibling().?.as(Element);
+
+    try testing.expectEqual(false, sm.hasDisplayNone(item));
+    try testing.expectEqual(true, sm.hasDisplayNone(y));
+
+    // Only the last rule is filed, and only what it reads is watched
+    try testing.expectEqual(true, sm.visibility.parent.isEmpty());
+    try testing.expectEqual(0, sm.visibility.other_rules.len);
+    try testing.expectEqual(null, sm.class_reach.get("menu"));
+    try testing.expectEqual(null, sm.class_reach.get("item"));
+    try testing.expectEqual(false, sm.attribute_names.contains("data-open"));
+    try testing.expectEqual(false, sm.siblings.following.any);
+    try testing.expectEqual(ClassReach.subtree, sm.class_reach.get("live").?.reach);
 }
 
 test "StyleManager: memo: a focus move drops what :focus and :focus-within reach" {
@@ -10166,7 +10207,7 @@ test "StyleManager: parent-keyed and :where rules keep their priority" {
     const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
     // `div > *` (0,0,1) beats the later :where (0,0,0); the :where beats
     // the earlier `*` (0,0,0) on document order; `.a > .x + *` keys on
-    // `.a` past the `+`; `.a:hover > *` can't be keyed, and stays in other.
+    // `.a` past the `+`; `.a:hover > *` can't match, and isn't filed.
     try style_el.asNode().setTextContent(
         \\* { width: 30px }
         \\div > * { width: 20px }
@@ -10190,8 +10231,8 @@ test "StyleManager: parent-keyed and :where rules keep their priority" {
     try testing.expectEqual(Length{}, sm.geometryProps(after_x.asNode().nextSibling().?.as(Element)).margin_left);
     try testing.expectEqual(Length{}, sm.geometryProps(after_x).margin_right);
 
-    // `*` and `.a:hover > *`
-    try testing.expectEqual(2, sm.geometry.other_rules.len);
+    // `*`
+    try testing.expectEqual(1, sm.geometry.other_rules.len);
     try testing.expectEqual(1, sm.geometry.parent.tag.count());
     try testing.expectEqual(1, sm.geometry.parent.class.count());
     try testing.expectEqual(2, sm.geometry.parent.class.get("a").?.len);

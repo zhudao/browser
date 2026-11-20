@@ -73,7 +73,18 @@ fn preprocessInput(arena: Allocator, input: []const u8) ![]const u8 {
     return result.items;
 }
 
+/// The selectors of a list that can match an element. Given `a:hover, b` we
+/// only get `b` back (the parser knows we don't support :hover, so it drops it)
+/// This isn't an error, it's an optimization.
 pub fn parseList(arena: Allocator, input: []const u8) ParseError![]const Selector.Selector {
+    return parseSelectors(arena, input, false);
+}
+
+pub fn parseAll(arena: Allocator, input: []const u8) ParseError![]const Selector.Selector {
+    return parseSelectors(arena, input, true);
+}
+
+fn parseSelectors(arena: Allocator, input: []const u8, keep_never_matching: bool) ParseError![]const Selector.Selector {
     // Preprocess input to normalize line endings
     const preprocessed = try preprocessInput(arena, input);
 
@@ -147,14 +158,14 @@ pub fn parseList(arena: Allocator, input: []const u8) ParseError![]const Selecto
             return error.InvalidSelector;
         }
         const selector = try parse(arena, selector_input);
-        try selectors.append(arena, selector);
+        // Only here: an argument of :is(), :not() or :has() still counts
+        // toward the specificity
+        if (keep_never_matching or neverMatches(selector) == false) {
+            try selectors.append(arena, selector);
+        }
 
         if (comma_pos >= trimmed.len) break;
         remaining = trimmed[comma_pos + 1 ..];
-    }
-
-    if (selectors.items.len == 0) {
-        return error.InvalidSelector;
     }
 
     return selectors.items;
@@ -167,13 +178,53 @@ fn parse(arena: Allocator, input: []const u8) ParseError!Selector.Selector {
     var segments: std.ArrayList(Segment) = .empty;
     while (parser.skipSpaces()) {
         const combinator = parser.parseCombinator();
-        try segments.append(arena, .{
-            .combinator = combinator,
-            .compound = try parser.parseCompound(arena),
-        });
+        if (segments.items.len == Selector.Selector.max_len) {
+            return error.InvalidSelector;
+        }
+        try segments.append(arena, .init(combinator, try parser.parseCompound(arena)));
     }
 
-    return .{ .first = first, .segments = segments.items };
+    return .init(first, segments.items);
+}
+
+// Whether no element can match the selector: one of its compounds has a part
+// List.matchesPart always fails.
+fn neverMatches(selector: Selector.Selector) bool {
+    if (compoundNeverMatches(selector.first())) {
+        return true;
+    }
+    for (selector.segments()) |segment| {
+        if (compoundNeverMatches(segment.compound())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn compoundNeverMatches(compound: Selector.Compound) bool {
+    for (compound.parts) |part| {
+        switch (part) {
+            .never => return true,
+            .pseudo_class => |pseudo| switch (pseudo) {
+                // No pointer, no keyboard, no history
+                .hover, .active, .focus_visible, .visited => return true,
+                // One argument has to match. Not :not(): it matches when
+                // its arguments don't.
+                .is, .where, .has => |list| {
+                    for (list) |argument| {
+                        if (neverMatches(argument) == false) {
+                            break;
+                        }
+                    } else {
+                        return true;
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 // Parts written with no whitespace between them ("div.a#b") form a compound.
@@ -181,6 +232,9 @@ fn parseCompound(self: *Parser, arena: Allocator) ParseError!Selector.Compound {
     _ = self.skipSpaces();
     var parts: std.ArrayList(Part) = .empty;
     while (true) {
+        if (parts.items.len == Selector.Selector.max_len) {
+            return error.InvalidSelector;
+        }
         try parts.append(arena, try self.parsePart(arena));
         if (!isStartOfPart(self.peek())) break;
     }
@@ -207,14 +261,15 @@ fn parseCombinator(self: *Parser) Combinator {
 const scope_anchor = [_]Part{.{ .pseudo_class = .scope }};
 
 fn absolutize(arena: Allocator, selector: Selector.Selector, combinator: Combinator) !Selector.Selector {
-    const segments = try arena.alloc(Segment, selector.segments.len + 1);
-    segments[0] = .{ .combinator = combinator, .compound = selector.first };
-    @memcpy(segments[1..], selector.segments);
+    const following = selector.segments();
+    if (following.len == Selector.Selector.max_len) {
+        return error.InvalidSelector;
+    }
+    const segments = try arena.alloc(Segment, following.len + 1);
+    segments[0] = .init(combinator, selector.first());
+    @memcpy(segments[1..], following);
 
-    return .{
-        .first = .{ .parts = &scope_anchor },
-        .segments = segments,
-    };
+    return .init(.{ .parts = &scope_anchor }, segments);
 }
 
 fn parsePart(self: *Parser, arena: Allocator) !Part {
@@ -2147,52 +2202,52 @@ test "Selector: Parser.has" {
     // No leading combinator: absolutized with an implied descendant combinator.
     {
         const selector = try parse(arena, "div:has(p)");
-        const args = selector.first.parts[1].pseudo_class.has;
+        const args = selector.first().parts[1].pseudo_class.has;
         try testing.expectEqual(1, args.len);
-        try testing.expectEqual(true, args[0].first.parts[0].pseudo_class == .scope);
-        try testing.expectEqual(1, args[0].segments.len);
-        try testing.expectEqual(.descendant, args[0].segments[0].combinator);
-        try testing.expectEqual(.p, args[0].segments[0].compound.parts[0].tag);
+        try testing.expectEqual(true, args[0].first().parts[0].pseudo_class == .scope);
+        try testing.expectEqual(1, args[0].segments().len);
+        try testing.expectEqual(.descendant, args[0].segments()[0].combinator);
+        try testing.expectEqual(.p, args[0].segments()[0].compound().parts[0].tag);
     }
 
     // Explicit leading combinators.
     {
         const selector = try parse(arena, "div:has(> p)");
-        const arg = selector.first.parts[1].pseudo_class.has[0];
-        try testing.expectEqual(true, arg.first.parts[0].pseudo_class == .scope);
-        try testing.expectEqual(.child, arg.segments[0].combinator);
+        const arg = selector.first().parts[1].pseudo_class.has[0];
+        try testing.expectEqual(true, arg.first().parts[0].pseudo_class == .scope);
+        try testing.expectEqual(.child, arg.segments()[0].combinator);
     }
 
     {
         const selector = try parse(arena, "li:has(~ li.active)");
-        const arg = selector.first.parts[1].pseudo_class.has[0];
-        try testing.expectEqual(.subsequent_sibling, arg.segments[0].combinator);
-        try testing.expectEqual(.li, arg.segments[0].compound.parts[0].tag);
-        try testing.expectEqual("active", arg.segments[0].compound.parts[1].class);
+        const arg = selector.first().parts[1].pseudo_class.has[0];
+        try testing.expectEqual(.subsequent_sibling, arg.segments()[0].combinator);
+        try testing.expectEqual(.li, arg.segments()[0].compound().parts[0].tag);
+        try testing.expectEqual("active", arg.segments()[0].compound().parts[1].class);
     }
 
     {
         const selector = try parse(arena, "span:has(+em)");
-        const arg = selector.first.parts[1].pseudo_class.has[0];
-        try testing.expectEqual(.next_sibling, arg.segments[0].combinator);
+        const arg = selector.first().parts[1].pseudo_class.has[0];
+        try testing.expectEqual(.next_sibling, arg.segments()[0].combinator);
     }
 
     // The argument's own combinators are preserved after the anchor segment.
     {
         const selector = try parse(arena, "div:has(~ p a)");
-        const arg = selector.first.parts[1].pseudo_class.has[0];
-        try testing.expectEqual(2, arg.segments.len);
-        try testing.expectEqual(.subsequent_sibling, arg.segments[0].combinator);
-        try testing.expectEqual(.descendant, arg.segments[1].combinator);
+        const arg = selector.first().parts[1].pseudo_class.has[0];
+        try testing.expectEqual(2, arg.segments().len);
+        try testing.expectEqual(.subsequent_sibling, arg.segments()[0].combinator);
+        try testing.expectEqual(.descendant, arg.segments()[1].combinator);
     }
 
     // Comma-separated relative selector list.
     {
         const selector = try parse(arena, "div:has(> p, ~ a)");
-        const args = selector.first.parts[1].pseudo_class.has;
+        const args = selector.first().parts[1].pseudo_class.has;
         try testing.expectEqual(2, args.len);
-        try testing.expectEqual(.child, args[0].segments[0].combinator);
-        try testing.expectEqual(.subsequent_sibling, args[1].segments[0].combinator);
+        try testing.expectEqual(.child, args[0].segments()[0].combinator);
+        try testing.expectEqual(.subsequent_sibling, args[1].segments()[0].combinator);
     }
 
     // A combinator with nothing after it is invalid.
@@ -2205,4 +2260,98 @@ test "Selector: Parser.has" {
     {
         try testing.expectError(error.InvalidPseudoClass, parse(arena, "div:has()"));
     }
+}
+
+test "Selector: Parser caps parts and segments at Selector.max_len" {
+    const arena = testing.arena_allocator;
+    const max = Selector.Selector.max_len;
+
+    try testing.expectEqual(24, @sizeOf(Selector.Selector));
+    try testing.expectEqual(16, @sizeOf(Segment));
+
+    {
+        const input = try arena.alloc(u8, (max + 1) * 2);
+        for (0..max + 1) |i| {
+            input[i * 2 ..][0..2].* = ".a".*;
+        }
+        const selector = try parse(arena, input[0 .. max * 2]);
+        try testing.expectEqual(max, selector.first().parts.len);
+        try testing.expectError(error.InvalidSelector, parse(arena, input));
+    }
+
+    {
+        // "a" then max + 1 times " a"
+        const input = try arena.alloc(u8, 1 + (max + 1) * 2);
+        input[0] = 'a';
+        for (0..max + 1) |i| {
+            input[1 + i * 2 ..][0..2].* = " a".*;
+        }
+        const longest = input[0 .. 1 + max * 2];
+        const selector = try parse(arena, longest);
+        try testing.expectEqual(max, selector.segments().len);
+        try testing.expectEqual(.a, selector.rightmost().parts[0].tag);
+        try testing.expectError(error.InvalidSelector, parse(arena, input));
+
+        // :has() adds the :scope anchor's segment
+        const has = try std.mem.concat(arena, u8, &.{ "div:has(", longest, ")" });
+        try testing.expectError(error.InvalidSelector, parse(arena, has));
+    }
+}
+
+test "Selector: Parser flags a selector no element can match" {
+    const arena = testing.arena_allocator;
+    const cases = [_]struct { []const u8, bool }{
+        .{ "a:hover", true },
+        .{ ".a:active", true },
+        .{ ":focus-visible", true },
+        .{ "a:visited", true },
+        // in any compound
+        .{ ".menu:hover .item", true },
+        .{ ".a:hover > .b", true },
+        .{ ".a:hover + .b ~ .c", true },
+        // an :is(), :where() or :has() whose every argument is one
+        .{ ":where(.a:hover)", true },
+        .{ ":is(.a:hover, .b:active) .c", true },
+        .{ ".a:has(.b:hover)", true },
+        .{ ".a:has(> .b:hover, ~ .c:active)", true },
+        .{ ":where(:is(.a:hover))", true },
+        .{ ":where(.a, .b:hover)", false },
+        .{ ":is(.a:hover, .a:focus-within) .b", false },
+        .{ ".a:has(.b:hover, .c)", false },
+        // :not() matches when its argument doesn't
+        .{ ".a:not(:hover)", false },
+        .{ ":not(:where(.a:hover))", false },
+        // these do match
+        .{ "input:focus", false },
+        .{ ".a:focus-within .b", false },
+        .{ ":target", false },
+        .{ "a:link", false },
+        .{ ".a .b > .c", false },
+    };
+    for (cases) |case| {
+        const all = try parseAll(arena, case[0]);
+        const matchable = try parseList(arena, case[0]);
+        errdefer std.debug.print("\nselector: {s}\n", .{case[0]});
+        try testing.expectEqual(1, all.len);
+        try testing.expectEqual(case[1], neverMatches(all[0]));
+        try testing.expectEqual(@intFromBool(case[1] == false), matchable.len);
+    }
+
+    // an attribute value that can't match
+    try testing.expectEqual(0, (try parseList(arena, "a[href^=\"\"] b")).len);
+
+    // parseList keeps the selectors of a list that can match, in order
+    const list = try parseList(arena, "a:hover, b, .c:active .d, i");
+    try testing.expectEqual(2, list.len);
+    try testing.expectEqual(.b, list[0].first().parts[0].tag);
+    try testing.expectEqual(.i, list[1].first().parts[0].tag);
+    try testing.expectEqual(4, (try parseAll(arena, "a:hover, b, .c:active .d, i")).len);
+
+    // an argument stays, for the specificity
+    const nested = try parseList(arena, ":is(.a, #b:hover)");
+    try testing.expectEqual(2, nested[0].first().parts[0].pseudo_class.is.len);
+
+    // dropped, not forgiven
+    try testing.expectError(error.InvalidSelector, parseList(arena, "a:hover,"));
+    try testing.expectError(error.InvalidSelector, parseList(arena, "a:hover, ,b"));
 }

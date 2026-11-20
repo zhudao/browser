@@ -56,6 +56,12 @@ pub fn condition(arena: Allocator, text: []const u8) bool {
     return evaluate(arena, wrapped) orelse false;
 }
 
+/// Whether the rules of an `@supports <prelude> { … }` apply. Unlike
+/// CSS.supports(), a bare declaration isn't a condition here.
+pub fn rule(arena: Allocator, prelude: []const u8) bool {
+    return evaluate(arena, prelude) orelse false;
+}
+
 /// The condition's value, or null when `text` isn't a condition.
 fn evaluate(arena: Allocator, text: []const u8) ?bool {
     var evaluator: Evaluator = .{ .arena = arena, .tokenizer = .{ .input = text } };
@@ -154,7 +160,7 @@ const Evaluator = struct {
     }
 
     fn supportsSelector(self: *Evaluator, text: []const u8) bool {
-        const selectors = SelectorParser.parseList(self.arena, text) catch return false;
+        const selectors = SelectorParser.parseAll(self.arena, text) catch return false;
         // A single complex selector, not a list.
         return selectors.len == 1;
     }
@@ -344,4 +350,15 @@ test "supports: condition" {
             return err;
         };
     }
+}
+
+test "supports: rule" {
+    defer testing.reset();
+    const arena = testing.arena_allocator;
+    try testing.expectEqual(true, rule(arena, "(color: red)"));
+    try testing.expectEqual(true, rule(arena, "not (bogus: red)"));
+    try testing.expectEqual(false, rule(arena, "(bogus: red)"));
+    // CSS.supports() takes a bare declaration, an @supports prelude doesn't
+    try testing.expectEqual(false, rule(arena, "color: red"));
+    try testing.expectEqual(false, rule(arena, ""));
 }
