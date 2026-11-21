@@ -513,11 +513,11 @@ pub fn extent(self: *Document) Extent {
     const style_manager = &frame._style_manager;
     var size: Extent = .{ .width = 0, .height = 0 };
 
-    // Content heights only: html's and body's own heights are this extent.
     const html_body = if (self.is(HTMLDocument) != null) self.getBody() else null;
     if (html_body) |b| {
         const body = b.asElement();
-        size.height = @max(layout.contentHeight(body, frame), style_manager.inlineSize(body, .height) orelse 0);
+        const html_declared = if (self.getDocumentElement()) |html| style_manager.rootHeight(html) orelse 0 else 0;
+        size.height = @max(self.bodyHeight(body), html_declared);
         size.width = style_manager.inlineSize(body, .width) orelse 0;
         var children: TreeWalker.FlatChildren = .init(body.asNode(), .{ .frame = frame });
         while (children.next()) |node| {
@@ -527,7 +527,7 @@ pub fn extent(self: *Document) Extent {
             }
         }
     } else if (self.getDocumentElement()) |root| {
-        size.height = layout.contentHeight(root, frame);
+        size.height = @max(layout.contentHeight(root, frame), style_manager.rootHeight(root) orelse 0);
     }
 
     // Whole pixels, like scroll offsets
@@ -537,6 +537,13 @@ pub fn extent(self: *Document) Extent {
         .extent = size,
     };
     return size;
+}
+
+/// A declared height only grows it: positions laid out past it must still fit.
+pub fn bodyHeight(self: *Document, body: *Element) f64 {
+    const frame = self._frame orelse return 0;
+    const declared = frame._style_manager.rootHeight(body) orelse 0;
+    return @ceil(@max(layout.contentHeight(body, frame), declared));
 }
 
 /// What the viewport scrolls over: the document, at least viewport-sized.
@@ -1151,6 +1158,8 @@ const HitLevel = struct {
     row: bool,
     top: f64,
     left: ?f64,
+    // How far inside it its children start: its left padding
+    content_left: ?f64 = null,
     up: u32, // the level of element's own parent
     cursor: ?Element.LineCursor = null,
     // When recording: element's box and those of its subtree walked so far
@@ -1194,6 +1203,11 @@ const HitLevel = struct {
 
         const level = &levels[index];
         const parent = level.element orelse return x;
+        x += level.content_left orelse blk: {
+            const start = layout.contentStart(parent, .width, owner);
+            level.content_left = start;
+            break :blk start;
+        };
         if (level.facts.grid and facts.position != .absolute and facts.position != .fixed) {
             // StyleManager.gridOf: in one of its parent's columns
             return x + layout.gridItemLeft(element, parent, owner) + leftOfLevel(levels, index, owner, frame);

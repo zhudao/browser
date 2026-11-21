@@ -28,6 +28,8 @@ const EventManager = @import("../EventManager.zig");
 const Node = @import("Node.zig");
 const Event = @import("Event.zig");
 const Screen = @import("Screen.zig");
+const OffscreenCanvas = @import("canvas/OffscreenCanvas.zig");
+const Clipboard = @import("Clipboard.zig");
 const Worker = @import("Worker.zig");
 const Window = @import("Window.zig");
 const FileReader = @import("FileReader.zig");
@@ -91,6 +93,7 @@ pub const Type = enum(u8) {
     audio_node,
     base_audio_context,
     broadcast_channel,
+    clipboard,
     cookie_store,
     event_source,
     file_reader,
@@ -106,6 +109,7 @@ pub const Type = enum(u8) {
     navigation_history_entry,
     node,
     notification,
+    offscreen_canvas,
     payment_request,
     payment_response,
     performance,
@@ -140,6 +144,7 @@ pub fn Subtype(comptime tag: Type) type {
         .audio_node => AudioNode,
         .base_audio_context => BaseAudioContext,
         .broadcast_channel => BroadcastChannel,
+        .clipboard => Clipboard,
         .cookie_store => CookieStore,
         .event_source => EventSource,
         .file_reader => FileReader,
@@ -155,6 +160,7 @@ pub fn Subtype(comptime tag: Type) type {
         .navigation_history_entry => NavigationHistoryEntry,
         .node => Node,
         .notification => Notification,
+        .offscreen_canvas => OffscreenCanvas,
         .payment_request => PaymentRequest,
         .payment_response => PaymentResponse,
         .performance => Performance,
@@ -426,11 +432,13 @@ pub fn format(self: *EventTarget, writer: *std.Io.Writer) !void {
         .font_face_set => writer.writeAll("<FontFaceSet>"),
         .websocket => writer.writeAll("<WebSocket>"),
         .event_source => writer.writeAll("<EventSource>"),
+        .clipboard => writer.writeAll("<Clipboard>"),
         .cookie_store => writer.writeAll("<CookieStore>"),
         .idb_request => writer.writeAll("<IDBRequest>"),
         .idb_database => writer.writeAll("<IDBDatabase>"),
         .idb_transaction => writer.writeAll("<IDBTransaction>"),
         .notification => writer.writeAll("<Notification>"),
+        .offscreen_canvas => writer.writeAll("<OffscreenCanvas>"),
         .payment_request => writer.writeAll("<PaymentRequest>"),
         .payment_response => writer.writeAll("<PaymentResponse>"),
         .permission_status => writer.writeAll("<PermissionStatus>"),
@@ -447,6 +455,7 @@ pub fn toString(self: *EventTarget) []const u8 {
         .audio_node => return self.subtype(AudioNode).toString(),
         .base_audio_context => return "[object BaseAudioContext]",
         .broadcast_channel => return "[object BroadcastChannel]",
+        .clipboard => return "[object Clipboard]",
         .cookie_store => return "[object CookieStore]",
         .event_source => return "[object EventSource]",
         .file_reader => return "[object FileReader]",
@@ -462,6 +471,7 @@ pub fn toString(self: *EventTarget) []const u8 {
         .navigation_history_entry => return "[object NavigationHistoryEntry]",
         .node => return "[object Node]",
         .notification => return "[object Notification]",
+        .offscreen_canvas => return "[object OffscreenCanvas]",
         .payment_request => return "[object PaymentRequest]",
         .payment_response => return "[object PaymentResponse]",
         .performance => return "[object Performance]",

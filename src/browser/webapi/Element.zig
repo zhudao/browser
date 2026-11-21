@@ -1677,14 +1677,15 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
 
     // Root containers span the document, see Document.extent.
     if (root) {
+        const doc = self.asNode().ownerDocument(frame) orelse return .{ .value = 0.0 };
         return .{ .value = switch (axis) {
             .width => 1920.0,
-            .height => if (self.asNode().ownerDocument(frame)) |doc| doc.extent().height else 0.0,
+            .height => if (tag == .body) doc.bodyHeight(self) else doc.extent().height,
         } };
     }
 
     // Presentational attributes lose to CSS sizes.
-    if (tag == .img or tag == .iframe) {
+    if (tag == .img or tag == .iframe or tag == .canvas or tag == .video) {
         if (self.getAttributeSafe(comptime .wrap(@tagName(axis)))) |attr| {
             if (std.fmt.parseFloat(f64, attr)) |parsed| {
                 return .{ .value = parsed, .explicit = true };
@@ -1692,9 +1693,9 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
         }
     }
 
-    // An iframe without a size is 300x150, like any replaced element without
-    // an intrinsic size. Its content is hit-tested inside this box.
-    if (tag == .iframe) {
+    // Replaced elements without an intrinsic size are 300x150. An iframe's
+    // content is hit-tested inside this box.
+    if (tag == .iframe or tag == .canvas or tag == .video) {
         return .{ .value = switch (axis) {
             .width => 300.0,
             .height => 150.0,
@@ -1769,6 +1770,13 @@ pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
         .width => layout.boxWidth(self, owner),
         .height => layout.boxHeight(self, owner),
     };
+}
+
+// The used width or height, as getComputedStyle reports it: the content box's
+// unless box-sizing says otherwise. Caller must have made sure self is visible.
+pub fn computedAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
+    const owner = self.ownerFrame(frame) orelse return self.getElementAxis(frame, axis).value;
+    return layout.declaredBoxSize(self, axis, owner);
 }
 
 /// The box's top-left in document coordinates, as every API reporting it
@@ -2045,6 +2053,9 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
         }
         const parent = current.flatParent(frame) orelse return x;
         if (current.is(Element)) |el| {
+            if (parent.is(Element)) |parent_el| {
+                x += layout.contentStart(parent_el, .width, owner);
+            }
             const alongside = owner._style_manager.alongside(el);
             if (alongside == .grid) {
                 x += layout.gridItemLeft(el, parent.as(Element), owner);

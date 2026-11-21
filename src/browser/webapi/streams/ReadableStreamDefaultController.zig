@@ -126,9 +126,12 @@ pub fn enqueueValue(self: *ReadableStreamDefaultController, value: js.Value) !vo
     return self.enqueueLocal(&ls.local, value, "stream enqueue value");
 }
 
+/// Hands `value` to the oldest pending read, or queues it. Then, as in the
+/// spec, pulls again if the queue still has room.
 fn enqueueLocal(self: *ReadableStreamDefaultController, local: *const js.Local, value: js.Value, comptime source: []const u8) !void {
     if (self._pending_reads.items.len == 0) {
-        return self.queueValue(value);
+        try self.queueValue(value);
+        return self._stream.callPullIfNeeded();
     }
 
     if (comptime lp.IS_DEBUG) {
@@ -143,6 +146,7 @@ fn enqueueLocal(self: *ReadableStreamDefaultController, local: *const js.Local, 
     // pending reads.
     const resolver = self._pending_reads.orderedRemove(0);
     resolveRead(local, resolver, value, source);
+    try self._stream.callPullIfNeeded();
 }
 
 fn queueValue(self: *ReadableStreamDefaultController, value: js.Value) !void {
@@ -179,6 +183,12 @@ pub fn close(self: *ReadableStreamDefaultController) !void {
     }
 
     self._stream._state = .closed;
+
+    // As in the spec, `closed` settles before pending reads. With chunks
+    // still queued, dequeue() does it once they're read.
+    if (self._queue.items.len == 0) {
+        if (self._stream._reader) |reader| reader.streamClosed();
+    }
 
     // Resolve all pending reads with done=true
     const result = ReadableStreamDefaultReader.ReadResult{
@@ -233,6 +243,7 @@ pub fn fail(self: *ReadableStreamDefaultController, local: *const js.Local, reas
     stream._stored_error = try reason.persist();
     stream._state = .errored;
     self.clearQueue();
+    if (stream._reader) |reader| reader.streamErrored(reason);
 
     // Rejecting runs page JS, which can reach the list too.
     const pending_reads = self._pending_reads;
@@ -249,6 +260,11 @@ pub fn dequeue(self: *ReadableStreamDefaultController) ?js.Value.Global {
         return null;
     }
     const chunk = self._queue.orderedRemove(0);
+
+    // a closed stream is done once its last chunk is read
+    if (self._stream._state == .closed and self._queue.items.len == 0) {
+        if (self._stream._reader) |reader| reader.streamClosed();
+    }
 
     // After dequeueing, we may need to pull more data
     self._stream.callPullIfNeeded() catch {};
