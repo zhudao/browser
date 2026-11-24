@@ -62,6 +62,10 @@ pub const Context = struct {
     // Whether script.realmCreated was sent or not. If sent, we'll send
     // script.realmDestroyed on teardown.
     realm_announced: bool = false,
+
+    // The answer for the next alert/confirm/prompt, saved ahead of time by
+    // lp:browsingContext.handleUserPrompt. The next dialog uses it and clears it.
+    pending_prompt_response: ?Notification.DialogResponse = null,
 };
 
 const PendingNavigate = struct {
@@ -81,6 +85,8 @@ pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
         close,
         locateNodes,
         setViewport,
+        handleUserPrompt,
+        captureScreenshot,
     }, action) orelse return error.UnknownCommand;
 
     switch (command) {
@@ -92,6 +98,8 @@ pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
         .close => return close(cmd),
         .locateNodes => return locateNodes(cmd),
         .setViewport => return setViewport(cmd),
+        .handleUserPrompt => return handleUserPrompt(cmd),
+        .captureScreenshot => return captureScreenshot(cmd),
     }
 }
 
@@ -186,13 +194,17 @@ fn announceRealm(bidi: *BiDi, frame: *const Frame) !void {
     }
     ctx.realm_announced = true;
 
-    const origin = (URL.getOrigin(bidi.message_arena.allocator(), frame.url) catch null) orelse "null";
     return bidi.sendEvent("script.realmCreated", .{
         .realm = &ctx.realm_id,
-        .origin = origin,
+        .origin = realmOrigin(bidi.message_arena.allocator(), frame),
         .type = "window",
         .context = &ctx.id,
     });
+}
+
+// The window realm's origin, "null" for an opaque one (about:blank).
+pub fn realmOrigin(arena: std.mem.Allocator, frame: *const Frame) []const u8 {
+    return (URL.getOrigin(arena, frame.url) catch null) orelse "null";
 }
 
 fn bidiNavigate(cmd: *BiDi.Command) !void {
@@ -355,6 +367,19 @@ fn close(cmd: *BiDi.Command) !void {
     const ctx = (try requireContext(cmd, p.context)) orelse return;
     try destroy(cmd, ctx);
     return cmd.sendResult(struct {}{});
+}
+
+// alert(), confirm() and prompt() never block: they return as soon as they're
+// called. So there's never a prompt open to act on. This matches CDP's
+// Page.handleJavaScriptDialog.
+fn handleUserPrompt(cmd: *BiDi.Command) !void {
+    const p = try cmd.params(struct {
+        context: []const u8,
+        accept: ?bool = null,
+        userText: ?[]const u8 = null,
+    });
+    _ = (try requireContext(cmd, p.context)) orelse return;
+    return cmd.sendError("no such alert", "no user prompt is open");
 }
 
 // Closes the page behind `ctx` and reports it gone.
@@ -618,6 +643,83 @@ fn setViewport(cmd: *BiDi.Command) !void {
     return cmd.sendDone();
 }
 
+fn captureScreenshot(cmd: *BiDi.Command) !void {
+    const p = try cmd.params(struct {
+        context: []const u8,
+        origin: enum { viewport, document } = .viewport,
+        format: struct {
+            type: []const u8 = "image/png",
+            // ignored: PNG is lossless
+            quality: ?f32 = null,
+        } = .{},
+        // BoxClipRectangle or ElementClipRectangle, flattened.
+        clip: ?struct {
+            type: enum { box, element },
+            x: f32 = 0,
+            y: f32 = 0,
+            width: f32 = 0,
+            height: f32 = 0,
+            element: std.json.Value = .null,
+        } = null,
+    });
+
+    _ = (try requireContext(cmd, p.context)) orelse return;
+    if (std.mem.eql(u8, p.format.type, "image/png") == false) {
+        log.debug(.not_implemented, "bidi.captureScreenshot", .{ .format = p.format.type });
+        return cmd.sendError("unsupported operation", "unsupported screenshot format");
+    }
+
+    const bidi = cmd.bidi;
+    const frame = bidi.user_context.session.currentFrame() orelse {
+        return cmd.sendError("no such frame", "no frame");
+    };
+
+    var opts: lp.screenshot.Opts = .fromViewport(bidi.browser.getViewport(), p.origin == .document, .layout);
+
+    if (p.clip) |clip| {
+        // The render's clip is in document coordinates; BiDi's are relative
+        // to the origin, and the viewport one is scrolled.
+        const window = frame.window;
+        const scroll_x: f32 = if (p.origin == .viewport) @floatFromInt(window.getScrollX()) else 0;
+        const scroll_y: f32 = if (p.origin == .viewport) @floatFromInt(window.getScrollY()) else 0;
+        switch (clip.type) {
+            // Passed through like CDP's Page.captureScreenshot: a clip past the
+            // viewport extends the image, up to the end of the content.
+            .box => opts.clip = .{ .x = clip.x + scroll_x, .y = clip.y + scroll_y, .width = clip.width, .height = clip.height },
+            .element => {
+                const shared_id = switch (clip.element) {
+                    .object => |o| o.get("sharedId") orelse .null,
+                    else => .null,
+                };
+                const node = remote_value.nodeFromSharedId(&bidi.node_registry, shared_id) catch {
+                    return cmd.sendError("no such node", "unknown element");
+                };
+                const el = node.is(Node.Element) orelse {
+                    return cmd.sendError("no such element", "clip target is not an element");
+                };
+                // Client rects are viewport-relative, whatever the origin
+                const rect = el.boundingClientRectValues(frame);
+                if (rect.width <= 0 or rect.height <= 0) {
+                    return cmd.sendError("unable to capture screen", "element has no box");
+                }
+                opts.clip = .{
+                    .x = @floatCast(rect.x + @as(f64, @floatFromInt(window.getScrollX()))),
+                    .y = @floatCast(rect.y + @as(f64, @floatFromInt(window.getScrollY()))),
+                    .width = @floatCast(rect.width),
+                    .height = @floatCast(rect.height),
+                };
+            },
+        }
+    }
+
+    const shot = lp.screenshot.preparePng(cmd.arena, .{ .root = frame.window._document.asNode() }, opts, frame) catch |err| switch (err) {
+        error.InvalidScreenshotOptions => return cmd.sendError("invalid argument", "invalid screenshot options"),
+        else => return err,
+    };
+    // Prepared streams itself as base64 straight into the outgoing message.
+    return cmd.sendResult(.{ .data = shot });
+}
+
 // A parameter that's left alone when absent, and reset to its default by null.
 fn Setting(comptime T: type) type {
     return union(enum) {
@@ -674,6 +776,34 @@ pub fn registerNotifications(bidi: *BiDi) !void {
     try notification.register(.frame_navigate, bidi, onFrameNavigate);
     try notification.register(.frame_navigate_failed, bidi, onFrameNavigateFailed);
     try notification.register(.frame_dom_content_loaded, bidi, onFrameDOMContentLoaded);
+    try notification.register(.javascript_dialog_opening, bidi, onJavascriptDialogOpening);
+}
+
+// Gives the answer saved by lp:browsingContext.handleUserPrompt, if any, to the dialog that
+// is opening, then reports the dialog. Both happen here so the event's
+// `handler` is the answer the dialog really gets.
+//
+// Dialogs from iframes use the top-level context too: it's the only context
+// we report.
+fn onJavascriptDialogOpening(ptr: *anyopaque, event: *const Notification.JavascriptDialogOpening) !void {
+    const bidi: *BiDi = @ptrCast(@alignCast(ptr));
+    const ctx = &(bidi.browsing_context orelse return);
+
+    // A saved answer applies to one dialog only.
+    if (ctx.pending_prompt_response) |pending| {
+        event.response.* = pending;
+        ctx.pending_prompt_response = null;
+    }
+
+    return bidi.sendEvent("browsingContext.userPromptOpened", .{
+        .context = &ctx.id,
+        .handler = if (event.response.accept) "accept" else "dismiss",
+        .message = event.message,
+        .type = event.dialog_type,
+        // We don't report the prompt's default text, the same as CDP's
+        // Page.javascriptDialogOpening.
+        .defaultValue = "",
+    });
 }
 
 // The page whose nodes and persisted values these belong to is going away.
@@ -1089,4 +1219,178 @@ test "bidi.browsing_context: traverseHistory and reload" {
     try ctx.processMessage(.{ .id = 8, .method = "browsingContext.reload", .params = .{ .context = context_id, .wait = "complete" } });
     try ctx.wait();
     try ctx.expectSentResult(.{ .url = testing.test_server ++ "bidi/values.html" }, .{ .id = 8 });
+}
+
+test "bidi.browsing_context: handleUserPrompt" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const context_id = try ctx.createContext(.{});
+
+    try ctx.processMessage(.{ .id = 1, .method = "browsingContext.handleUserPrompt", .params = .{ .context = "nope" } });
+    try ctx.expectSentError("no such frame", null, .{ .id = 1 });
+    try ctx.processMessage(.{ .id = 2, .method = "browsingContext.handleUserPrompt", .params = .{ .context = context_id, .accept = true } });
+    try ctx.expectSentError("no such alert", null, .{ .id = 2 });
+}
+
+test "bidi.browsing_context: captureScreenshot" {
+    testing.silenceLog(&.{.not_implemented});
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const context_id = try ctx.createContext(.{ .url = "bidi/locate.html" });
+
+    {
+        try ctx.processMessage(.{ .id = 1, .method = "browsingContext.captureScreenshot", .params = .{ .context = context_id } });
+        const png = try screenshotResult(&ctx, 1);
+        try testing.expectEqual(Viewport.default.width, pngWidth(png));
+        try testing.expectEqual(Viewport.default.height, pngHeight(png));
+    }
+
+    {
+        try ctx.processMessage(.{
+            .id = 2,
+            .method = "browsingContext.setViewport",
+            .params = .{ .context = context_id, .viewport = .{ .width = 300, .height = 200 }, .devicePixelRatio = 2 },
+        });
+        try ctx.expectSentResult(null, .{ .id = 2 });
+        try ctx.processMessage(.{ .id = 3, .method = "browsingContext.captureScreenshot", .params = .{ .context = context_id } });
+        const png = try screenshotResult(&ctx, 3);
+        try testing.expectEqual(600, pngWidth(png));
+        try testing.expectEqual(400, pngHeight(png));
+    }
+
+    // document origin: the whole content, which is shorter than the viewport
+    {
+        const frame = try ctx.frame();
+        const content_height = try lp.screenshot.contentHeight(testing.arena, frame.window._document.asNode(), 300, .layout, frame);
+        try ctx.processMessage(.{ .id = 4, .method = "browsingContext.captureScreenshot", .params = .{ .context = context_id, .origin = "document" } });
+        const png = try screenshotResult(&ctx, 4);
+        try testing.expectEqual(600, pngWidth(png));
+        try testing.expectEqual(content_height * 2, pngHeight(png));
+    }
+
+    {
+        try ctx.processMessage(.{
+            .id = 5,
+            .method = "browsingContext.captureScreenshot",
+            .params = .{ .context = context_id, .clip = .{ .type = "box", .x = 10, .y = 10, .width = 100, .height = 40 } },
+        });
+        const png = try screenshotResult(&ctx, 5);
+        try testing.expectEqual(200, pngWidth(png));
+        try testing.expectEqual(80, pngHeight(png));
+    }
+
+    // element clip crops to the element's box. Back to the default width
+    // (keeping the scale): the root's layout width doesn't follow the viewport.
+    {
+        try ctx.processMessage(.{
+            .id = 6,
+            .method = "browsingContext.setViewport",
+            .params = .{ .context = context_id, .viewport = null },
+        });
+        try ctx.expectSentResult(null, .{ .id = 6 });
+        try ctx.processMessage(.{
+            .id = 9,
+            .method = "browsingContext.locateNodes",
+            .params = .{ .context = context_id, .locator = .{ .type = "css", .value = "#other" } },
+        });
+        try ctx.expectSentResult(.{ .nodes = .{.{ .type = "node", .sharedId = "1" }} }, .{ .id = 9 });
+        try ctx.processMessage(.{
+            .id = 10,
+            .method = "browsingContext.captureScreenshot",
+            .params = .{ .context = context_id, .clip = .{ .type = "element", .element = .{ .sharedId = "1" } } },
+        });
+        const png = try screenshotResult(&ctx, 10);
+        const frame = try ctx.frame();
+        const rect = frame.window._document.getElementById("other").?.boundingClientRectValues(frame);
+        try testing.expectEqual(@as(u32, @intFromFloat(rect.width * 2)), pngWidth(png));
+        try testing.expectEqual(@as(u32, @intFromFloat(rect.height * 2)), pngHeight(png));
+    }
+
+    try ctx.processMessage(.{
+        .id = 11,
+        .method = "browsingContext.captureScreenshot",
+        .params = .{ .context = context_id, .clip = .{ .type = "element", .element = .{ .sharedId = "999" } } },
+    });
+    try ctx.expectSentError("no such node", null, .{ .id = 11 });
+
+    try ctx.processMessage(.{
+        .id = 12,
+        .method = "browsingContext.captureScreenshot",
+        .params = .{ .context = context_id, .format = .{ .type = "image/jpeg", .quality = 0.5 } },
+    });
+    try ctx.expectSentError("unsupported operation", null, .{ .id = 12 });
+
+    try ctx.processMessage(.{ .id = 13, .method = "browsingContext.captureScreenshot", .params = .{ .context = "nope" } });
+    try ctx.expectSentError("no such frame", null, .{ .id = 13 });
+}
+
+// The decoded PNG of the reply to `id`.
+fn screenshotResult(ctx: *testing.TestContext, id: i64) ![]const u8 {
+    // matching first reads every pending message into ctx.received
+    try ctx.expectSent(.{ .type = "success", .id = id });
+    for (ctx.received.items) |msg| {
+        const got = msg.object.get("id") orelse continue;
+        if (got != .integer or got.integer != id) continue;
+        const data = msg.object.get("result").?.object.get("data").?.string;
+        const decoder = std.base64.standard.Decoder;
+        const out = try testing.arena.alloc(u8, try decoder.calcSizeForSlice(data));
+        try decoder.decode(out, data);
+        try testing.expectEqual("\x89PNG\r\n\x1a\n", out[0..8]);
+        return out;
+    }
+    return error.MessageNotFound;
+}
+
+// IHDR width and height, big-endian at offsets 16 and 20.
+fn pngWidth(png: []const u8) u32 {
+    return std.mem.readInt(u32, png[16..20], .big);
+}
+fn pngHeight(png: []const u8) u32 {
+    return std.mem.readInt(u32, png[20..24], .big);
+}
+
+test "bidi.browsing_context: userPromptOpened" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    const context_id = try ctx.createContext(.{});
+
+    // not subscribed: no event
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "script.evaluate",
+        .params = .{ .expression = "alert('quiet')", .awaitPromise = false, .target = .{ .context = context_id } },
+    });
+    // session.new, browsingContext.create and the evaluate result
+    try ctx.expectSentCount(3);
+
+    try ctx.processMessage(.{ .id = 2, .method = "session.subscribe", .params = .{ .events = .{"browsingContext.userPromptOpened"} } });
+
+    // no saved answer: dismissed
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "script.evaluate",
+        .params = .{ .expression = "confirm('sure?')", .awaitPromise = false, .target = .{ .context = context_id } },
+    });
+    try ctx.expectSentEvent("browsingContext.userPromptOpened", .{
+        .context = context_id,
+        .handler = "dismiss",
+        .message = "sure?",
+        .type = "confirm",
+        .defaultValue = "",
+    });
+
+    // saved answer: accepted
+    try ctx.processMessage(.{ .id = 4, .method = "lp:browsingContext.handleUserPrompt", .params = .{ .context = context_id } });
+    try ctx.processMessage(.{
+        .id = 5,
+        .method = "script.evaluate",
+        .params = .{ .expression = "prompt('name?', 'Guest')", .awaitPromise = false, .target = .{ .context = context_id } },
+    });
+    try ctx.expectSentEvent("browsingContext.userPromptOpened", .{
+        .context = context_id,
+        .handler = "accept",
+        .message = "name?",
+        .type = "prompt",
+        .defaultValue = "",
+    });
 }

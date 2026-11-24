@@ -38,6 +38,7 @@ pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
         disown,
         addPreloadScript,
         removePreloadScript,
+        getRealms,
     }, action) orelse return error.UnknownCommand;
 
     switch (command) {
@@ -46,7 +47,66 @@ pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
         .disown => return disown(cmd),
         .addPreloadScript => return addPreloadScript(cmd),
         .removePreloadScript => return removePreloadScript(cmd),
+        .getRealms => return getRealms(cmd),
     }
+}
+
+const WindowRealmInfo = struct {
+    realm: []const u8,
+    origin: []const u8,
+    type: []const u8 = "window",
+    context: []const u8,
+};
+
+// We only have the window realm of our one context: no workers, no iframe
+// realms, no sandboxes.
+fn getRealms(cmd: *BiDi.Command) !void {
+    const p = try cmd.params(struct {
+        context: ?[]const u8 = null,
+        // Every script.RealmType, so an unknown one is an invalid argument
+        // while one we don't have (a worker) is a filter matching nothing.
+        type: ?enum {
+            window,
+            @"dedicated-worker",
+            @"shared-worker",
+            @"service-worker",
+            worker,
+            @"paint-worklet",
+            @"audio-worklet",
+            worklet,
+        } = null,
+    });
+
+    const bidi = cmd.bidi;
+    const none: []const WindowRealmInfo = &.{};
+
+    const ctx = blk: {
+        if (p.context) |id| {
+            break :blk (try browsing_context.requireContext(cmd, id)) orelse return;
+        }
+        break :blk &(bidi.browsing_context orelse return cmd.sendResult(.{ .realms = none }));
+    };
+
+    if (!ctx.realm_announced) {
+        return cmd.sendResult(.{ .realms = none });
+    }
+
+    if (p.type) |t| {
+        if (t != .window) {
+            return cmd.sendResult(.{ .realms = none });
+        }
+    }
+
+    const frame = bidi.user_context.session.currentFrame() orelse {
+        return cmd.sendResult(.{ .realms = none });
+    };
+
+    const realms = [_]WindowRealmInfo{.{
+        .realm = &ctx.realm_id,
+        .origin = browsing_context.realmOrigin(cmd.arena, frame),
+        .context = &ctx.id,
+    }};
+    return cmd.sendResult(.{ .realms = &realms });
 }
 
 // Addresses the realm to run in. We only have the one, so a `realm` is
@@ -177,6 +237,10 @@ pub const PreloadScript = struct {
     context: ?[36]u8,
     user_context: ?BiDi.UserContext.Id,
 
+    // The arguments the function is called with. The page's functions point
+    // into this slice, and can outlive this registration.
+    channels: []Channel,
+
     // A preload script targeting a navigable also runs in its descendants.
     fn appliesTo(self: *const PreloadScript, bidi: *BiDi, frame: *const Frame) bool {
         if (self.user_context) |user_context| {
@@ -195,10 +259,61 @@ pub const PreloadScript = struct {
     }
 };
 
+// A preload script argument: the page gets a function, and each call sends
+// a script.message event carrying the (serialized) value it was given.
+const Channel = struct {
+    bidi: *BiDi,
+    id: []const u8,
+    opts: remote_value.Serializer.Options,
+
+    // The ChannelValue a client sends.
+    const Param = struct {
+        type: []const u8,
+        value: struct {
+            channel: []const u8,
+            serializationOptions: remote_value.SerializationOptions = .{},
+            ownership: ResultOwnership = .none,
+        },
+    };
+
+    fn send(self: *Channel, value_: ?js.Value, exec: *const js.Execution) void {
+        self.trySend(value_, exec) catch |err| {
+            log.warn(.bidi, "channel message", .{ .channel = self.id, .err = err });
+        };
+    }
+
+    fn trySend(self: *const Channel, value_: ?js.Value, exec: *const js.Execution) !void {
+        const bidi = self.bidi;
+        if (bidi.subscribed("script.message") == false) {
+            return;
+        }
+        const frame = switch (exec.js.global) {
+            .frame => |frame| frame,
+            .worker => return,
+        };
+        // There are no navigables for iframes, so a message from one is
+        // reported against the top-level navigable.
+        const ctx = &(bidi.browsing_context orelse return);
+        const local = exec.js.local.?;
+        const value = value_ orelse try local.zigValueToJs({}, .{});
+
+        const arena = try bidi.app.arena_pool.acquire(.small, "bidi channel");
+        defer arena.release();
+
+        var serializer = remote_value.Serializer.init(bidi, arena.allocator(), frame, local, self.opts);
+        const data = try serializer.run(value);
+        return bidi.sendEvent("script.message", .{
+            .channel = self.id,
+            .data = data,
+            .source = .{ .realm = &ctx.realm_id, .context = &ctx.id },
+        });
+    }
+};
+
 fn addPreloadScript(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         functionDeclaration: []const u8,
-        arguments: []const std.json.Value = &.{},
+        arguments: []const Channel.Param = &.{},
         contexts: ?[]const []const u8 = null,
         userContexts: ?[]const []const u8 = null,
         sandbox: ?[]const u8 = null,
@@ -207,9 +322,10 @@ fn addPreloadScript(cmd: *BiDi.Command) !void {
     if (p.sandbox != null) {
         return cmd.sendError("unsupported operation", "sandboxes are not supported");
     }
-    // The arguments can only be channels, and we don't send script.message.
-    if (p.arguments.len > 0) {
-        return cmd.sendError("unsupported operation", "channels are not supported");
+    for (p.arguments) |argument| {
+        if (std.mem.eql(u8, argument.type, "channel") == false) {
+            return cmd.sendError("invalid argument", "arguments must be channels");
+        }
     }
     if (p.contexts != null and p.userContexts != null) {
         return cmd.sendError("invalid argument", "contexts and userContexts are mutually exclusive");
@@ -251,6 +367,15 @@ fn addPreloadScript(cmd: *BiDi.Command) !void {
         } else .init(user_contexts[0]);
     }
 
+    const channels = try allocator.alloc(Channel, p.arguments.len);
+    for (p.arguments, channels) |argument, *channel| {
+        channel.* = .{
+            .bidi = bidi,
+            .id = try allocator.dupe(u8, argument.value.channel),
+            .opts = argument.value.serializationOptions.options(argument.value.ownership == .root),
+        };
+    }
+
     // \n in case the functionDeclaration ends with a comment.
     const source = try std.fmt.allocPrint(allocator, "({s}\n)", .{p.functionDeclaration});
 
@@ -259,6 +384,7 @@ fn addPreloadScript(cmd: *BiDi.Command) !void {
         .source = source,
         .context = context,
         .user_context = user_context,
+        .channels = channels,
     };
     uuidv4(&preload.id);
     try bidi.preload_scripts.append(allocator, preload);
@@ -316,8 +442,16 @@ fn onFrameNavigated(ptr: *anyopaque, msg: *const Notification.FrameNavigated) !v
             continue;
         }
         const function = declaration.toFunction();
+
+        // Not the message_arena: a navigation the page starts runs outside
+        // any command, so that arena isn't reset until the next one.
+        const arguments = try ls.local.call_arena.alloc(js.Function, preload.channels.len);
+        for (preload.channels, arguments) |*channel, *argument| {
+            argument.* = ls.local.newCallback(Channel.send, channel);
+        }
+
         // A throw is reported on the window, like any script's.
-        function.callWithThisReport({}, .{}) catch |err| {
+        function.callWithThisReport({}, arguments) catch |err| {
             log.debug(.bidi, "preload script", .{ .id = &preload.id, .err = err });
         };
     }
@@ -1539,6 +1673,59 @@ test "bidi.script: target validation" {
     try ctx.expectSentResult(.{ .type = "success", .realm = realm }, .{ .id = 4 });
 }
 
+test "bidi.script: getRealms" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    // No browsing context yet, so no realm.
+    try ctx.startSession();
+    try ctx.processMessage(.{ .id = 1, .method = "script.getRealms", .params = struct {}{} });
+    try ctx.expectSentResult(.{ .realms = &[_]struct {}{} }, .{ .id = 1 });
+
+    const context_id = try ctx.createContext(.{ .url = "bidi/values.html" });
+    const bc = &(ctx.bidi().browsing_context orelse return error.NoBrowsingContext);
+    const realm1 = try testing.arena.dupe(u8, &bc.realm_id);
+    const expected = .{ .realms = .{.{
+        .realm = realm1,
+        .origin = "http://127.0.0.1:9582",
+        .type = "window",
+        .context = context_id,
+    }} };
+
+    try ctx.processMessage(.{ .id = 2, .method = "script.getRealms", .params = struct {}{} });
+    try ctx.expectSentResult(expected, .{ .id = 2 });
+
+    try ctx.processMessage(.{ .id = 3, .method = "script.getRealms", .params = .{ .context = context_id } });
+    try ctx.expectSentResult(expected, .{ .id = 3 });
+
+    try ctx.processMessage(.{ .id = 4, .method = "script.getRealms", .params = .{ .type = "window" } });
+    try ctx.expectSentResult(expected, .{ .id = 4 });
+
+    // A realm type we never have is a filter matching nothing, not an error.
+    try ctx.processMessage(.{ .id = 5, .method = "script.getRealms", .params = .{ .type = "dedicated-worker" } });
+    try ctx.expectSentResult(.{ .realms = &[_]struct {}{} }, .{ .id = 5 });
+
+    // A type that isn't a script.RealmType is rejected.
+    try ctx.processMessage(.{ .id = 9, .method = "script.getRealms", .params = .{ .type = "foo" } });
+    try ctx.expectSentError("invalid argument", "invalid params", .{ .id = 9 });
+
+    try ctx.processMessage(.{ .id = 6, .method = "script.getRealms", .params = .{ .context = "nope" } });
+    try ctx.expectSentError("no such frame", "unknown context", .{ .id = 6 });
+
+    // A navigation is a new document, so a new realm.
+    try ctx.processMessage(.{
+        .id = 7,
+        .method = "browsingContext.navigate",
+        .params = .{ .context = context_id, .url = testing.test_server ++ "bidi/values.html", .wait = "complete" },
+    });
+    try ctx.wait();
+    const realm2 = try testing.arena.dupe(u8, &bc.realm_id);
+    try testing.expect(std.mem.eql(u8, realm1, realm2) == false);
+
+    try ctx.processMessage(.{ .id = 8, .method = "script.getRealms", .params = struct {}{} });
+    try ctx.expectSentResult(.{ .realms = .{.{ .realm = realm2, .context = context_id }} }, .{ .id = 8 });
+}
+
 test "bidi.script: commands need a session" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -1732,4 +1919,62 @@ test "bidi.script: addPreloadScript userContexts" {
         .{ .type = "undefined" },
         .{ .type = "boolean", .value = true },
     } } }, .{ .id = 6 });
+}
+
+test "bidi.script: addPreloadScript channels" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const context_id = try ctx.createContext(.{});
+    try ctx.processMessage(.{ .id = 1, .method = "session.subscribe", .params = .{ .events = .{"script.message"} } });
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "script.addPreloadScript",
+        .params = .{
+            .functionDeclaration = "(send) => { if (window === top) { window.send = send; send({ a: 1 }); } }",
+            .arguments = .{.{ .type = "channel", .value = .{ .channel = "chan" } }},
+            .contexts = .{context_id},
+        },
+    });
+    const script_id = try testing.arena.dupe(u8, &ctx.bidi().preload_scripts.items[0].id);
+    try ctx.expectSentResult(.{ .script = script_id }, .{ .id = 2 });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "browsingContext.navigate",
+        .params = .{ .context = context_id, .url = testing.test_server ++ "bidi/values.html", .wait = "complete" },
+    });
+    try ctx.wait();
+
+    const realm = try testing.arena.dupe(u8, &ctx.bidi().browsing_context.?.realm_id);
+    try ctx.expectSentEvent("script.message", .{
+        .channel = "chan",
+        .data = .{ .type = "object", .value = .{.{ "a", .{ .type = "number", .value = 1 } }} },
+        .source = .{ .realm = realm, .context = context_id },
+    });
+
+    try ctx.processMessage(.{
+        .id = 4,
+        .method = "script.removePreloadScript",
+        .params = .{ .script = script_id },
+    });
+    try ctx.expectSentResult(null, .{ .id = 4 });
+
+    // The function keeps working after the preload script is gone, and a call
+    // without an argument sends undefined.
+    try ctx.processMessage(.{
+        .id = 5,
+        .method = "script.evaluate",
+        .params = .{ .expression = "send(); send('later')", .target = .{ .context = context_id } },
+    });
+    try ctx.expectSentEvent("script.message", .{ .channel = "chan", .data = .{ .type = "undefined" } });
+    try ctx.expectSentEvent("script.message", .{ .channel = "chan", .data = .{ .type = "string", .value = "later" } });
+
+    try ctx.processMessage(.{
+        .id = 6,
+        .method = "script.addPreloadScript",
+        .params = .{ .functionDeclaration = "() => {}", .arguments = .{.{ .type = "number", .value = 1 }} },
+    });
+    try ctx.expectSentError("invalid argument", null, .{ .id = 6 });
 }

@@ -1679,7 +1679,7 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
     if (root) {
         const doc = self.asNode().ownerDocument(frame) orelse return .{ .value = 0.0 };
         return .{ .value = switch (axis) {
-            .width => 1920.0,
+            .width => @floatFromInt(frame.page.getViewport().width),
             .height => if (tag == .body) doc.bodyHeight(self) else doc.extent().height,
         } };
     }
@@ -1786,10 +1786,6 @@ fn documentOrigin(self: *Element, frame: *Frame) layout.Origin {
     return layout.boxOrigin(self, owner, frame);
 }
 
-pub fn getBoundingClientRect(self: *Element, frame: *Frame) !*DOMRect {
-    return DOMRect.create(self.boundingClientRectValues(frame), frame._factory);
-}
-
 // Plain rect values, no JS-backed allocation: the internal fast path shared by
 // getBoundingClientRect, getClientRects, and IntersectionObserver. A DOMRect is
 // only materialized at the JS boundary.
@@ -1820,15 +1816,6 @@ pub fn clientOrigin(self: *Element, frame: *Frame) struct { x: f64, y: f64 } {
         .x = origin.x - @as(f64, @floatFromInt(window.getScrollX())),
         .y = origin.y - @as(f64, @floatFromInt(window.getScrollY())),
     };
-}
-
-pub fn getClientRects(self: *Element, frame: *Frame) ![]*DOMRect {
-    if (!self.isVisible(frame)) {
-        return &.{};
-    }
-    const rects = try frame.local_arena.alloc(*DOMRect, 1);
-    rects[0] = try DOMRect.create(self.boundingClientRectValuesForVisible(frame), frame._factory);
-    return rects;
 }
 
 // Scroll events fire in the element's own frame — not the caller's, which
@@ -2049,7 +2036,7 @@ pub fn horizontalPosition(self: *Element, frame: *Frame) f64 {
                 current = (anchor.base orelse return x).asNode();
                 continue;
             }
-            x += layout.relativeShift(el, .horizontal, owner);
+            x += layout.relativeShift(el, .horizontal, owner) + layout.marginOn(el, .left, owner);
         }
         const parent = current.flatParent(frame) orelse return x;
         if (current.is(Element)) |el| {
@@ -2091,6 +2078,14 @@ pub const LineCursor = struct {
     // Text before the box, unwrapped: on its line, or in a row the
     // anonymous item a run of it makes.
     text: ?layout.LineText(.full) = null,
+    // A flex row's free space, read at the first offset; null for none
+    space: ??layout.RowSpace = null,
+    // A row's gap between its items, read at the first offsetOf
+    gap: ?f64 = null,
+    // In a row: the items before `next`, and, with space to place, their
+    // auto margins
+    items: f64 = 0,
+    autos: f64 = 0,
 
     pub const Mode = enum {
         // a flex row's item, a table cell: beside every sibling before it
@@ -2151,6 +2146,14 @@ pub const LineCursor = struct {
     /// `node` is a child of the parent, at or after the last one asked for.
     pub fn offsetOf(self: *LineCursor, node: *Node, owner: *Frame) f64 {
         const style_manager = &owner._style_manager;
+        const space: ?layout.RowSpace = self.space orelse blk: {
+            const space = if (self.mode == .row and self.text != null) layout.rowSpace(self.text.?.parent, owner) else null;
+            self.space = space;
+            break :blk space;
+        };
+        if (self.mode == .row and self.gap == null) {
+            self.gap = if (self.text) |t| style_manager.gap(t.parent, .width) else 0;
+        }
         while (self.next) |s| : (self.next = s.flatNextSibling(self.frame)) {
             if (s == node) break;
             const sibling = s.is(Element) orelse {
@@ -2176,24 +2179,57 @@ pub const LineCursor = struct {
             if (comptime lp.IS_TEST) {
                 style_manager.line_steps += 1;
             }
+            const width = layout.boxWidth(sibling, owner);
             if (self.mode == .row) {
                 // The text since the last item is an item of its own
-                self.x += self.textItem();
+                self.addTextItem();
+                if (space != null and space.?.auto != 0) {
+                    self.autos += @floatFromInt(style_manager.autoMargins(sibling));
+                }
+                if (width == 0 and style_manager.widthSizing(sibling) == .contents) {
+                    // No box, but its children are the row's items
+                    self.addItem(layout.contentsItemWidth(sibling, owner));
+                } else {
+                    self.addItem(width + layout.inlineMargins(sibling, owner));
+                }
+                continue;
             }
-            self.x += layout.boxWidth(sibling, owner);
+            self.x += width + layout.inlineMargins(sibling, owner);
         }
         if (self.mode == .row) {
-            self.x += self.textItem();
-            return self.x;
+            self.addTextItem();
+            // The node goes a gap after the item before it
+            const x = if (self.items > 0) self.x + self.gap.? else self.x;
+            const placed = space orelse return x;
+            var autos = self.autos;
+            if (placed.auto != 0) {
+                if (node.is(Element)) |el| {
+                    const left = style_manager.margin(el, .left) == .auto and style_manager.takesMargins(el);
+                    autos += @floatFromInt(@intFromBool(left));
+                }
+            }
+            return x + placed.lead + placed.between * self.items + placed.auto * autos;
         }
         return self.x + if (self.text) |*t| t.widthBefore() else 0;
     }
 
-    // Snapped to Chrome's 1/64px layout unit, like an element item. It's
-    // never shrunk: the row's sizing doesn't see it.
-    fn textItem(self: *LineCursor) f64 {
-        const t = &(self.text orelse return 0);
-        return @round(t.end() * 64) / 64;
+    // A row's next item, a gap after the one before it
+    fn addItem(self: *LineCursor, width: f64) void {
+        if (self.items > 0) {
+            self.x += self.gap.?;
+        }
+        self.x += width;
+        self.items += 1;
+    }
+
+    // The text since the last item is an item of its own. Snapped to
+    // Chrome's 1/64px layout unit, like an element item; it's never shrunk.
+    fn addTextItem(self: *LineCursor) void {
+        const t = &(self.text orelse return);
+        const width = @round(t.end() * 64) / 64;
+        if (width > 0) {
+            self.addItem(width);
+        }
     }
 };
 
@@ -2985,8 +3021,21 @@ pub const JsApi = struct {
     pub const offsetWidth = bridge.accessor(Element.getOffsetWidth, null, .{});
     pub const offsetHeight = bridge.accessor(Element.getOffsetHeight, null, .{});
     pub const offsetParent = bridge.accessor(Element.getOffsetParent, null, .{});
-    pub const getClientRects = bridge.function(Element.getClientRects, .{});
-    pub const getBoundingClientRect = bridge.function(Element.getBoundingClientRect, .{});
+    pub const getClientRects = bridge.function(struct {
+        fn wrap(self: *Element, frame: *Frame) ![]js.NoIdentity(DOMRect) {
+            if (!self.isVisible(frame)) {
+                return &.{};
+            }
+            const rects = try frame.local_arena.alloc(js.NoIdentity(DOMRect), 1);
+            rects[0] = .wrap(try DOMRect.create(self.boundingClientRectValuesForVisible(frame), frame._factory));
+            return rects;
+        }
+    }.wrap, .{});
+    pub const getBoundingClientRect = bridge.function(struct {
+        fn wrap(self: *Element, frame: *Frame) !js.NoIdentity(DOMRect) {
+            return .wrap(try DOMRect.create(self.boundingClientRectValues(frame), frame._factory));
+        }
+    }.wrap, .{});
     pub const getElementsByTagName = bridge.function(Element.getElementsByTagName, .{});
     pub const getElementsByTagNameNS = bridge.function(Element.getElementsByTagNameNS, .{});
     pub const getElementsByClassName = bridge.function(Element.getElementsByClassName, .{});
