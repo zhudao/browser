@@ -235,10 +235,13 @@ pub fn asNode(self: *CData) *Node {
 }
 
 pub fn is(self: *CData, comptime T: type) ?*T {
-    if (self._type != comptime tagOf(T)) {
-        return null;
+    if (self._type == comptime tagOf(T)) {
+        return self.subtype(T);
     }
-    return self.subtype(T);
+    if (T == Text and self._type == .cdata_section) {
+        return self.subtype(Text);
+    }
+    return null;
 }
 
 pub fn getData(self: *const CData) String {
