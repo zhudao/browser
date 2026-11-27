@@ -106,6 +106,15 @@ unscoped_sizing: bool = false,
 // `content` rule.
 lazy_rules: std.HashMapUnmanaged(properties.Id, LazyRules, IdContext, std.hash_map.default_max_load_percentage) = .empty,
 
+// The memos each custom property reaches, by its index among the custom names:
+// those of the properties whose var() read it since the rebuild. Empty for
+// most: a colour variable is only read by properties nothing here tracks.
+var_reach: std.ArrayList(Memos) = .empty,
+
+// The rule blocks kept as written, see Var. A rule's `unresolved` is an index
+// in here, plus one.
+var_blocks: std.ArrayList([]const Var.Declaration) = .empty,
+
 // The rules declaring each animation property, the shorthand apart from the
 // longhands. frame/css_animations.zig reads them to fire the animation events.
 animation_rules: std.enums.EnumArray(Animation.Property, LazyRules) = .initFill(.{}),
@@ -695,6 +704,8 @@ fn addSelectorRules(
     // By pointer: inlined, by value would copy them for every rule
     props: *const Declarations,
     important: *const Declarations,
+    // Null for most rules: no declaration uses var()
+    unresolved: ?*const Var.Blocks,
     declared: LazyDeclarations,
     layer: u16,
 ) !bool {
@@ -709,13 +720,24 @@ fn addSelectorRules(
         lazy.animation = .{};
     }
 
-    const relevant = props.isRelevant() or important.isRelevant();
+    const relevant = props.isRelevant() or important.isRelevant() or unresolved != null;
     if (relevant == false and lazy.isEmpty()) {
         return false;
     }
 
     const arena = self.arena.allocator();
-    var changed = lazy.declaresCustom();
+    // A custom property no var() has read changes no memo. During a rebuild
+    // that's all of them, and the memos are reset anyway.
+    var changed = false;
+    for (lazy.declared) |declaration| {
+        const reach = self.varReach(declaration.id);
+        if (reach.count() != 0) {
+            changed = true;
+            for (SelectorParser.parseList(arena, selector_text) catch &.{}) |selector| {
+                try self.trackVarSelector(selector, reach);
+            }
+        }
+    }
 
     if (lazy.isEmpty() == false) {
         const priority = try self.nextPriority(layer);
@@ -742,7 +764,7 @@ fn addSelectorRules(
         const before = self.next_doc_order;
         const selectors = SelectorParser.parseList(arena, selector_text) catch &.{};
         for (selectors) |selector| {
-            try self.addTrackedRule(selector, props, important, layer);
+            try self.addTrackedRule(selector, props, important, unresolved, layer);
         }
         changed = changed or self.next_doc_order != before;
     }
@@ -752,13 +774,28 @@ fn addSelectorRules(
 // One priority per selector, shared by every group it lands in: doc_order
 // indexes rule_layers. The !important declarations become a second rule in
 // the tier above every normal one, where an unlayered rule packs rank 0.
-fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *const Declarations, important: *const Declarations, layer: u16) !void {
+fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *const Declarations, important: *const Declarations, unresolved: ?*const Var.Blocks, layer: u16) !void {
     const matched = unwrapWhere(selector);
     // Before anything is collected: a rule no bucket holds reads nothing
     const placement = placeSelector(matched) orelse return;
-    try self.collectAttributeNames(selector, false);
-    self.siblings.addNext(nextReach(selector));
-    try self.collectClassReach(selector, .subtree, true, matched.rightmost(), BoxReach.of(props).widest(.of(important)));
+    const deep = siblingsReachDescendants(selector);
+    try self.collectAttributeNames(selector, false, deep);
+    self.siblings.addNext(nextReach(selector), deep);
+    var boxes = BoxReach.of(props).widest(.of(important));
+    if (unresolved) |blocks| {
+        for (blocks) |by_group| {
+            for (by_group) |block| {
+                for (block) |declaration| {
+                    // What it resolves to isn't known: any z-index, any box
+                    boxes = boxes.widest(.ofMemos(propertyReach(declaration.id)));
+                    if (declaration.id == .@"z-index") {
+                        self.z_index_rules = true;
+                    }
+                }
+            }
+        }
+    }
+    try self.collectClassReach(selector, .subtree, true, matched.rightmost(), boxes);
     for ([_]?ZIndex{ props.geometry.z_index, important.geometry.z_index }) |z| {
         if ((z orelse .auto) != .auto) {
             self.z_index_rules = true;
@@ -769,9 +806,13 @@ fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *cons
     const important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK);
     const parent_needs = if (parentCompound(matched)) |compound| KeyBits.needed(compound) else 0;
     const ancestor_needs = try self.ancestors.needed(self.arena.allocator(), matched);
-    inline for (group_fields) |field| {
-        inline for (.{ @field(props, field), @field(important, field) }, .{ priority, important_priority }) |declared, p| {
-            if (declaresAny(declared)) {
+    inline for (group_fields, 0..) |field, group| {
+        inline for (.{ props, important }, .{ priority, important_priority }, 0..) |source, p, importance| {
+            const declared = &@field(source, field);
+            // A group's block is parsed whole, in order: it holds what the
+            // group declares without var() too
+            const in_block = if (unresolved) |blocks| blocks[importance][group].len != 0 else false;
+            if (in_block == false and declaresAny(declared)) {
                 try @field(self, field).bucket(self.arena.allocator(), placement, .{
                     .props = .init(declared),
                     .selector = matched,
@@ -782,11 +823,28 @@ fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *cons
             }
         }
     }
+    const blocks = unresolved orelse return;
+    inline for (group_fields, 0..) |field, group| {
+        inline for (.{ priority, important_priority }, 0..) |p, importance| {
+            const block = blocks[importance][group];
+            if (block.len != 0) {
+                try self.var_blocks.append(self.arena.allocator(), block);
+                try @field(self, field).bucket(self.arena.allocator(), placement, .{
+                    .props = .{ .set = .full, .unresolved = @intCast(self.var_blocks.items.len) },
+                    .selector = matched,
+                    .priority = p,
+                    .parent_needs = parent_needs,
+                    .ancestor_needs = ancestor_needs,
+                });
+            }
+        }
+    }
 }
 
-// `nested`: an argument of :not(), :is()..., not a rule's own selector
-fn collectAttributeNames(self: *StyleManager, selector: Selector.Selector, nested: bool) Allocator.Error!void {
-    try self.collectCompoundAttributeNames(selector.first(), nested);
+// `nested`: an argument of :not(), :is()..., not a rule's own selector.
+// `deep`: the rule's siblingsReachDescendants.
+fn collectAttributeNames(self: *StyleManager, selector: Selector.Selector, nested: bool, deep: bool) Allocator.Error!void {
+    try self.collectCompoundAttributeNames(selector.first(), nested, deep);
     for (selector.segments(), 0..) |segment, i| {
         switch (segment.combinator) {
             .subsequent_sibling => {
@@ -801,11 +859,11 @@ fn collectAttributeNames(self: *StyleManager, selector: Selector.Selector, neste
             // counted by nextReach
             .next_sibling, .descendant, .child => {},
         }
-        try self.collectCompoundAttributeNames(segment.compound(), nested);
+        try self.collectCompoundAttributeNames(segment.compound(), nested, deep);
     }
 }
 
-fn collectCompoundAttributeNames(self: *StyleManager, compound: Selector.Compound, nested: bool) Allocator.Error!void {
+fn collectCompoundAttributeNames(self: *StyleManager, compound: Selector.Compound, nested: bool, deep: bool) Allocator.Error!void {
     // By pointer: a short name's str() points into its String, which would be
     // an issue, except these are all on the same self.arena, so we can copy the pointer.
     const allocator = self.arena.allocator();
@@ -835,7 +893,7 @@ fn collectCompoundAttributeNames(self: *StyleManager, compound: Selector.Compoun
                     break :blk of.selectors;
                 },
                 else => {
-                    try self.siblings.add(allocator, pseudo, if (nested) null else compound);
+                    try self.siblings.add(allocator, pseudo, if (nested) null else compound, deep);
                     if (readsOtherFormElements(pseudo)) {
                         self.reads_form = true;
                         self.reads_default = self.reads_default or pseudo == .default;
@@ -852,7 +910,7 @@ fn collectCompoundAttributeNames(self: *StyleManager, compound: Selector.Compoun
             else => continue,
         };
         for (arguments) |selector| {
-            try self.collectAttributeNames(selector, true);
+            try self.collectAttributeNames(selector, true, deep);
         }
     }
 }
@@ -874,7 +932,7 @@ fn pseudoClassAttributes(pseudo: Selector.PseudoClass) []const []const u8 {
         // value set a control's state while the user hasn't touched it.
         .valid, .invalid, .in_range, .out_of_range => &.{ "required", "readonly", "disabled", "pattern", "min", "max", "step", "minlength", "maxlength", "multiple", "value", "checked", "selected", "form", "name" },
         // Element state, the tree, or always_read (:target reads id)
-        .modal, .popover_open, .indeterminate, .placeholder_shown, .hover, .active, .focus, .focus_within, .focus_visible, .visited, .target, .root, .scope, .empty, .first_child, .last_child, .only_child, .first_of_type, .last_of_type, .only_of_type, .nth_child, .nth_last_child, .nth_of_type, .nth_last_of_type, .defined => &.{},
+        .modal, .popover_open, .indeterminate, .placeholder_shown, .hover, .active, .focus, .focus_within, .focus_visible, .visited, .host, .target, .root, .scope, .empty, .first_child, .last_child, .only_child, .first_of_type, .last_of_type, .only_of_type, .nth_child, .nth_last_child, .nth_of_type, .nth_last_of_type, .defined => &.{},
         // Walked by collectCompoundAttributeNames
         .not, .is, .where, .has, .nth_child_of, .nth_last_child_of => unreachable,
     };
@@ -964,6 +1022,10 @@ const SiblingReads = struct {
     // A change reaches this many element siblings after it: one for `+` or
     // :first-child, one more for each `+` that follows (see nextReach)
     next: u8 = 0,
+    // ... and the styles under this many of them, when a match under one can
+    // change too (see siblingsReachDescendants). Past it, a sibling's own
+    // styles change, and what inherits them.
+    next_subtrees: u8 = 0,
     // ... every later one that can match a compound counting the siblings
     // before it: :nth-child(), :nth-of-type(), :first-of-type
     later: Compounds = .{},
@@ -971,6 +1033,8 @@ const SiblingReads = struct {
     following: Compounds = .{},
     // ... the previous element sibling: :last-child
     previous: bool = false,
+    // ... and the styles under it, like next_subtrees
+    previous_subtree: bool = false,
     // ... every earlier one that can match a compound counting the siblings
     // after it: :nth-last-child(), :nth-last-of-type(), :last-of-type
     earlier: Compounds = .{},
@@ -979,20 +1043,27 @@ const SiblingReads = struct {
     // parent's subtree, which batches.
     const max_next = 4;
 
-    fn addNext(self: *SiblingReads, reach: usize) void {
+    fn addNext(self: *SiblingReads, reach: usize, deep: bool) void {
         if (reach > max_next) {
             self.later.any = true;
             return;
         }
         self.next = @max(self.next, @as(u8, @intCast(reach)));
+        if (deep) {
+            self.next_subtrees = @max(self.next_subtrees, @as(u8, @intCast(reach)));
+        }
     }
 
     // `compound` holds `pseudo`; null inside :not(), :is()..., where it
-    // isn't the one the sibling has to match.
-    fn add(self: *SiblingReads, allocator: Allocator, pseudo: Selector.PseudoClass, compound: ?Selector.Compound) Allocator.Error!void {
+    // isn't the one the sibling has to match. `deep`: the rule's
+    // siblingsReachDescendants.
+    fn add(self: *SiblingReads, allocator: Allocator, pseudo: Selector.PseudoClass, compound: ?Selector.Compound, deep: bool) Allocator.Error!void {
         switch (pseudo) {
             // their next sibling is counted by nextReach
-            .last_child, .only_child => self.previous = true,
+            .last_child, .only_child => {
+                self.previous = true;
+                self.previous_subtree = self.previous_subtree or deep;
+            },
             .nth_child, .nth_of_type, .first_of_type => try self.later.add(allocator, compound),
             .nth_last_child, .nth_last_of_type, .last_of_type => try self.earlier.add(allocator, compound),
             .only_of_type => {
@@ -1017,15 +1088,59 @@ fn readsSiblings(compound: Selector.Compound) bool {
             else => continue,
         };
         for (nested) |selector| {
-            if (readsSiblings(selector.first())) {
+            if (selectorReadsSiblings(selector)) {
                 return true;
             }
-            for (selector.segments()) |segment| {
-                if (segment.combinator == .next_sibling or segment.combinator == .subsequent_sibling or readsSiblings(segment.compound())) {
-                    return true;
-                }
+        }
+    }
+    return false;
+}
+
+fn selectorReadsSiblings(selector: Selector.Selector) bool {
+    if (readsSiblings(selector.first())) {
+        return true;
+    }
+    for (selector.segments()) |segment| {
+        if (segment.combinator == .next_sibling or segment.combinator == .subsequent_sibling or readsSiblings(segment.compound())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a sibling whose match a tree change can change (SiblingReads.next,
+/// .previous) can change a match under it too: a descendant or child
+/// combinator right of a compound that reads its siblings, in the selector or
+/// in an argument of one of its compounds. `.a:first-child` and `.a + .b`
+/// don't: only the sibling's own styles change. `.a:first-child .b` does.
+fn siblingsReachDescendants(selector: Selector.Selector) bool {
+    var reads = false;
+    const segments = selector.segments();
+    for (0..segments.len + 1) |i| {
+        const compound = if (i == 0) selector.first() else segments[i - 1].compound();
+        if (i != 0) switch (segments[i - 1].combinator) {
+            .descendant, .child => if (reads) return true,
+            .next_sibling, .subsequent_sibling => reads = true,
+        };
+        for (compound.parts) |part| {
+            switch (part) {
+                .pseudo_class => |pseudo| switch (pseudo) {
+                    .not, .is, .where => |arguments| for (arguments) |argument| {
+                        if (siblingsReachDescendants(argument)) return true;
+                    },
+                    .nth_child_of, .nth_last_child_of => |of| for (of.selectors) |argument| {
+                        if (siblingsReachDescendants(argument)) return true;
+                    },
+                    // what the argument matches is under the compound
+                    .has => |arguments| for (arguments) |argument| {
+                        if (selectorReadsSiblings(argument)) return true;
+                    },
+                    else => {},
+                },
+                else => {},
             }
         }
+        reads = reads or readsSiblings(compound);
     }
     return false;
 }
@@ -1319,6 +1434,15 @@ const BoxReach = enum(u8) {
 
     fn widest(a: BoxReach, b: BoxReach) BoxReach {
         return @fromBackingInt(@intCast(@max(@backingInt(a), @backingInt(b))));
+    }
+
+    // Of a property by the memos it reaches, when its value isn't known
+    fn ofMemos(memos: Memos) BoxReach {
+        if (memos.contains(.layout) or memos.contains(.heights)) {
+            return .layout;
+        }
+        // could be a vertical inset
+        return if (memos.contains(.geometry)) .hit else .none;
     }
 
     // Field by field what property_reach says of the properties they parse:
@@ -2158,23 +2282,54 @@ fn previousElement(from: ?*Node) ?*Node {
 // subtree.
 fn dropSiblings(self: *StyleManager, previous: ?*Node, next: ?*Node, boxes: *BoxScope, budget: *usize) bool {
     var sibling = next;
-    for (0..self.siblings.next) |_| {
+    for (0..self.siblings.next) |i| {
         const s = nextElement(sibling) orelse break;
-        boxes.restyled(s);
-        if (self.dropSubtree(s, boxes.memos.*, budget) == false) {
+        if (self.dropRestyled(s, i < self.siblings.next_subtrees, boxes, budget) == false) {
             return false;
         }
         sibling = s.nextSibling();
     }
     if (self.siblings.previous) {
         if (previousElement(previous)) |s| {
-            boxes.restyled(s);
-            if (self.dropSubtree(s, boxes.memos.*, budget) == false) {
+            if (self.dropRestyled(s, self.siblings.previous_subtree, boxes, budget) == false) {
                 return false;
             }
         }
     }
     return true;
+}
+
+// `node`'s own match changed, and with `subtree` the matches under it. Its
+// box can change in any way, and so can the boxes inside it, which it sizes:
+// their layout goes either way. Without `subtree` the styles under it stay,
+// but for what inherits from it.
+fn dropRestyled(self: *StyleManager, node: *Node, subtree: bool, boxes: *BoxScope, budget: *usize) bool {
+    boxes.restyled(node);
+    if (subtree) {
+        return self.dropSubtree(node, boxes.memos.*, budget);
+    }
+    const el = node.as(Element);
+    var layout: Memos = .empty;
+    var it = boxes.memos.iterator();
+    while (it.next()) |memo| {
+        switch (memo) {
+            .layout, .heights => layout.insert(memo),
+            inline else => |m| {
+                const group = &@field(self, @tagName(m));
+                switch (m) {
+                    // Entries hold the element's own values
+                    .geometry, .text, .grid => _ = group.memo.remove(el),
+                    // Entries hold resolved values: el's reach its descendants
+                    .visibility, .touch_action, .flow => self.dropInherited(&group.memo, node),
+                    .layout, .heights => unreachable,
+                }
+            },
+        }
+    }
+    if (layout.count() == 0) {
+        return true;
+    }
+    return self.dropSubtree(node, layout, budget);
 }
 
 fn memoFills(self: *const StyleManager) usize {
@@ -2379,6 +2534,9 @@ pub fn inlineStyleWritten(self: *StyleManager, el: *Element, id: properties.Id) 
     if (self.dirty or self.reads_style_attribute) {
         return false;
     }
+    if (@backingInt(id) >= properties.known_count) {
+        return self.customChanged(el, self.varReach(id));
+    }
     // z-index orders boxes, it doesn't move them
     self.invalidateInline(el, propertyReach(id), id != .@"z-index");
     return true;
@@ -2401,7 +2559,79 @@ pub fn styleAttributeChanged(self: *StyleManager, el: *Element, old: ?[]const u8
         }
     }
     self.invalidateInline(el, reach, true);
-    return true;
+    return self.customChanged(el, self.customReach(old, new).unionWith(self.customReach(new, old)));
+}
+
+// What the custom properties `text` declares reach, those `other` declares
+// the same aside.
+fn customReach(self: *const StyleManager, text: ?[]const u8, other: ?[]const u8) Memos {
+    var reach: Memos = .empty;
+    if (self.var_reach.items.len == 0) {
+        return reach;
+    }
+    var it = CssParser.parseDeclarationsList(text orelse "");
+    while (it.next()) |declaration| {
+        const id = self.frame.page.css_custom_names.lookup(declaration.name) orelse continue;
+        const memos = self.varReach(id);
+        if (memos.subsetOf(reach)) {
+            continue;
+        }
+        const a = customDeclared(text, declaration.name);
+        const b = customDeclared(other, declaration.name);
+        const same = a.important == b.important and std.mem.eql(u8, a.value orelse "", b.value orelse "");
+        if (same == false) {
+            reach = reach.unionWith(memos);
+        }
+    }
+    return reach;
+}
+
+// A style attribute's winning declaration of a custom property
+fn customDeclared(text: ?[]const u8, name: []const u8) Slot {
+    var slot: Slot = .{};
+    var it = CssParser.parseDeclarationsList(text orelse "");
+    while (it.next()) |declaration| {
+        if (std.mem.eql(u8, declaration.name, name)) {
+            slot.apply(declaration.value, declaration.important);
+        }
+    }
+    return slot;
+}
+
+// The custom properties `el` declares changed, the ones reaching `reach`:
+// everything under it inherits them. False when that can't be scoped.
+fn customChanged(self: *StyleManager, el: *Element, reach: Memos) bool {
+    if (reach.count() == 0) {
+        return true;
+    }
+    self.origin_memo = null;
+    const moves: BoxReach = .ofMemos(reach);
+    if (moves == .hit) {
+        self.inline_bumps += 1;
+    }
+    var memos: Memos = .empty;
+    var budget: usize = 0;
+    inline for (group_fields) |field| {
+        const group = &@field(self, field);
+        if (reach.contains(@field(Memo, field)) and group.memo.count() != 0 and group.fresh(self.frame)) {
+            memos.insert(@field(Memo, field));
+            budget += group.memo.count();
+        }
+    }
+    if (budget == 0) {
+        if (moves == .layout) {
+            self.layout_bumps += 1;
+        }
+        return true;
+    }
+    const root = el.asNode();
+    if (self.droppedCovers(root)) {
+        return true;
+    }
+    // recordDropped speaks for every memo: only those in reach go here
+    var boxes: BoxScope = if (moves == .layout) .init(self, &memos, &budget) else .{ .style_manager = self, .memos = &memos, .scoped = false };
+    boxes.restyled(root);
+    return self.dropSubtree(root, memos, &budget);
 }
 
 // The memos a style attribute's declarations reach
@@ -2588,8 +2818,8 @@ fn heightWritten(self: *StyleManager, el: *Element) void {
 }
 
 /// Each known property's memos: the ones that read it. A property not listed
-/// reaches nothing. transform/custom properties...no memo reads them.
-/// Nothing substitutes var() (yet).
+/// reaches nothing: no memo reads a transform. A custom property reaches what
+/// the properties reading it through var() do, see varReach.
 const property_reach = blk: {
     // layout reads everything, except what we explicitly ignore (safer option)
     // A vertical inset moves a positioned box, or sizes one with both, and
@@ -2630,10 +2860,17 @@ const property_reach = blk: {
 fn propertyReach(id: properties.Id) Memos {
     const index = @backingInt(id);
     if (index >= property_reach.len) {
-        // a custom property
+        // a custom property: see varReach
         return .empty;
     }
     return property_reach[index];
+}
+
+// What reading custom property `id` through var() reaches: nothing for a
+// known property, or a custom one no tracked property has read.
+fn varReach(self: *const StyleManager, id: properties.Id) Memos {
+    const index = std.math.sub(usize, @backingInt(id), properties.known_count) catch return .empty;
+    return if (index < self.var_reach.items.len) self.var_reach.items[index] else .empty;
 }
 
 /// Rank and document-order bits of the next rule. A rule outside any layer
@@ -2772,6 +3009,8 @@ fn rebuildIfDirty(self: *StyleManager) !void {
 
     self.lazy_rules = .empty;
     try self.lazy_rules.ensureTotalCapacity(arena, lazy_rules_count);
+    self.var_reach = .empty;
+    self.var_blocks = .empty;
     self.animation_rules = .initFill(.{});
     self.keyframes = .empty;
     self.attribute_names = .empty;
@@ -3053,7 +3292,7 @@ pub fn ownTextTransform(self: *StyleManager, el: *Element) TextTransform {
     self.rebuildIfDirty() catch return .inherit;
     // Most pages declare no text-transform: skip the cascade and the memo.
     if (!self.text.hasRules() and !el._flags.has_inline_style) {
-        return .inherit;
+        return TextTransform.uaDefault(el.getTag()) orelse .inherit;
     }
     return self.text.ownProps(self.arena.allocator(), el, self.frame).text_transform;
 }
@@ -3167,7 +3406,7 @@ pub fn rootHeight(self: *StyleManager, el: *Element) ?f64 {
 /// Like declaredSize, but only the inline style counts.
 pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
     self.assertOwns(el);
-    const length = @field(inlineDeclared(Geometry.Declared, el, self.frame).props(.any), @tagName(axis)) orelse return null;
+    const length = @field(inlineDeclared(Geometry.Declared, el, self.frame).resolved(.any, .{ .style_manager = self, .el = el }), @tagName(axis)) orelse return null;
     return @max(0, length.resolve(self, el) orelse return null);
 }
 
@@ -3369,6 +3608,34 @@ pub fn autoMargins(self: *StyleManager, el: *Element) u2 {
     }
     const left, const right = self.geometry.ownPair(self.arena.allocator(), el, "margin_left", "margin_right", self.frame);
     return @as(u2, @intFromBool(left.unit == .auto)) + @intFromBool(right.unit == .auto);
+}
+
+/// el's top and bottom margins, from one read: a flow walk asks for every
+/// child. An auto one is 0 (layout.Anchor handles a positioned box's), and so
+/// are both on a plain inline box, whose margins don't move its line (CSS 2
+/// §10.6.1), or a box that takes no margins.
+pub fn blockMargins(self: *StyleManager, el: *Element) [2]Percent {
+    self.assertOwns(el);
+    const none: [2]Percent = .{ .{ .fraction = 0 }, .{ .fraction = 0 } };
+    self.rebuildIfDirty() catch return none;
+    const top, const bottom = self.geometry.ownPair(self.arena.allocator(), el, "margin_top", "margin_bottom", self.frame);
+    if (top.isNone() and bottom.isNone()) {
+        return none;
+    }
+    if (self.visibilityProps(el).box == .inline_level and el.getTag().isReplacedOrControl() == false) {
+        return none;
+    }
+    if (self.takesMargins(el) == false) {
+        return none;
+    }
+    var result = none;
+    for ([_]Length{ top, bottom }, &result) |length, *side| {
+        if (length.unit == .auto) {
+            continue;
+        }
+        side.* = length.percentage() orelse .{ .fraction = 0, .px = length.resolve(self, el) orelse 0 };
+    }
+    return result;
 }
 
 /// What places a flex row's free space, from one read; null for an element
@@ -3638,6 +3905,17 @@ pub const GridColumn = struct {
 pub fn gridColumn(self: *StyleManager, el: *Element) GridColumn {
     const grid = self.gridProps(el);
     return .{ .start = grid.column_start, .end = grid.column_end, .span = grid.column_span };
+}
+
+/// Whether the margins of el's stacked children collapse where they meet
+/// (CSS 2 §8.3.1): not between a flex column's or a grid's items.
+pub fn collapsesMargins(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return true;
+    return switch (self.visibilityProps(el).display) {
+        .flex, .grid => false,
+        .none, .other => true,
+    };
 }
 
 /// The gap between a flex or grid container's columns (.width) or its rows
@@ -4299,6 +4577,13 @@ fn Group(comptime Spec: type) type {
 
             // What the selector asks of the subject's ancestors, 0 for nothing
             ancestor_needs: AncestorFilter.Bits,
+
+            // Where the rules next to it in its list start that have the same
+            // left part: everything left of the subject's compound, its
+            // combinator included (set by bucket). Where that fails for an
+            // element it fails for all of them, and parent_needs and
+            // ancestor_needs, read off it, are theirs too.
+            run: u32 = 0,
         };
 
         const RuleList = std.MultiArrayList(Rule);
@@ -4307,9 +4592,12 @@ fn Group(comptime Spec: type) type {
         // their values. Read for every candidate rule, so kept small.
         const RuleProps = struct {
             set: std.EnumSet(Field) = .empty,
+            // The block in var_blocks, plus one, of a rule whose values wait
+            // for an element. What it sets isn't known before: `set` is full.
+            unresolved: u32 = 0,
             values: Cascaded = .{},
 
-            fn init(declared: Declared) RuleProps {
+            fn init(declared: *const Declared) RuleProps {
                 var self: RuleProps = .{};
                 inline for (fields) |field| {
                     if (@field(declared, field)) |value| {
@@ -4448,7 +4736,12 @@ fn Group(comptime Spec: type) type {
                 .subject => |key| try self.subject.list(allocator, key),
                 .other => &self.other_rules,
             };
-            try list.append(allocator, rule);
+            var placed = rule;
+            placed.run = @intCast(list.len);
+            if (list.len != 0 and sameLeft(list.items(.selector)[list.len - 1], rule.selector)) {
+                placed.run = list.items(.run)[list.len - 1];
+            }
+            try list.append(allocator, placed);
             if (rule.priority & IMPORTANT_BIT != 0) {
                 self.has_important = true;
             }
@@ -4587,12 +4880,14 @@ fn Group(comptime Spec: type) type {
             var priorities: Priorities(Declared) = .initFill(0);
 
             const inline_style = inlineDeclared(Declared, el, frame);
-            inline for (.{ .normal, .important }, .{ INLINE_PRIORITY, INLINE_IMPORTANT_PRIORITY }) |importance, priority| {
-                const inline_declared = inline_style.props(importance);
-                inline for (fields) |field| {
-                    if (@field(inline_declared, field)) |value| {
-                        @field(p, field) = value;
-                        priorities.set(@field(Field, field), priority);
+            if (inline_style.isEmpty() == false) {
+                inline for (.{ .normal, .important }, .{ INLINE_PRIORITY, INLINE_IMPORTANT_PRIORITY }) |importance, priority| {
+                    const inline_declared = inline_style.resolved(importance, .{ .style_manager = &frame._style_manager, .el = el });
+                    inline for (fields) |field| {
+                        if (@field(inline_declared, field)) |value| {
+                            @field(p, field) = value;
+                            priorities.set(@field(Field, field), priority);
+                        }
                     }
                 }
             }
@@ -4609,7 +4904,7 @@ fn Group(comptime Spec: type) type {
         // properties `declared` sets: the cascade seeded with just that
         // declaration, every other property out of reach.
         fn importantRuleWins(self: *const Self, declared: Declared, el: *Element, frame: *Frame) bool {
-            if (self.has_important == false or declaresAny(declared) == false) {
+            if (self.has_important == false or declaresAny(&declared) == false) {
                 return false;
             }
             var p: Cascaded = .{};
@@ -4655,9 +4950,31 @@ fn Group(comptime Spec: type) type {
             }
         }
 
+        // Where rule i's run starts (see Rule.run): what rejected it for el
+        // rejects the rest, which the walk then steps over.
+        fn skipRun(all: *const RuleList.Slice, i: usize, el: *Element, nth: *SelectorList.NthCache, frame: *Frame) usize {
+            const start = all.items(.run)[i];
+            if (comptime lp.IS_DEBUG) {
+                for (all.items(.selector)[start .. i + 1]) |skipped| {
+                    std.debug.assert(matchesSelector(el, skipped, nth, frame) == false);
+                }
+            }
+            return start;
+        }
+
         fn checkRules(rules: *const RuleList, p: *Cascaded, priorities: *Priorities(Declared), el: *Element, has: *ElementHas, frame: *Frame) void {
             const nth = frame._style_manager.nthCache();
-            rules: for (rules.items(.priority), rules.items(.props), rules.items(.selector), rules.items(.parent_needs), rules.items(.ancestor_needs)) |priority, *rule, selector, parent_needs, ancestor_needs| {
+            const all = rules.slice();
+            // Last first: among rules of equal specificity the later one is
+            // the stronger, and the ones it beats are then skipped unmatched.
+            var i = all.len;
+            rules: while (i > 0) {
+                i -= 1;
+                const priority = all.items(.priority)[i];
+                const rule = &all.items(.props)[i];
+                const selector = all.items(.selector)[i];
+                const parent_needs = all.items(.parent_needs)[i];
+                const ancestor_needs = all.items(.ancestor_needs)[i];
                 if (parent_needs != 0) {
                     const parent = has.parent orelse blk: {
                         const parent = KeyBits.ofParent(el);
@@ -4667,6 +4984,7 @@ fn Group(comptime Spec: type) type {
                     // A parent without one of them fails the `>`, whatever
                     // the rest of the selector says.
                     if (parent_needs & ~parent != 0) {
+                        i = skipRun(&all, i, el, nth, frame);
                         continue;
                     }
                 }
@@ -4678,9 +4996,7 @@ fn Group(comptime Spec: type) type {
                     };
                     // No ancestor carries one of the tokens the selector needs
                     if (ancestor_needs & ~ancestors != 0) {
-                        if (comptime lp.IS_DEBUG) {
-                            std.debug.assert(matchesSelector(el, selector, nth, frame) == false);
-                        }
+                        i = skipRun(&all, i, el, nth, frame);
                         continue;
                     }
                 }
@@ -4695,15 +5011,43 @@ fn Group(comptime Spec: type) type {
                     }
                     if (matched == false) {
                         count(.matches);
-                        if (matchesSelector(el, selector, nth, frame) == false) {
-                            continue :rules;
+                        switch (SelectorList.matchSides(el, selector, frame.document.asNode(), nth, frame)) {
+                            .both => {},
+                            .subject_failed => continue :rules,
+                            .left_failed => {
+                                i = skipRun(&all, i, el, nth, frame);
+                                continue :rules;
+                            },
                         }
                         matched = true;
+                        if (rule.unresolved != 0) {
+                            applyUnresolved(frame._style_manager.var_blocks.items[rule.unresolved - 1], priority, p, priorities, el, frame);
+                            continue :rules;
+                        }
                     }
                     switch (f) {
                         inline else => |field| @field(p, @tagName(field)) = @field(rule.values, @tagName(field)),
                     }
                     priorities.set(f, priority);
+                }
+            }
+        }
+
+        // A matching rule's block, parsed with el's variables.
+        fn applyUnresolved(block: []const Var.Declaration, priority: u64, p: *Cascaded, priorities: *Priorities(Declared), el: *Element, frame: *Frame) void {
+            const resolver: Var.Resolver = .{ .style_manager = &frame._style_manager, .el = el };
+            var declared: Declared = .{};
+            for (block) |declaration| {
+                var buf: Var.Buffer = undefined;
+                declared.apply(declaration.id, resolver.resolve(declaration.id, declaration.value, &buf));
+            }
+            inline for (fields) |field| {
+                if (@field(declared, field)) |value| {
+                    const f = @field(Field, field);
+                    if (priority > priorities.get(f)) {
+                        @field(p, field) = value;
+                        priorities.set(f, priority);
+                    }
                 }
             }
         }
@@ -4765,10 +5109,39 @@ fn addStoredRule(self: *StyleManager, entry: *const RuleStore.Entry, selector_te
     // A custom rule holds selector_text until the property is looked up, but it
     // doesn't need a copy: the sheet frees a rule's selector only along with
     // sheetModified(), and every lookup rebuilds first.
+    if (folded.isEmpty()) {
+        return self.addSelectorRules(selector_text, &no_declarations, &no_declarations, null, lazy, layer);
+    }
+    var blocks: Var.Blocks = undefined;
+    const unresolved = folded.uses_var and try self.unresolvedBlocks(&folded, &blocks);
+    const blocks_ptr: ?*const Var.Blocks = if (unresolved) &blocks else null;
     const normal = folded.props(.normal);
+    if (folded.anyImportant() == false) {
+        return self.addSelectorRules(selector_text, &normal, &no_declarations, blocks_ptr, lazy, layer);
+    }
     const important = folded.props(.important);
-    return self.addSelectorRules(selector_text, &normal, &important, lazy, layer);
+    return self.addSelectorRules(selector_text, &normal, &important, blocks_ptr, lazy, layer);
 }
+
+// Fills `blocks` with the rule's declarations of each group that reads a
+// var(). False when no group reads one.
+// Out of line: inlined into addStoredRule, the rules that never get here pay
+// for it (the style perf scenario went +0.4% instructions).
+noinline fn unresolvedBlocks(self: *StyleManager, folded: *const Slots(Declarations), blocks: *Var.Blocks) !bool {
+    const arena = self.arena.allocator();
+    var any = false;
+    inline for (.{ .normal, .important }, 0..) |importance, i| {
+        const block = try folded.unresolved(arena, importance);
+        inline for (group_fields, 0..) |field, group| {
+            const own = try Var.blockOf(@FieldType(Declarations, field), arena, block) orelse &.{};
+            blocks[i][group] = own;
+            any = any or own.len != 0;
+        }
+    }
+    return any;
+}
+
+const no_declarations: Declarations = .{};
 
 /// A style rule appended at or after the sheet that emitted the last rule is
 /// last in cascade order, so it joins the buckets directly. Anything else
@@ -5321,6 +5694,86 @@ fn countCompoundSpecificity(compound: Selector.Compound, ids: *u32, classes: *u3
     }
 }
 
+// Whether two selectors have the same left part (see Rule.run). A lone
+// compound has none.
+fn sameLeft(a: Selector.Selector, b: Selector.Selector) bool {
+    const as = a.segments();
+    const bs = b.segments();
+    if (as.len == 0 or as.len != bs.len or deepEql(a.first().parts, b.first().parts) == false) {
+        return false;
+    }
+    for (as, bs, 0..) |x, y, i| {
+        if (x.combinator != y.combinator) {
+            return false;
+        }
+        // the last segment's compound is the subject
+        if (i + 1 != as.len and deepEql(x.compound().parts, y.compound().parts) == false) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Structural equality that follows slices and nested selectors
+fn deepEql(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    if (T == Selector.Selector) {
+        if (deepEql(a.first().parts, b.first().parts) == false or a.segments().len != b.segments().len) {
+            return false;
+        }
+        for (a.segments(), b.segments()) |x, y| {
+            if (x.combinator != y.combinator or deepEql(x.compound().parts, y.compound().parts) == false) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (T == String) {
+        return std.mem.eql(u8, a.str(), b.str());
+    }
+    switch (@typeInfo(T)) {
+        .pointer => |info| switch (info.size) {
+            .slice => {
+                if (a.len != b.len) {
+                    return false;
+                }
+                for (a, b) |x, y| {
+                    if (deepEql(x, y) == false) {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .one => return deepEql(a.*, b.*),
+            else => @compileError("deepEql: " ++ @typeName(T)),
+        },
+        .@"struct" => |info| {
+            inline for (info.field_names) |name| {
+                if (deepEql(@field(a, name), @field(b, name)) == false) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .@"union" => {
+            const Active = std.meta.Tag(T);
+            if (@as(Active, a) != @as(Active, b)) {
+                return false;
+            }
+            switch (a) {
+                inline else => |value, tag| return deepEql(value, @field(b, @tagName(tag))),
+            }
+        },
+        .optional => {
+            const x = a orelse return b == null;
+            const y = b orelse return false;
+            return deepEql(x, y);
+        },
+        .void => return true,
+        else => return a == b,
+    }
+}
+
 // `nth` is nthCache(), fetched once for the rules of a list: this runs for
 // every one of them.
 fn matchesSelector(el: *Element, selector: Selector.Selector, nth: *SelectorList.NthCache, frame: *Frame) bool {
@@ -5585,16 +6038,16 @@ const Box = enum(u3) {
     }
 };
 
-/// The case-changing part of `text-transform`. innerText applies `uppercase`
-/// and `lowercase`; `capitalize` is a computed value only, and `full-width`,
-/// `full-size-kana` and `math-auto` are accepted but not applied. `.inherit` is both the
-/// `inherit`/`unset` keywords and "nothing declared": text-transform inherits.
+/// The case-changing part of `text-transform`. Used by innerText.
+/// `full-width`, `full-size-kana` and `math-auto` are accepted but not
+/// applied.
 pub const TextTransform = enum(u3) {
-    inherit,
+    inherit, // also means it wasn't set
     none,
     capitalize,
     uppercase,
     lowercase,
+    math_auto, // for getComputedStyle only
 
     // Null for an invalid value, which drops the declaration.
     fn parse(value: []const u8) ?TextTransform {
@@ -5605,21 +6058,39 @@ pub const TextTransform = enum(u3) {
         if (std.ascii.eqlIgnoreCase(trimmed, "initial") or std.ascii.eqlIgnoreCase(trimmed, "none")) {
             return .none;
         }
+        // Only valid on its own.
+        if (std.ascii.eqlIgnoreCase(trimmed, "math-auto")) {
+            return .math_auto;
+        }
 
-        // At most one case keyword, alongside any of the non-case ones.
+        // `[ <case> || full-width || full-size-kana ]`: each at most once.
         var result: ?TextTransform = null;
+        var full_width = false;
+        var full_size_kana = false;
         var any = false;
         var it = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
         while (it.next()) |token| {
             any = true;
+            const seen = if (std.ascii.eqlIgnoreCase(token, "full-width"))
+                &full_width
+            else if (std.ascii.eqlIgnoreCase(token, "full-size-kana"))
+                &full_size_kana
+            else
+                null;
+            if (seen) |flag| {
+                if (flag.*) {
+                    return null;
+                }
+                flag.* = true;
+                continue;
+            }
+
             const case: TextTransform = if (std.ascii.eqlIgnoreCase(token, "uppercase"))
                 .uppercase
             else if (std.ascii.eqlIgnoreCase(token, "lowercase"))
                 .lowercase
             else if (std.ascii.eqlIgnoreCase(token, "capitalize"))
                 .capitalize
-            else if (std.ascii.eqlIgnoreCase(token, "full-width") or std.ascii.eqlIgnoreCase(token, "full-size-kana") or std.ascii.eqlIgnoreCase(token, "math-auto"))
-                continue
             else
                 return null;
             if (result != null) {
@@ -5633,10 +6104,18 @@ pub const TextTransform = enum(u3) {
         return result orelse .none;
     }
 
+    fn uaDefault(tag: Tag) ?TextTransform {
+        return switch (tag) {
+            .button, .input, .select, .textarea => .none,
+            else => null,
+        };
+    }
+
     /// The computed-value keyword, as getComputedStyle reports it.
     pub fn keyword(self: TextTransform) []const u8 {
         return switch (self) {
             .inherit, .none => "none",
+            .math_auto => "math-auto",
             else => @tagName(self),
         };
     }
@@ -6324,7 +6803,7 @@ const Visibility = struct {
 /// An element's box: its size and how it scrolls.
 const Geometry = struct {
     const Declared = struct {
-        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "min-height", "max-height", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-left", "margin-right", "margin-inline-start", "margin-inline-end", "inset", "inset-inline", "left", "right", "inset-inline-start", "inset-inline-end", "inset-block", "top", "bottom", "inset-block-start", "inset-block-end", "z-index", "padding", "padding-inline", "padding-block", "padding-top", "padding-right", "padding-bottom", "padding-left", "padding-inline-start", "padding-inline-end", "padding-block-start", "padding-block-end", "box-sizing" };
+        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "min-height", "max-height", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-block", "margin-left", "margin-right", "margin-top", "margin-bottom", "margin-inline-start", "margin-inline-end", "margin-block-start", "margin-block-end", "inset", "inset-inline", "left", "right", "inset-inline-start", "inset-inline-end", "inset-block", "top", "bottom", "inset-block-start", "inset-block-end", "z-index", "padding", "padding-inline", "padding-block", "padding-top", "padding-right", "padding-bottom", "padding-left", "padding-inline-start", "padding-inline-end", "padding-block-start", "padding-block-end", "box-sizing" };
 
         overflow_x_scrolls: ?bool = null,
         overflow_x_clips: ?bool = null,
@@ -6343,6 +6822,8 @@ const Geometry = struct {
         max_height: ?Length = null,
         margin_left: ?Length = null,
         margin_right: ?Length = null,
+        margin_top: ?Length = null,
+        margin_bottom: ?Length = null,
         left: ?Length = null,
         right: ?Length = null,
         top: ?Length = null,
@@ -6374,6 +6855,13 @@ const Geometry = struct {
                     const sides = boxSides(value, Length.parseMargin) orelse return;
                     self.margin_left = sides.left;
                     self.margin_right = sides.right;
+                    self.margin_top = sides.top;
+                    self.margin_bottom = sides.bottom;
+                },
+                .@"margin-block" => {
+                    const sides = inlineSides(value, Length.parseMargin) orelse return;
+                    self.margin_top = sides.left;
+                    self.margin_bottom = sides.right;
                 },
                 .@"margin-inline" => {
                     const sides = inlineSides(value, Length.parseMargin) orelse return;
@@ -6414,6 +6902,12 @@ const Geometry = struct {
                 },
                 .@"margin-right", .@"margin-inline-end" => {
                     self.margin_right = Length.parseMargin(value);
+                },
+                .@"margin-top", .@"margin-block-start" => {
+                    self.margin_top = Length.parseMargin(value);
+                },
+                .@"margin-bottom", .@"margin-block-end" => {
+                    self.margin_bottom = Length.parseMargin(value);
                 },
                 .@"overflow-y" => {
                     self.overflow_y_scrolls = overflowScrolls(value);
@@ -6676,7 +7170,7 @@ const Geometry = struct {
         return .{ .value = value, .unit = if (percent) .percent else .px };
     }
 
-    const Computed = packed struct(u616) {
+    const Computed = packed struct(u688) {
         overflow_x_scrolls: bool = false,
         overflow_x_clips: bool = false,
         flex_grow: bool = false,
@@ -6698,6 +7192,10 @@ const Geometry = struct {
         // layout are 0
         margin_left: Length = .{ .unit = .px },
         margin_right: Length = .{ .unit = .px },
+        // auto is 0, except between a positioned box's insets (see
+        // layout.Anchor)
+        margin_top: Length = .{ .unit = .px },
+        margin_bottom: Length = .{ .unit = .px },
         // Positioned boxes only; auto, and values that need layout, are auto
         left: Length = .{},
         right: Length = .{},
@@ -6876,7 +7374,13 @@ const Text = struct {
     };
 
     pub fn finish(p: *Computed, el: *Element, _: *Frame, priorities: *const Priorities(Declared)) void {
-        const ua = WhiteSpace.uaDefault(el.getTag()) orelse return;
+        const tag = el.getTag();
+        if (priorities.get(.text_transform) == 0) {
+            if (TextTransform.uaDefault(tag)) |ua| {
+                p.text_transform = ua;
+            }
+        }
+        const ua = WhiteSpace.uaDefault(tag) orelse return;
         if (priorities.get(.white_space_collapse) == 0) {
             p.white_space_collapse = ua.collapse;
         }
@@ -7186,6 +7690,134 @@ const Grid = struct {
 
 /// Every group's share of one declaration block, so a sheet's block is folded
 /// once. Field names match the StyleManager's group fields.
+/// var() in the value of a property the cascade reads. A rule's declarations
+/// are parsed once, for every element the rule matches, but a variable's
+/// value depends on the element. So a block using one is kept as written, and
+/// parsed each time it's cascaded for an element (the memos keep the result).
+const Var = struct {
+    /// A declaration as written
+    const Declaration = struct { id: properties.Id, value: []const u8 };
+
+    /// A rule's blocks: normal then !important, one per group, empty for a
+    /// group that reads no var().
+    const Blocks = [2][group_fields.len][]const Declaration;
+
+    // What a value expands into. A longer one is invalid.
+    const max_len = 512;
+    const Buffer = [max_len]u8;
+
+    // Variables defined from variables, and what stops a cycle
+    const max_depth = 8;
+
+    // What a value that doesn't resolve is parsed as (invalid at
+    // computed-value time): the declaration still wins the cascade.
+    const invalid = "unset";
+
+    const Out = struct {
+        buf: *Buffer,
+        len: usize = 0,
+
+        fn append(self: *Out, text: []const u8) bool {
+            if (text.len > self.buf.len - self.len) {
+                return false;
+            }
+            @memcpy(self.buf[self.len..][0..text.len], text);
+            self.len += text.len;
+            return true;
+        }
+    };
+
+    /// The element a block is cascaded for.
+    const Resolver = struct {
+        style_manager: *StyleManager,
+        el: *Element,
+
+        // `value` of property `id`, its variables replaced by their values
+        fn resolve(self: Resolver, id: properties.Id, value: []const u8, buf: *Buffer) []const u8 {
+            if (in(value) == false) {
+                return value;
+            }
+            var out: Out = .{ .buf = buf };
+            if (self.style_manager.expandVars(self.el, propertyReach(id), value, &out, 0) == false) {
+                return invalid;
+            }
+            return std.mem.trim(u8, buf[0..out.len], &std.ascii.whitespace);
+        }
+    };
+
+    // Asked of every declaration: most values are short and call no
+    // function, which a plain loop finds out faster than a vectorized search.
+    fn in(value: []const u8) bool {
+        for (value) |c| {
+            if (c == '(') {
+                return find(value) != null;
+            }
+        }
+        return false;
+    }
+
+    // Where the next var( starts
+    fn find(value: []const u8) ?usize {
+        var from: usize = 0;
+        while (std.mem.findScalarPos(u8, value, from, '(')) |paren| : (from = paren + 1) {
+            if (paren < 3 or std.ascii.eqlIgnoreCase(value[paren - 3 .. paren], "var") == false) {
+                continue;
+            }
+            const start = paren - 3;
+            // not the end of another function's name
+            if (start == 0 or (std.ascii.isAlphanumeric(value[start - 1]) == false and value[start - 1] != '-' and value[start - 1] != '_')) {
+                return start;
+            }
+        }
+        return null;
+    }
+
+    // The `)` of a function whose arguments start at `from`
+    fn closing(value: []const u8, from: usize) ?usize {
+        var depth: usize = 0;
+        for (value[from..], from..) |c, i| {
+            switch (c) {
+                '(' => depth += 1,
+                ')' => {
+                    if (depth == 0) {
+                        return i;
+                    }
+                    depth -= 1;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    // The declarations of `block` a group reads, when one of them uses var().
+    fn blockOf(comptime Declared: type, allocator: Allocator, block: []const Declaration) !?[]const Declaration {
+        var count: usize = 0;
+        var uses_var = false;
+        for (block) |declaration| {
+            if (Slots(Declared).tracks(declaration.id)) {
+                count += 1;
+                uses_var = uses_var or in(declaration.value);
+            }
+        }
+        if (uses_var == false) {
+            return null;
+        }
+        if (count == block.len) {
+            return block;
+        }
+        const own = try allocator.alloc(Declaration, count);
+        var i: usize = 0;
+        for (block) |declaration| {
+            if (Slots(Declared).tracks(declaration.id)) {
+                own[i] = declaration;
+                i += 1;
+            }
+        }
+        return own;
+    }
+};
+
 const Declarations = struct {
     const names = Visibility.Declared.names ++ Geometry.Declared.names ++ TouchAction.Declared.names ++ Text.Declared.names ++ Flow.Declared.names ++ Grid.Declared.names;
 
@@ -7202,9 +7834,9 @@ const Declarations = struct {
         }
     }
 
-    fn isRelevant(self: Declarations) bool {
+    fn isRelevant(self: *const Declarations) bool {
         inline for (group_fields) |field| {
-            if (declaresAny(@field(self, field))) {
+            if (declaresAny(&@field(self, field))) {
                 return true;
             }
         }
@@ -7214,8 +7846,9 @@ const Declarations = struct {
 
 const group_fields = @typeInfo(Declarations).@"struct".field_names;
 
+// `declared`: a pointer to a group's Declared, which is too large to copy
 fn declaresAny(declared: anytype) bool {
-    inline for (@typeInfo(@TypeOf(declared)).@"struct".field_names) |field| {
+    inline for (@typeInfo(@TypeOf(declared.*)).@"struct".field_names) |field| {
         if (@field(declared, field) != null) {
             return true;
         }
@@ -7266,6 +7899,10 @@ const ParsedRule = struct {
     selector: Selector.Selector,
     value: []const u8,
     priority: u64, // packed the same way as a group Rule.priority
+
+    // The selector is `:root`, where most variables are declared: expandVar
+    // walks every ancestor, and needn't match it on each.
+    root: bool,
 };
 
 /// A lazy declaration on its way from a rule block into lazy_rules.
@@ -7288,16 +7925,6 @@ const LazyDeclarations = struct {
     fn declares(self: LazyDeclarations, id: properties.Id) bool {
         for (self.declared) |declaration| {
             if (declaration.id == id) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Unlike `content`, a custom property can change what a memo reads
-    fn declaresCustom(self: LazyDeclarations) bool {
-        for (self.declared) |declaration| {
-            if (declaration.id != .content) {
                 return true;
             }
         }
@@ -7444,7 +8071,13 @@ fn Slots(comptime Declared: type) type {
     return struct {
         const Self = @This();
 
-        slots: [Declared.names.len]Slot = @splat(.{}),
+        // The slots holding a value: most blocks declare none of these
+        // properties, or one or two, and the rest is never written or read.
+        set: std.StaticBitSet(Declared.names.len) = .empty,
+        slots: [Declared.names.len]Slot = undefined,
+
+        // Whether a value applied used var(): it may have been replaced since
+        uses_var: bool = false,
 
         const ids = blk: {
             var result: [Declared.names.len]properties.Id = undefined;
@@ -7483,28 +8116,110 @@ fn Slots(comptime Declared: type) type {
             if (slot == untracked) {
                 return;
             }
+            const uses_var = Var.in(value);
             if (comptime @hasDecl(Declared, "accepts")) {
                 // An invalid value is dropped, so an earlier one in the same
                 // block still holds
-                if (value.len != 0 and Declared.accepts(id, value) == false) {
+                if (value.len != 0 and uses_var == false and Declared.accepts(id, value) == false) {
                     return;
                 }
             }
+            if (self.set.isSet(slot) == false) {
+                self.slots[slot] = .{};
+            }
             self.slots[slot].apply(value, important);
+            self.set.setValue(slot, self.slots[slot].value != null);
+            self.uses_var = self.uses_var or uses_var;
         }
 
+        fn isEmpty(self: *const Self) bool {
+            return self.set.count() == 0;
+        }
+
+        fn anyImportant(self: *const Self) bool {
+            var it = self.set.iterator(.{});
+            while (it.next()) |slot| {
+                if (self.slots[slot].important) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // The values as written: one using var() parses as whatever its
+        // property makes of an invalid value. See resolved and unresolved.
         fn props(self: *const Self, comptime importance: Importance) Declared {
             var p: Declared = .{};
-            for (ids, self.slots) |id, s| {
-                const value = s.value orelse continue;
+            var it = self.set.iterator(.{});
+            while (it.next()) |slot| {
+                const s = self.slots[slot];
                 switch (importance) {
                     .any => {},
                     .normal => if (s.important) continue,
                     .important => if (s.important == false) continue,
                 }
-                p.apply(id, value);
+                p.apply(ids[slot], s.value.?);
             }
             return p;
+        }
+
+        // props for an element: its variables replace each var().
+        fn resolved(self: *const Self, comptime importance: Importance, resolver: Var.Resolver) Declared {
+            if (self.uses_var == false) {
+                return self.props(importance);
+            }
+            var p: Declared = .{};
+            var it = self.set.iterator(.{});
+            while (it.next()) |slot| {
+                const s = self.slots[slot];
+                switch (importance) {
+                    .any => {},
+                    .normal => if (s.important) continue,
+                    .important => if (s.important == false) continue,
+                }
+                var buf: Var.Buffer = undefined;
+                p.apply(ids[slot], resolver.resolve(ids[slot], s.value.?, &buf));
+            }
+            return p;
+        }
+
+        // The declarations as written, when one of them uses var(): they
+        // fold in order, so the others can't be parsed apart.
+        fn unresolved(self: *const Self, allocator: Allocator, comptime importance: Importance) ![]const Var.Declaration {
+            if (self.uses_var == false) {
+                return &.{};
+            }
+            var count: usize = 0;
+            var uses_var = false;
+            var it = self.set.iterator(.{});
+            while (it.next()) |slot| {
+                const s = self.slots[slot];
+                if (s.important != (importance == .important)) {
+                    continue;
+                }
+                count += 1;
+                uses_var = uses_var or Var.in(s.value.?);
+            }
+            if (uses_var == false) {
+                return &.{};
+            }
+            const block = try allocator.alloc(Var.Declaration, count);
+            var i: usize = 0;
+            it = self.set.iterator(.{});
+            while (it.next()) |slot| {
+                const s = self.slots[slot];
+                if (s.important != (importance == .important)) {
+                    continue;
+                }
+                block[i] = .{ .id = ids[slot], .value = s.value.? };
+                i += 1;
+            }
+            return block;
+        }
+
+        fn tracks(id: properties.Id) bool {
+            const index = @backingInt(id);
+            return index < slot_of.len and slot_of[index] != untracked;
         }
     };
 }
@@ -7675,6 +8390,143 @@ pub fn customPropertyValue(self: *StyleManager, el: *Element, id: properties.Id)
         }
     }
     return null;
+}
+
+// Appends `value` to `out`, each var() replaced by its variable's value on
+// `el`, or its fallback. `reach`: the memos of the property this is for.
+// False for an invalid value: a variable nothing declares, a cycle.
+fn expandVars(self: *StyleManager, el: *Element, reach: Memos, value: []const u8, out: *Var.Out, depth: u8) bool {
+    var rest = value;
+    while (Var.find(rest)) |start| {
+        const args_start = start + "var(".len;
+        const end = Var.closing(rest, args_start) orelse return false;
+        const args = rest[args_start..end];
+        // a name has no comma: the first one starts the fallback
+        const comma = std.mem.findScalar(u8, args, ',');
+        const name = std.mem.trim(u8, args[0 .. comma orelse args.len], &std.ascii.whitespace);
+        if (out.append(rest[0..start]) == false) {
+            return false;
+        }
+        const mark = out.len;
+        if (self.expandVar(el, reach, name, out, depth) == false) {
+            out.len = mark;
+            const fallback = args[(comma orelse return false) + 1 ..];
+            if (self.expandVars(el, reach, std.mem.trim(u8, fallback, &std.ascii.whitespace), out, depth) == false) {
+                return false;
+            }
+        }
+        rest = rest[end + 1 ..];
+    }
+    return out.append(rest);
+}
+
+// Appends the value of the custom property `name` on `el`: the nearest
+// declaration up the flat tree, its own variables resolved where it's declared.
+fn expandVar(self: *StyleManager, el: *Element, reach: Memos, name: []const u8, out: *Var.Out, depth: u8) bool {
+    if (depth == Var.max_depth or name.len < 3 or std.mem.startsWith(u8, name, "--") == false) {
+        return false;
+    }
+    const page = self.frame.page;
+    // Numbered even when nothing declares it: what declares it later then
+    // finds what it reaches.
+    const id = (page.css_custom_names.intern(page.arena, name) catch return false) orelse return false;
+    const rules = self.parsedRules(self.lazy_rules.getPtr(id)) catch return false;
+    self.varRead(id, reach, rules);
+
+    var current: ?*Element = el;
+    while (current) |elem| : (current = elem.asNode().flatTreeParentElement(self.frame)) {
+        const declared = self.varDeclared(elem, id, name, rules) orelse continue;
+        if (inheritsKeyword(declared)) {
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(declared, "initial")) {
+            return false;
+        }
+        if (Var.in(declared)) {
+            return self.expandVars(elem, reach, declared, out, depth + 1);
+        }
+        return out.append(declared);
+    }
+    return false;
+}
+
+// lazyWinner for expandVar: a style attribute is read as written, where
+// lazyWinner parses it into the element's style object.
+fn varDeclared(self: *StyleManager, el: *Element, id: properties.Id, name: []const u8, rules: []const ParsedRule) ?[]const u8 {
+    const nth = self.nthCache();
+    const is_root = if (el.asNode()._parent) |parent| parent._type == .document else false;
+    var value: ?[]const u8 = null;
+    var priority: u64 = 0;
+    for (rules) |rule| {
+        if (rule.priority <= priority) {
+            continue;
+        }
+        const matches = if (rule.root) is_root else matchesSelector(el, rule.selector, nth, self.frame);
+        if (matches) {
+            value = rule.value;
+            priority = rule.priority;
+        }
+    }
+    if (el._flags.has_inline_style == false) {
+        return value;
+    }
+    var slot: Slot = .{};
+    if (el.existingStyle(self.frame)) |style| {
+        if (style.asCSSStyleDeclaration().storedDeclaration(id)) |declared| {
+            slot = .{ .value = declared.value, .important = declared.important };
+        }
+    } else if (el.getAttributeInterned("style")) |attr| {
+        // Parsed only when it can declare it: every element under el asks
+        if (std.mem.find(u8, attr, name) != null) {
+            var it = CssParser.parseDeclarationsList(attr);
+            while (it.next()) |declaration| {
+                if (std.mem.eql(u8, declaration.name, name)) {
+                    slot.apply(declaration.value, declaration.important);
+                }
+            }
+        }
+    }
+    const inline_value = slot.value orelse return value;
+    const inline_priority = if (slot.important) INLINE_IMPORTANT_PRIORITY else INLINE_PRIORITY;
+    return if (inline_priority > priority) inline_value else value;
+}
+
+// A property reaching `reach` read custom property `id`, which `rules`
+// declare: from here on a change to its value on an element reaches those
+// memos, for everything under the element.
+fn varRead(self: *StyleManager, id: properties.Id, reach: Memos, rules: []const ParsedRule) void {
+    const index = @backingInt(id) - properties.known_count;
+    if (index < self.var_reach.items.len and reach.subsetOf(self.var_reach.items[index])) {
+        return;
+    }
+    self.trackVar(index, reach, rules) catch |err| {
+        log.err(.browser, "StyleManager var", .{ .err = err });
+        // Its changes can't be scoped: start over
+        self.dirty = true;
+    };
+}
+
+fn trackVar(self: *StyleManager, index: usize, reach: Memos, rules: []const ParsedRule) !void {
+    const allocator = self.arena.allocator();
+    if (index >= self.var_reach.items.len) {
+        try self.var_reach.appendNTimes(allocator, .empty, index + 1 - self.var_reach.items.len);
+    }
+    const wider = self.var_reach.items[index].unionWith(reach);
+    self.var_reach.items[index] = wider;
+    for (rules) |rule| {
+        try self.trackVarSelector(rule.selector, wider);
+    }
+}
+
+// What addTrackedRule collects of a rule's selector, for one that declares a
+// custom property reaching `reach`.
+fn trackVarSelector(self: *StyleManager, selector: Selector.Selector, reach: Memos) !void {
+    // Like parsedRules: these are never matched
+    _ = getBucketKey(selector.rightmost()) orelse return;
+    const deep = siblingsReachDescendants(selector);
+    try self.collectAttributeNames(selector, false, deep);
+    self.siblings.addNext(nextReach(selector), deep);
+    try self.collectClassReach(selector, .subtree, true, selector.rightmost(), .ofMemos(reach));
 }
 
 /// Declared `content` of `el`, or null when nothing declares it. It doesn't
@@ -7936,10 +8788,12 @@ fn parsedRules(self: *StyleManager, maybe_property: ?*LazyRules) ![]const Parsed
                 _ = getBucketKey(selector.rightmost()) orelse continue;
             }
 
+            const first = selector.first();
             try parsed.append(arena, .{
                 .selector = selector,
                 .value = rule.value,
                 .priority = rule.priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT),
+                .root = selector.segments().len == 0 and first.parts.len == 1 and first.parts[0] == .pseudo_class and first.parts[0].pseudo_class == .root,
             });
         }
     }
@@ -8072,6 +8926,121 @@ test "StyleManager: position" {
     try testing.htmlRunner("css/position.html", .{});
 }
 
+test "StyleManager: var()" {
+    try testing.htmlRunner("css/var.html", .{});
+}
+
+test "StyleManager: memo: a custom property reaches the memos that read it through var()" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div><p class=\"w c\"></p></div><div><p class=\"w\"></p></div>");
+    const div = body.firstChild().?.as(Element);
+    const p = div.asNode().firstChild().?.as(Element);
+    const other = div.asNode().nextSibling().?.firstChild().?.as(Element);
+
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(":root { --w: 10px; --c: red } .w { width: var(--w) } .c { color: var(--c) }", frame);
+    _ = try body.appendChild(style_el.asNode(), frame);
+    const sheet = style_el._sheet orelse return error.NoSheet;
+    const style = (try div.getOrCreateStyle(frame)).asCSSStyleDeclaration();
+
+    try testing.expectEqual(10, sm.declaredSize(p, .width));
+    try testing.expectEqual(10, sm.declaredSize(other, .width));
+    const version = frame.page.style_version;
+    const fills = sm.geometry.fills;
+
+    // Only a colour reads --c, and no memo reads a colour
+    sm.setCacheLayout(p, .box_width, 100);
+    try style.setProperty("--c", "blue", null, frame);
+    try testing.expect(sm.geometry.memo.contains(p));
+    try testing.expectEqual(@as(?f64, 100), sm.getCachedLayout(p, .box_width));
+    _ = try sheet.insertRule("div { --c: green; --unread: 1px }", 3, frame);
+    try testing.expectEqual(false, sm.dirty);
+    try testing.expect(sm.geometry.memo.contains(p));
+    try testing.expectEqual(@as(?f64, 100), sm.getCachedLayout(p, .box_width));
+    try testing.expectEqual(version, frame.page.style_version);
+
+    // A width reads --w: what's under the element it changed on
+    try style.setProperty("--w", "20px", null, frame);
+    try testing.expectEqual(false, sm.geometry.memo.contains(p));
+    try testing.expect(sm.geometry.memo.contains(other));
+    try testing.expectEqual(null, sm.getCachedLayout(p, .box_width));
+    try testing.expectEqual(20, sm.declaredSize(p, .width));
+    try testing.expectEqual(10, sm.declaredSize(other, .width));
+    try testing.expectEqual(fills + 1, sm.geometry.fills);
+    try testing.expectEqual(version, frame.page.style_version);
+
+    // The value it has
+    try style.setProperty("--w", "20px", null, frame);
+    try testing.expect(sm.geometry.memo.contains(p));
+
+    // A rule declaring it reaches every memo, like any tracked rule
+    _ = try sheet.insertRule("div { --w: 30px }", 4, frame);
+    try testing.expectEqual(false, sm.dirty);
+    try testing.expect(frame.page.style_version != version);
+    try testing.expectEqual(20, sm.declaredSize(p, .width));
+    try testing.expectEqual(30, sm.declaredSize(other, .width));
+}
+
+test "StyleManager: Var: expansion" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div style=\"--a: 1px; --b: var(--a) var(--a); --self: var(--self); --up: var(--c)\"><p style=\"--c: 3px; --a: 2px\"></p></div>");
+    const p = body.firstChild().?.firstChild().?.as(Element);
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "10px", "10px" },
+        .{ "var(--a)", "2px" },
+        .{ "VAR( --a )", "2px" },
+        .{ "calc(var(--a) * 2)", "calc(2px * 2)" },
+        // resolved where it's declared: the div's --a, not p's
+        .{ "var(--b)", "1px 1px" },
+        // --c isn't declared on the div
+        .{ "var(--up)", Var.invalid },
+        .{ "var(--up, 4px)", "4px" },
+        .{ "var(--nope)", Var.invalid },
+        .{ "var(--nope, 5px)", "5px" },
+        .{ "var(--nope,)", "" },
+        .{ "var(--nope, var(--c))", "3px" },
+        .{ "var(--nope, var(--nope, 6px))", "6px" },
+        .{ "var(--nope, rgb(1, 2, 3))", "rgb(1, 2, 3)" },
+        .{ "var(--self)", Var.invalid },
+        .{ "var(--a) var(--c)", "2px 3px" },
+        .{ "var(--a", Var.invalid },
+        .{ "var()", Var.invalid },
+        .{ "var(a)", Var.invalid },
+        // another function's name
+        .{ "foovar(--a)", "foovar(--a)" },
+        .{ "min(var(--a), 1px)", "min(2px, 1px)" },
+    };
+    const resolver: Var.Resolver = .{ .style_manager = sm, .el = p };
+    for (cases) |case| {
+        var buf: Var.Buffer = undefined;
+        try testing.expectString(case[1], resolver.resolve(.width, case[0], &buf));
+    }
+
+    // What doesn't fit the buffer is invalid
+    var long: [Var.max_len + 16]u8 = undefined;
+    @memset(&long, ' ');
+    @memcpy(long[0.."var(--a)".len], "var(--a)");
+    var buf: Var.Buffer = undefined;
+    try testing.expectString(Var.invalid, resolver.resolve(.width, &long, &buf));
+}
+
 test "StyleManager: inline style writes" {
     try testing.htmlRunner("css/inline_style_writes.html", .{});
 }
@@ -8121,16 +9090,20 @@ test "StyleManager: text-transform without rules skips the memo" {
 
     const div = try frame.window._document.createElement("div", null, frame);
     try Frame.parse.htmlAsChildren(frame, div.asNode(),
-        \\<p style="text-transform: uppercase"><b><i></i></b></p>
+        \\<p style="text-transform: uppercase"><b><i></i></b><button></button></p>
     );
     const p = div.asNode().firstChild().?.as(Element);
     const b = p.asNode().firstChild().?.as(Element);
     const i = b.asNode().firstChild().?.as(Element);
+    const button = b.asNode().nextSibling().?.as(Element);
 
     // Inherited from the inline declaration; only <p> needs the cascade.
     try testing.expectEqual(TextTransform.uppercase, sm.textTransform(i));
     try testing.expectEqual(1, sm.text.memo.count());
     try testing.expectEqual(TextTransform.none, sm.textTransform(div));
+    // The UA default still applies without the cascade.
+    try testing.expectEqual(TextTransform.none, sm.textTransform(button));
+    try testing.expectEqual(1, sm.text.memo.count());
 }
 
 test "StyleManager: computeSpecificity: element selector" {
@@ -9860,6 +10833,76 @@ test "StyleManager: memo: :first-child alone reaches the next element" {
     try testing.expectEqual(true, sm.visibility.memo.contains(second));
 }
 
+test "StyleManager: siblingsReachDescendants" {
+    const arena = testing.arena_allocator;
+    const cases = [_]struct { []const u8, bool }{
+        .{ ".row:first-child", false },
+        .{ ".list > .row:first-child", false },
+        .{ ".a + .b", false },
+        .{ ":first-child + b + u", false },
+        .{ ".x > :not(:last-child)", false },
+        .{ ".a .b", false },
+        .{ ".row:first-child .title", true },
+        .{ ".row:last-child > .title", true },
+        .{ ".a + .b .c", true },
+        .{ ".a ~ .b > .c", true },
+        .{ ":is(.a:first-child .b)", true },
+        .{ ".x:not(.a + .b .c)", true },
+        .{ ".x:has(> :first-child)", true },
+        .{ ".x:has(> .y)", false },
+    };
+    for (cases) |case| {
+        const selectors = try SelectorParser.parseList(arena, case[0]);
+        try testing.expectEqual(case[1], siblingsReachDescendants(selectors[0]));
+    }
+}
+
+test "StyleManager: memo: a sibling's own match changing keeps the styles under it" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div><p><i></i></p><p><i></i></p></div>");
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent("p:first-child { margin-top: 5px } i { width: 7px }", frame);
+    _ = try body.appendChild(style_el.asNode(), frame);
+    const div = body.firstChild().?;
+    const first = div.firstChild().?.as(Element);
+    const inner = first.asNode().firstChild().?.as(Element);
+    try sm.rebuildIfDirty();
+    try testing.expectEqual(Length{ .value = 5, .unit = .px }, sm.geometryProps(first).margin_top);
+    try testing.expectEqual(Length{ .value = 7, .unit = .px }, sm.geometryProps(inner).width);
+    try testing.expectEqual(SiblingReads{ .next = 1 }, sm.siblings);
+
+    const version = frame.page.style_version;
+    const p = try doc.createElement("p", null, frame);
+    _ = try div.insertBefore(p.asNode(), first.asNode(), frame);
+    try testing.expectEqual(version, frame.page.style_version);
+    try testing.expectEqual(false, sm.geometry.memo.contains(first));
+    try testing.expectEqual(true, sm.geometry.memo.contains(inner));
+    try testing.expectEqual(Length{ .unit = .px }, sm.geometryProps(first).margin_top);
+
+    // A match under the sibling reads across the gap: its subtree goes
+    try style_el.asNode().setTextContent("p:first-child i { width: 7px }", frame);
+    try sm.rebuildIfDirty();
+    try testing.expectEqual(Length{}, sm.geometryProps(inner).width);
+    try testing.expectEqual(SiblingReads{ .next = 1, .next_subtrees = 1 }, sm.siblings);
+    // past what's cached, dropping would cost more than starting over
+    for ([_]*Node{ html, body, div, p.asNode() }) |node| {
+        _ = sm.geometryProps(node.as(Element));
+    }
+    const rebuilt = frame.page.style_version;
+    _ = try div.removeChild(p.asNode(), frame);
+    try testing.expectEqual(rebuilt, frame.page.style_version);
+    try testing.expectEqual(false, sm.geometry.memo.contains(inner));
+    try testing.expectEqual(Length{ .value = 7, .unit = .px }, sm.geometryProps(inner).width);
+}
+
 test "StyleManager: memo: a `+` chain reaches a sibling per hop" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
@@ -10208,7 +11251,7 @@ test "StyleManager: records: a group allocates the chunks it reaches" {
 }
 
 test "StyleManager: records: geometry packs its lengths' units with the flags" {
-    try testing.expectEqual(84, @sizeOf(Records(Geometry.Stored).Entry));
+    try testing.expectEqual(92, @sizeOf(Records(Geometry.Stored).Entry));
 
     // Each field apart from its neighbours
     const names = Geometry.Stored.names;
@@ -11424,10 +12467,83 @@ test "StyleManager: work: a `>` rule is skipped when the parent lacks its keys" 
     try testing.expectEqual(Length{ .value = 6, .unit = .px }, sm.geometryProps(foreign_span.as(Element)).height);
 
     // Without the parent's keys every span matched its 4 rules and every li
-    // its one: 4 * 4 + 3 = 19. Now a span under an li matches the 3 li rules,
-    // the one under #top its own, the one under a plain div none, and the li
-    // of a list without the class none.
-    try testing.expectEqual(3 + 3 + 1 + 1 + 0 + 1 + 0, work.matches);
+    // its one: 4 * 4 + 3 = 19. Now a span under an li matches the li rules,
+    // last first, until one sets its height: all 3 for the first li's, 2 for
+    // the second's. The one under #top matches its own, the one under a
+    // plain div none, and the li of a list without the class none.
+    try testing.expectEqual(3 + 2 + 1 + 1 + 0 + 1 + 0, work.matches);
+}
+
+// Rules next to each other in a list that share everything left of their
+// subject compound fail together where that part fails: one match, then the
+// walk steps over the rest.
+test "StyleManager: work: rules sharing a left part fail together" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+    const GeometryGroup = @TypeOf(sm.geometry);
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body,
+        \\<div class="sec"><p class="item"></p></div><div class="sec"><p class="item"></p></div>
+    );
+    const first = body.firstChild().?;
+    const second = first.nextSibling().?;
+
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(
+        \\.sec + .sec .item:not(.x1) { width: 1px }
+        \\.sec + .sec .item:not(.x2) { width: 2px }
+        \\.sec + .sec .item:not(.x3) { width: 3px }
+        \\.sec + .sec .item:not(.x4) { width: 4px }
+        \\.sec ~ .sec .item:not(.x5) { height: 5px }
+    , frame);
+    _ = try body.insertBefore(style_el.asNode(), body.firstChild(), frame);
+    try sm.rebuildIfDirty();
+
+    // No .sec before the first one: its .item passes the ancestor filter and
+    // every subject compound, and fails `.sec +` once for the four rules,
+    // `.sec ~` once for the other.
+    GeometryGroup.work = .{};
+    const outside = sm.geometryProps(first.firstChild().?.as(Element));
+    try testing.expectEqual(Length{}, outside.width);
+    try testing.expectEqual(Length{}, outside.height);
+    try testing.expectEqual(2, GeometryGroup.work.matches);
+
+    // Under the second, the last rule of each left part wins and the ones
+    // it beats aren't matched.
+    GeometryGroup.work = .{};
+    const inside = sm.geometryProps(second.firstChild().?.as(Element));
+    try testing.expectEqual(Length{ .value = 4, .unit = .px }, inside.width);
+    try testing.expectEqual(Length{ .value = 5, .unit = .px }, inside.height);
+    try testing.expectEqual(2, GeometryGroup.work.matches);
+}
+
+test "StyleManager: sameLeft" {
+    const arena = testing.arena_allocator;
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ ".a .b", ".a .c", true },
+        .{ ".a > .b", ".a > i:not(.x)", true },
+        .{ ".a ~ .a .b + .b *", ".a ~ .a .b + .b span", true },
+        .{ "[x*=\"1\"] li:nth-child(2) > a", "[x*=\"1\"] li:nth-child(2) > b", true },
+        // nothing left of a lone compound
+        .{ ".a", ".a", false },
+        .{ ".a .b", ".a > .b", false },
+        .{ ".a .b", ".c .b", false },
+        .{ ".a .b .c", ".a .c", false },
+        .{ "[x*=\"1\"] li:nth-child(2) > a", "[x*=\"2\"] li:nth-child(2) > a", false },
+        .{ "[x*=\"1\"] li:nth-child(2) > a", "[x*=\"1\"] li:nth-child(3) > a", false },
+        .{ ".a:not(.b .c) i", ".a:not(.b .d) i", false },
+    };
+    for (cases) |case| {
+        const a = try SelectorParser.parseList(arena, case[0]);
+        const b = try SelectorParser.parseList(arena, case[1]);
+        try testing.expectEqual(case[2], sameLeft(a[0], b[0]));
+    }
 }
 
 // A descendant rule whose ancestor compounds no ancestor's tag, id or classes

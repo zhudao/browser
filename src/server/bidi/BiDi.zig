@@ -93,6 +93,9 @@ execute_pending: std.ArrayList(*execute.Pending) = .empty,
 // script.addPreloadScript registrations, run in each new document
 preload_scripts: std.ArrayList(script.PreloadScript) = .empty,
 
+// network.addIntercept registrations: the spec's intercept map.
+intercepts: std.ArrayList(@import("network.zig").Intercept) = .empty,
+
 // The HTTP session's timeouts. BiDi has no equivalent.
 timeouts: Timeouts = .{},
 
@@ -190,6 +193,7 @@ pub fn init(self: *BiDi, app: *App, inbox: *Inbox, origin: Origin) !void {
     try self.newUserContext("default");
     try @import("browsing_context.zig").registerNotifications(self);
     try script.registerNotifications(self);
+    try @import("network.zig").registerNotifications(self);
 }
 
 pub fn deinit(self: *BiDi) void {
@@ -359,6 +363,7 @@ pub fn onMessage(self: *BiDi, data: []const u8) anyerror!void {
         input,
         storage,
         emulation,
+        network,
         // An implementation may define extension modules. These must have a
         // module name that contains a single colon ":" character.
         // https://www.w3.org/TR/webdriver-bidi/#protocol-modules
@@ -380,6 +385,7 @@ pub fn onMessage(self: *BiDi, data: []const u8) anyerror!void {
         .input => @import("input.zig").processMessage(&cmd, action),
         .storage => @import("storage.zig").processMessage(&cmd, action),
         .emulation => @import("emulation.zig").processMessage(&cmd, action),
+        .network => @import("network.zig").processMessage(&cmd, action),
         .@"lp:browsingContext" => @import("lp.zig").processMessage(&cmd, action),
     };
     result catch |err| {

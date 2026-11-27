@@ -717,6 +717,14 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
     // Only Page contexts have document.getElementById lookup
     switch (local.ctx.global) {
         .frame => |frame| {
+            // a child frame's name wins over an element id, as the spec's
+            // named access on Window object orders them
+            if (frame.window.getNamedFrame(property, frame)) |access| {
+                const js_val = local.zigValueToJs(access, .{}) catch return js.Intercepted.no;
+                var pc = Caller.PropertyCallbackInfo{ .handle = handle.? };
+                pc.getReturnValue().set(js_val);
+                return js.Intercepted.yes;
+            }
             const document = frame.document;
             if (document.getElementById(property)) |el| {
                 const js_val = local.zigValueToJs(el, .{}) catch return js.Intercepted.no;
@@ -1475,6 +1483,12 @@ pub const JsApis = blk: {
 };
 
 // Whether Child is Ancestor or inherits from it, following the Proto chain.
+// A cross-origin Window or Location: members are own properties, the prototype
+// is null and the interface isn't exposed on the global.
+pub fn isCrossOrigin(comptime JsApi: type) bool {
+    return @hasDecl(JsApi.Meta, "cross_origin") and JsApi.Meta.cross_origin;
+}
+
 pub fn inheritsOrIs(comptime Child: type, comptime Ancestor: type) bool {
     comptime {
         const target = Ancestor.bridge.type;

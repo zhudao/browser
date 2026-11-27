@@ -85,10 +85,75 @@ pub extern "c" fn url_resolve_with_encoding(base_ptr: [*]const u8, base_len: usi
 /// `err` is `0` if there's no error.
 /// Returned `OwnedString` doesn't have a sentinel; callers must be aware of that.
 pub extern "c" fn url_resolve_without_encoding(base_ptr: [*]const u8, base_len: usize, input_ptr: [*]const u8, input_len: usize, err: *i32) OwnedString;
+/// url_resolve_with_encoding against a base already parsed by url_parse.
+/// `err` is `0` if there's no error.
+/// Returned `OwnedString` doesn't have a sentinel; callers must be aware of that.
+pub extern "c" fn url_resolve_parsed_with_encoding(base: *const Url, input_ptr: [*]const u8, input_len: usize, enc_ptr: [*]const u8, enc_len: usize, err: *i32) OwnedString;
 
 extern "c" fn url_get_port(url: *const Url) i32;
 pub inline fn urlGetPort(url: *const Url) ?u16 {
     const result = url_get_port(url);
     if (result < 0) return null;
     return @intCast(result);
+}
+
+// The URL record's components. Each borrows into the Url's buffer, so it's
+// valid until the Url is freed or changed. Null is the record's null: no
+// host, no query, ...
+
+pub fn urlGetScheme(url: *const Url) []const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    url_get_scheme(url, &out, &len);
+    return out[0..len];
+}
+
+pub fn urlGetUsername(url: *const Url) []const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    url_get_username(url, &out, &len);
+    return out[0..len];
+}
+
+pub fn urlGetPassword(url: *const Url) ?[]const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    if (url_get_password(url, &out, &len) != 0) {
+        return null;
+    }
+    return out[0..len];
+}
+
+pub fn urlGetHostname(url: *const Url) ?[]const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    if (url_get_hostname(url, &out, &len) != 0) {
+        return null;
+    }
+    return out[0..len];
+}
+
+pub fn urlGetPath(url: *const Url) []const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    url_get_path(url, &out, &len);
+    return out[0..len];
+}
+
+pub fn urlGetQuery(url: *const Url) ?[]const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    if (url_get_query(url, &out, &len) != 0) {
+        return null;
+    }
+    return out[0..len];
+}
+
+pub fn urlGetFragment(url: *const Url) ?[]const u8 {
+    var out: [*]const u8 = undefined;
+    var len: usize = 0;
+    if (url_get_fragment(url, &out, &len) != 0) {
+        return null;
+    }
+    return out[0..len];
 }
