@@ -95,6 +95,10 @@ origin_memo: ?OriginMemo = null,
 // element's geometry, a height can stop at a declared one (see heightWritten).
 inline_bumps: usize = 0,
 
+// Inline writes that move a box no memo holds, like a transform (see
+// geometryVersion).
+origin_bumps: usize = 0,
+
 // A box that sizes others by its content couldn't be flagged (see
 // setSizesOthers), in the layout memo's current version.
 unscoped_sizing: bool = false,
@@ -175,8 +179,9 @@ class_subjects: std.ArrayList(Compounds) = .empty,
 // ([class*=x]): any change to it can change what that matches. Null: none.
 class_attribute: ?ClassUse = null,
 
-// Those compounds' attribute selectors: a class change that matches each one
-// as before changes none of them. Past the limit, any change counts.
+// Those compounds' attribute selectors, each match once: a class change that
+// matches each one as before changes none of them. Past the limit, any
+// change counts.
 class_attribute_selectors: std.ArrayList(Selector.Attribute) = .empty,
 class_attribute_unlisted: bool = false,
 has: HasKeys = .{},
@@ -316,6 +321,14 @@ fn Records(comptime T: type) type {
             e.stamp = 0;
             self.len -= 1;
             return true;
+        }
+
+        // Puts back el's entry, which remove took: its chunk is there
+        fn restore(self: *Self, el: *const Element, value: T) void {
+            const e = self.entry(el).?;
+            std.debug.assert(e.stamp != self.generation);
+            self.len += 1;
+            e.* = .{ .stamp = self.generation, .value = value };
         }
 
         // `index` is el's, from claimSlot
@@ -782,9 +795,13 @@ fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *cons
     try self.collectAttributeNames(selector, false, deep);
     self.siblings.addNext(nextReach(selector), deep);
     var boxes = BoxReach.of(props).widest(.of(important));
+    var groups = declaredGroups(props).unionWith(declaredGroups(important));
     if (unresolved) |blocks| {
         for (blocks) |by_group| {
-            for (by_group) |block| {
+            for (by_group, 0..) |block, i| {
+                if (block.len != 0) {
+                    groups.insert(group_memos[i]);
+                }
                 for (block) |declaration| {
                     // What it resolves to isn't known: any z-index, any box
                     boxes = boxes.widest(.ofMemos(propertyReach(declaration.id)));
@@ -795,7 +812,7 @@ fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: *cons
             }
         }
     }
-    try self.collectClassReach(selector, .subtree, true, matched.rightmost(), boxes);
+    try self.collectClassReach(selector, .subtree, true, matched.rightmost(), .{ .boxes = boxes, .groups = groups, .values = true });
     for ([_]?ZIndex{ props.geometry.z_index, important.geometry.z_index }) |z| {
         if ((z orelse .auto) != .auto) {
             self.z_index_rules = true;
@@ -1489,23 +1506,42 @@ const ClassUse = struct {
     // style then changes, and what inherits from it.
     subjects: u32,
 
+    // Every rule it's in has it in the subject's own compound, and declares
+    // values, not a custom property (which what's under the subject reads):
+    // it changes the element's values, and what inherits them, nothing else.
+    own_values: bool,
+
+    // The groups its rules declare values of, all of them together
+    groups: Memos,
+
     const any_subject = std.math.maxInt(u32);
+};
+
+// What a rule's declarations do to the elements it matches, for the classes
+// in its selector (see ClassUse)
+const RuleEffect = struct {
+    boxes: BoxReach,
+    groups: Memos,
+    // false: it declares custom properties, which what's under its subject reads
+    values: bool,
 };
 
 // A use of `use`'s class, in a compound reaching `reach`, in a rule whose
 // subject is `subject`; null when the class is the subject's own, or the
 // subject isn't known.
-fn noteClassUse(self: *StyleManager, use: *ClassUse, first: bool, reach: ClassReach, subject: ?Selector.Compound, boxes: BoxReach) Allocator.Error!void {
+fn noteClassUse(self: *StyleManager, use: *ClassUse, first: bool, reach: ClassReach, subject: ?Selector.Compound, effect: RuleEffect, own_values: bool) Allocator.Error!void {
     const allocator = self.arena.allocator();
     if (first) {
-        use.* = .{ .reach = reach, .boxes = boxes, .subjects = ClassUse.any_subject };
+        use.* = .{ .reach = reach, .boxes = effect.boxes, .subjects = ClassUse.any_subject, .own_values = own_values, .groups = effect.groups };
         if (subject != null) {
             use.subjects = @intCast(self.class_subjects.items.len);
             try self.class_subjects.append(allocator, .{});
         }
     } else {
         use.reach = use.reach.widest(reach);
-        use.boxes = use.boxes.widest(boxes);
+        use.boxes = use.boxes.widest(effect.boxes);
+        use.own_values = use.own_values and own_values;
+        use.groups = use.groups.unionWith(effect.groups);
     }
     if (use.subjects == ClassUse.any_subject) {
         return;
@@ -1519,10 +1555,37 @@ fn noteClassUse(self: *StyleManager, use: *ClassUse, first: bool, reach: ClassRe
 
 const max_class_attribute_selectors = 256;
 
+// Sites repeat a few: Tailwind Typography puts [class~=not-prose] in every
+// .prose rule, over a thousand of them
+fn listClassAttributeSelector(self: *StyleManager, attr: Selector.Attribute) Allocator.Error!void {
+    for (self.class_attribute_selectors.items) |listed| {
+        if (sameClassMatch(listed, attr)) {
+            return;
+        }
+    }
+    if (self.class_attribute_selectors.items.len == max_class_attribute_selectors) {
+        self.class_attribute_unlisted = true;
+        return;
+    }
+    try self.class_attribute_selectors.append(self.arena.allocator(), attr);
+}
+
+// Whether two [class...] selectors match the same strings (see
+// classAttributeMatchChanged): the name is class in both
+fn sameClassMatch(a: Selector.Attribute, b: Selector.Attribute) bool {
+    if (a.value_case != b.value_case or std.meta.activeTag(a.matcher) != std.meta.activeTag(b.matcher)) {
+        return false;
+    }
+    return switch (a.matcher) {
+        .presence => true,
+        inline else => |value, tag| std.mem.eql(u8, value, @field(b.matcher, @tagName(tag))),
+    };
+}
+
 // `subject` is the reach of the selector's subject compound: .subtree for a
 // rule's selector, the enclosing compound's for an :is() argument. `own`:
 // that compound is the rule's subject, `rule_subject` (null: not known).
-fn collectClassReach(self: *StyleManager, selector: Selector.Selector, subject: ClassReach, own: bool, rule_subject: ?Selector.Compound, boxes: BoxReach) Allocator.Error!void {
+fn collectClassReach(self: *StyleManager, selector: Selector.Selector, subject: ClassReach, own: bool, rule_subject: ?Selector.Compound, effect: RuleEffect) Allocator.Error!void {
     const segments = selector.segments();
     for (0..segments.len + 1) |i| {
         const compound = if (i == 0) selector.first() else segments[i - 1].compound();
@@ -1532,40 +1595,37 @@ fn collectClassReach(self: *StyleManager, selector: Selector.Selector, subject: 
             .descendant, .child => .subtree,
             .next_sibling, .subsequent_sibling => .parent_subtree,
         };
-        try self.collectCompoundClassReach(compound, reach, own and i == segments.len, rule_subject, boxes);
+        try self.collectCompoundClassReach(compound, reach, own and i == segments.len, rule_subject, effect);
     }
 }
 
-fn collectCompoundClassReach(self: *StyleManager, compound: Selector.Compound, reach: ClassReach, own: bool, rule_subject: ?Selector.Compound, boxes: BoxReach) Allocator.Error!void {
+fn collectCompoundClassReach(self: *StyleManager, compound: Selector.Compound, reach: ClassReach, own: bool, rule_subject: ?Selector.Compound, effect: RuleEffect) Allocator.Error!void {
     const subject = if (own) null else rule_subject;
+    const own_values = own and reach == .subtree and effect.values;
     for (compound.parts) |part| {
         switch (part) {
             .class => |class| {
                 const gop = try self.class_reach.getOrPut(self.arena.allocator(), class);
-                try self.noteClassUse(gop.value_ptr, gop.found_existing == false, reach, subject, boxes);
+                try self.noteClassUse(gop.value_ptr, gop.found_existing == false, reach, subject, effect, own_values);
             },
             .attribute => |attr| if (attr.name.eql(comptime .wrap("class"))) {
                 const first = self.class_attribute == null;
                 if (first) {
-                    self.class_attribute = .{ .reach = reach, .boxes = boxes, .subjects = ClassUse.any_subject };
+                    self.class_attribute = .{ .reach = reach, .boxes = effect.boxes, .subjects = ClassUse.any_subject, .own_values = own_values, .groups = effect.groups };
                 }
-                try self.noteClassUse(&self.class_attribute.?, first, reach, subject, boxes);
-                if (self.class_attribute_selectors.items.len < max_class_attribute_selectors) {
-                    try self.class_attribute_selectors.append(self.arena.allocator(), attr);
-                } else {
-                    self.class_attribute_unlisted = true;
-                }
+                try self.noteClassUse(&self.class_attribute.?, first, reach, subject, effect, own_values);
+                try self.listClassAttributeSelector(attr);
             },
             .pseudo_class => |pseudo| switch (pseudo) {
                 .not, .is, .where => |selectors| for (selectors) |selector| {
-                    try self.collectClassReach(selector, reach, own, rule_subject, boxes);
+                    try self.collectClassReach(selector, reach, own, rule_subject, effect);
                 },
                 // A sibling's class changes which index the element has
                 .nth_child_of, .nth_last_child_of => |of| for (of.selectors) |selector| {
-                    try self.collectClassReach(selector, reach.widest(.parent_subtree), false, null, boxes);
+                    try self.collectClassReach(selector, reach.widest(.parent_subtree), false, null, effect);
                 },
                 .has => |selectors| for (selectors) |selector| {
-                    try self.collectClassReach(selector, .full, false, null, boxes);
+                    try self.collectClassReach(selector, .full, false, null, effect);
                 },
                 .focus => self.focus_reach = if (self.focus_reach) |current| current.widest(reach) else reach,
                 .focus_within => self.focus_within_reach = if (self.focus_within_reach) |current| current.widest(reach) else reach,
@@ -1588,12 +1648,16 @@ pub fn classChanged(self: *StyleManager, el: *Element, old: ?[]const u8, new: ?[
     var reach: ?ClassReach = null;
     var moves: BoxReach = .none;
     var subjects: ClassSubjects = .{};
+    var own_values = true;
+    var groups: Memos = .empty;
     // [class*=x] reads the string, [class] its presence
     if (self.class_attribute) |use| {
         if (self.classAttributeMatchChanged(el, old, new)) {
             reach = use.reach;
             moves = use.boxes;
             subjects.add(self, use);
+            own_values = use.own_values;
+            groups = use.groups;
         }
     }
     inline for (.{ .{ old, new }, .{ new, old } }) |pair| {
@@ -1609,12 +1673,37 @@ pub fn classChanged(self: *StyleManager, el: *Element, old: ?[]const u8, new: ?[
                 reach = if (reach) |current| current.widest(use.reach) else use.reach;
                 moves = moves.widest(use.boxes);
                 subjects.add(self, use);
+                own_values = own_values and use.own_values;
+                groups = groups.unionWith(use.groups);
             }
         }
     }
     const scope = reach orelse return true;
     if (scope == .full) {
         return false;
+    }
+    if (own_values) {
+        // Only el's values can change, and those that did are stored: what
+        // reads them goes, as for an inline write of the properties that
+        // changed. Unless the layout does: below drops only the boxes el
+        // moves, an inline write all of them.
+        if (self.ownValuesChanged(el, groups)) |changed| scoped: {
+            if (changed.reach.contains(.layout)) {
+                break :scoped;
+            }
+            const dropped = self.dropInheritors(el, &changed);
+            if (dropped == false) {
+                break :scoped;
+            }
+            if (changed.moves_box) {
+                self.inline_bumps += 1;
+                self.origin_memo = null;
+            }
+            if (changed.reach.contains(.heights)) {
+                self.heightWritten(el);
+            }
+            return true;
+        }
     }
     if (moves == .hit) {
         self.inline_bumps += 1;
@@ -1683,6 +1772,131 @@ pub fn classChanged(self: *StyleManager, el: *Element, old: ?[]const u8, new: ?[
     if (moves == .layout) {
         // droppedCovers answers for the boxes too, and these were kept
         self.recordDropped(root);
+    }
+    return true;
+}
+
+const OwnChange = struct {
+    // The memos reading the values that changed
+    reach: Memos = .empty,
+    // Whether one of them places a box (see BoxReach.of): a hit reads the
+    // others as it goes
+    moves_box: bool = false,
+};
+
+// What changed in el's values in `groups`, el's classes having changed, and
+// with them only what rules declaring those groups match (see
+// ClassUse.own_values). el's entries hold the new values: what inherits them
+// is the caller's to drop. Null, nothing replaced, when a group read this
+// version doesn't hold el, or its parent for an inherited one: what was read
+// from the old values isn't known.
+fn ownValuesChanged(self: *StyleManager, el: *Element, groups: Memos) ?OwnChange {
+    const frame = self.frame;
+    const parent = el.asNode().flatTreeParentElement(frame);
+    inline for (group_fields) |field| {
+        const group = &@field(self, field);
+        // Not read since the last full style change: nothing holds its values
+        if (groups.contains(@field(Memo, field)) and group.fresh(frame)) {
+            const G = @TypeOf(group.*);
+            if (group.memo.contains(el) == false) {
+                return null;
+            }
+            if (G.Cascaded != G.Computed and parent != null and group.memo.contains(parent.?) == false) {
+                return null;
+            }
+        }
+    }
+
+    var change: OwnChange = .{};
+    inline for (group_fields) |field| {
+        const group = &@field(self, field);
+        if (groups.contains(@field(Memo, field)) and group.fresh(frame)) {
+            const G = @TypeOf(group.*);
+            const old = G.load(group.memo.get(el).?);
+            _ = group.memo.remove(el);
+            // Refilled the way a read does, through its group's one caller:
+            // another call site would take the fill out of line from it
+            const new = switch (comptime @field(Memo, field)) {
+                .visibility => self.visibilityProps(el),
+                .geometry => self.geometryProps(el),
+                .touch_action => self.touchActionProps(el),
+                .text => self.text.ownProps(self.arena.allocator(), el, frame),
+                .flow => self.flowProps(el),
+                .grid => self.gridProps(el),
+                .layout, .heights => comptime unreachable,
+            };
+            const Bits = @typeInfo(G.Computed).@"struct".backing_integer.?;
+            if (@as(Bits, @bitCast(old)) != @as(Bits, @bitCast(new))) {
+                inline for (@typeInfo(G.Computed).@"struct".field_names) |name| {
+                    if (std.meta.eql(@field(old, name), @field(new, name)) == false) {
+                        change.reach = change.reach.unionWith(comptime fieldReach(field, name));
+                        if (comptime fieldMovesBox(field, name)) {
+                            change.moves_box = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return change;
+}
+
+// What inherits el's values in the inherited groups `change` reaches goes:
+// they're el's old ones. el keeps its new entries. False, nothing dropped,
+// when one couldn't be stored: what's under it can't be told apart then.
+// Not Records.put: a second caller would take it out of the fills' loops.
+fn dropInheritors(self: *StyleManager, el: *Element, change: *const OwnChange) bool {
+    inline for (group_fields) |field| {
+        const group = &@field(self, field);
+        if (change.reach.contains(@field(Memo, field)) and group.memo.contains(el) == false) {
+            return false;
+        }
+    }
+    inline for (group_fields) |field| {
+        const group = &@field(self, field);
+        const G = @TypeOf(group.*);
+        if (G.Cascaded != G.Computed and change.reach.contains(@field(Memo, field))) {
+            const new = group.memo.get(el).?;
+            self.dropInherited(&group.memo, el.asNode());
+            group.memo.restore(el, new);
+        }
+    }
+    return true;
+}
+
+// The memos reading a group's computed field: property_reach, for the
+// properties it's computed from.
+fn fieldReach(comptime group: []const u8, comptime field: []const u8) Memos {
+    @setEvalBranchQuota(10_000);
+    var memos: Memos = .initOne(@field(Memo, group));
+    if (fieldMovesBox(group, field) == false) {
+        return memos;
+    }
+    // A vertical inset is applied on every read (see property_reach)
+    for ([_][]const u8{ "top", "bottom" }) |name| {
+        if (std.mem.eql(u8, field, name)) {
+            return memos;
+        }
+    }
+    for ([_][]const u8{ "height", "min_height", "max_height" }) |name| {
+        if (std.mem.eql(u8, group, "geometry") and std.mem.eql(u8, field, name)) {
+            memos.insert(.heights);
+            return memos;
+        }
+    }
+    memos.insert(.layout);
+    return memos;
+}
+
+// BoxReach.of, for a computed field
+fn fieldMovesBox(comptime group: []const u8, comptime field: []const u8) bool {
+    if (std.mem.eql(u8, group, "touch_action")) {
+        return false;
+    }
+    for ([_][]const u8{ "visibility_hidden", "pointer_events_none", "in_opacity_zero", "overscroll_x_contains", "overscroll_y_contains", "z_index" }) |name| {
+        if (std.mem.eql(u8, field, name)) {
+            return false;
+        }
     }
     return true;
 }
@@ -2537,9 +2751,25 @@ pub fn inlineStyleWritten(self: *StyleManager, el: *Element, id: properties.Id) 
     if (@backingInt(id) >= properties.known_count) {
         return self.customChanged(el, self.varReach(id));
     }
+    var reach = propertyReach(id);
+    if (self.insetOnlyMoves(el, id)) {
+        reach.remove(.layout);
+    }
     // z-index orders boxes, it doesn't move them
-    self.invalidateInline(el, propertyReach(id), id != .@"z-index");
+    self.invalidateInline(el, reach, id != .@"z-index");
     return true;
+}
+
+// A left or right only places the box, applied on every read like a top
+// (see property_reach), unless the box is pinned on both sides: it then
+// stretches between them, and that width is cached (see widthSizing).
+fn insetOnlyMoves(self: *StyleManager, el: *Element, id: properties.Id) bool {
+    const geometry = self.geometryProps(el);
+    return switch (id) {
+        .left => geometry.right.unit == .auto,
+        .right => geometry.left.unit == .auto,
+        else => false,
+    };
 }
 
 /// `el`'s style attribute went from `old` to `new` (null: absent), `el`
@@ -2675,12 +2905,21 @@ fn nextReaching(it: *CssParser.DeclarationsIterator, memo: Memo) ?Reaching {
     return null;
 }
 
-fn invalidateInline(self: *StyleManager, el: *Element, reach: Memos, moves_box: bool) void {
+fn invalidateInline(self: *StyleManager, el: *Element, reach_: Memos, moves_box: bool) void {
+    var reach = reach_;
+    if (reach.contains(.heights) and self.hadAspectRatio(el)) {
+        // The ratio turns the height into a width (see declaredSize)
+        reach.remove(.heights);
+        reach.insert(.layout);
+    }
     if (moves_box and reach.count() != 0) {
         self.inline_bumps += 1;
     }
     // A transform reaches no memo, but moves the origins (translateX)
     self.origin_memo = null;
+    if (moves_box) {
+        self.origin_bumps += 1;
+    }
     var it = reach.iterator();
     while (it.next()) |memo| {
         switch (memo) {
@@ -2701,6 +2940,16 @@ fn invalidateInline(self: *StyleManager, el: *Element, reach: Memos, moves_box: 
             },
         }
     }
+}
+
+// Whether the layout read an aspect ratio of el's: one it read is in the
+// geometry memo, until a restyle drops both.
+fn hadAspectRatio(self: *StyleManager, el: *Element) bool {
+    if (self.geometry.fresh(self.frame) == false) {
+        return false;
+    }
+    const cached = self.geometry.memo.get(el) orelse return false;
+    return @TypeOf(self.geometry).load(cached).aspect_ratio.isNone() == false;
 }
 
 /// Drops `root`'s entry and those of everything that inherits from it.
@@ -3371,17 +3620,71 @@ pub fn overscrollContainAxes(self: *StyleManager, el: *Element) Element.ScrollAx
 pub fn touchPanBlockedAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
     self.assertOwns(el);
     self.rebuildIfDirty() catch return .{};
-    const p = self.touch_action.inheritedProps(self.arena.allocator(), el, self.frame);
+    const p = self.touchActionProps(el);
     return .{ .x = p.pan_x_blocked, .y = p.pan_y_blocked };
 }
 
-/// Own computed width or height in px, from inline style or a sheet rule.
-/// Null when undeclared or when it needs layout to resolve.
+/// Own computed width or height in px, from inline style, a sheet rule or a
+/// presentational attribute. An auto width with an aspect ratio is the one
+/// the ratio gives a declared height. Null when undeclared or when it needs
+/// layout to resolve.
 pub fn declaredSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
     self.assertOwns(el);
     self.rebuildIfDirty() catch return null;
-    const length = @field(self.geometryProps(el), @tagName(axis));
-    return @max(0, length.resolve(self, el) orelse return null);
+    const allocator = self.arena.allocator();
+    if (axis == .height) {
+        const length = self.geometry.ownProp(allocator, el, "height", self.frame);
+        return @max(0, length.resolve(self, el) orelse return null);
+    }
+    const length, const ratio = self.geometry.ownPair(allocator, el, "width", "aspect_ratio", self.frame);
+    if (length.resolve(self, el)) |px| {
+        return @max(0, px);
+    }
+    if (length.unit == .auto and ratio.isNone() == false) {
+        const geometry = self.geometryProps(el);
+        const height = @max(0, geometry.height.resolve(self, el) orelse return null);
+        if (geometry.border_box == false or geometry.aspect_ratio_auto == false) {
+            // Both sizes are of the box the ratio is
+            return ratio.widthOf(height);
+        }
+        // Border-box sizes, a content-box ratio. A percentage padding isn't
+        // read: the width would follow the containing block's.
+        const vertical = self.boxEdges(el, .height).padding.px;
+        const horizontal = self.boxEdges(el, .width).padding.px;
+        return ratio.widthOf(@max(0, height - vertical)) + horizontal;
+    }
+    return null;
+}
+
+pub const UsedAspectRatio = struct {
+    ratio: Ratio,
+    border_box: bool, // of the border box, else of the content box
+};
+
+/// el's aspect-ratio, or the one its width and height attributes map to
+/// (see Geometry.finish).
+pub fn aspectRatio(self: *StyleManager, el: *Element) ?UsedAspectRatio {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return null;
+    // Read on every auto height: the one field, rarely set
+    const ratio = self.geometry.ownProp(self.arena.allocator(), el, "aspect_ratio", self.frame);
+    if (ratio.isNone()) {
+        return null;
+    }
+    const border_box, const auto = self.geometry.ownPair(self.arena.allocator(), el, "border_box", "aspect_ratio_auto", self.frame);
+    return .{ .ratio = ratio, .border_box = border_box and auto == false };
+}
+
+/// Whether a replaced element's undeclared size on `axis` is its natural
+/// one: a percentage width isn't, nor a height an aspect ratio gives.
+pub fn takesNaturalSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return true;
+    const geometry = self.geometryProps(el);
+    return switch (axis) {
+        .width => geometry.width.percentage() == null,
+        .height => geometry.aspect_ratio.isNone(),
+    };
 }
 
 /// A root container's declared height. html's percentage is of the viewport,
@@ -4355,6 +4658,12 @@ fn hitVersion(self: *const StyleManager) usize {
     return self.extentVersion() + self.inline_bumps;
 }
 
+/// Bumped by every change that can resize or move a box, a transform
+/// included: hitVersion, which a hit reads alongside what it doesn't track.
+pub fn geometryVersion(self: *const StyleManager) usize {
+    return self.hitVersion() + self.origin_bumps;
+}
+
 /// The cursor of the last line Element.horizontalPosition walked, left at the
 /// child it was asked for. Reading the left of every child of one parent in
 /// order then measures each sibling once, where a cursor per read measures
@@ -4511,6 +4820,11 @@ fn geometryProps(self: *StyleManager, el: *Element) Geometry.Computed {
 /// Callers must have run rebuildIfDirty, which resets the memo.
 fn flowProps(self: *StyleManager, el: *Element) Flow.Computed {
     return self.flow.inheritedProps(self.arena.allocator(), el, self.frame);
+}
+
+/// Callers must have run rebuildIfDirty, which resets the memo.
+fn touchActionProps(self: *StyleManager, el: *Element) TouchAction.Computed {
+    return self.touch_action.inheritedProps(self.arena.allocator(), el, self.frame);
 }
 
 /// A Group's rule lookup work, counted in tests.
@@ -6416,6 +6730,86 @@ pub const Length = packed struct(u36) {
     }
 };
 
+/// A preferred aspect ratio, as its two terms: a quotient would round
+/// (200 / 60).
+pub const Ratio = packed struct(u64) {
+    width: f32 = 0,
+    height: f32 = 0,
+
+    // No ratio, or a degenerate one
+    fn isNone(self: Ratio) bool {
+        return self.width == 0;
+    }
+
+    pub fn widthOf(self: Ratio, height: f64) f64 {
+        return height * self.width / self.height;
+    }
+
+    pub fn heightOf(self: Ratio, width: f64) f64 {
+        return width * self.height / self.width;
+    }
+};
+
+// `aspect-ratio: auto || <ratio>`. A ratio with a 0 side is degenerate: it
+// behaves as auto, like a missing one (ratio 0).
+const AspectRatio = struct {
+    ratio: Ratio = .{},
+    auto: bool = true,
+
+    // Null for an invalid value, which drops the declaration, and for
+    // inherit, which a memo of own values can't follow
+    fn parse(value: []const u8) ?AspectRatio {
+        for ([_][]const u8{ "initial", "unset", "revert", "revert-layer" }) |keyword| {
+            if (std.ascii.eqlIgnoreCase(value, keyword)) {
+                return .{};
+            }
+        }
+        var result: AspectRatio = .{ .auto = false };
+        var ratio: ?Ratio = null;
+        var rest = value;
+        while (true) {
+            rest = std.mem.trimStart(u8, rest, &std.ascii.whitespace);
+            if (rest.len == 0) {
+                break;
+            }
+            if (std.ascii.startsWithIgnoreCase(rest, "auto")) {
+                if (result.auto) return null;
+                result.auto = true;
+                rest = rest[4..];
+                continue;
+            }
+            if (ratio != null) return null;
+            const width = takeNumber(&rest) orelse return null;
+            rest = std.mem.trimStart(u8, rest, &std.ascii.whitespace);
+            var height: f32 = 1;
+            if (std.mem.startsWith(u8, rest, "/")) {
+                rest = std.mem.trimStart(u8, rest[1..], &std.ascii.whitespace);
+                height = takeNumber(&rest) orelse return null;
+            }
+            ratio = if (width > 0 and height > 0) .{ .width = width, .height = height } else .{};
+        }
+        const r = ratio orelse return if (result.auto) result else null;
+        if (r.isNone()) {
+            return .{};
+        }
+        result.ratio = r;
+        return result;
+    }
+
+    // A non-negative <number> at the start of `rest`, which moves past it
+    fn takeNumber(rest: *[]const u8) ?f32 {
+        const text = rest.*;
+        var end: usize = 0;
+        while (end < text.len and (std.ascii.isDigit(text[end]) or text[end] == '.')) : (end += 1) {}
+        const number = std.fmt.parseFloat(f32, text[0..end]) catch return null;
+        if (std.math.isFinite(number) == false) {
+            return null;
+        }
+        rest.* = text[end..];
+        return number;
+    }
+};
+
 /// A percentage of the containing block, plus a px offset (calc(100% - 2rem)).
 pub const Percent = struct {
     fraction: f64,
@@ -6803,7 +7197,7 @@ const Visibility = struct {
 /// An element's box: its size and how it scrolls.
 const Geometry = struct {
     const Declared = struct {
-        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "min-height", "max-height", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-block", "margin-left", "margin-right", "margin-top", "margin-bottom", "margin-inline-start", "margin-inline-end", "margin-block-start", "margin-block-end", "inset", "inset-inline", "left", "right", "inset-inline-start", "inset-inline-end", "inset-block", "top", "bottom", "inset-block-start", "inset-block-end", "z-index", "padding", "padding-inline", "padding-block", "padding-top", "padding-right", "padding-bottom", "padding-left", "padding-inline-start", "padding-inline-end", "padding-block-start", "padding-block-end", "box-sizing" };
+        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "min-height", "max-height", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-block", "margin-left", "margin-right", "margin-top", "margin-bottom", "margin-inline-start", "margin-inline-end", "margin-block-start", "margin-block-end", "inset", "inset-inline", "left", "right", "inset-inline-start", "inset-inline-end", "inset-block", "top", "bottom", "inset-block-start", "inset-block-end", "z-index", "padding", "padding-inline", "padding-block", "padding-top", "padding-right", "padding-bottom", "padding-left", "padding-inline-start", "padding-inline-end", "padding-block-start", "padding-block-end", "box-sizing", "aspect-ratio" };
 
         overflow_x_scrolls: ?bool = null,
         overflow_x_clips: ?bool = null,
@@ -6832,6 +7226,8 @@ const Geometry = struct {
         padding_right: ?Length = null,
         padding_bottom: ?Length = null,
         padding_left: ?Length = null,
+        aspect_ratio: ?Ratio = null,
+        aspect_ratio_auto: ?bool = null,
 
         fn apply(self: *Declared, id: properties.Id, value: []const u8) void {
             switch (id) {
@@ -6972,6 +7368,11 @@ const Geometry = struct {
                 },
                 .@"box-sizing" => {
                     self.border_box = std.ascii.eqlIgnoreCase(value, "border-box");
+                },
+                .@"aspect-ratio" => {
+                    const parsed = AspectRatio.parse(value) orelse return;
+                    self.aspect_ratio = parsed.ratio;
+                    self.aspect_ratio_auto = parsed.auto;
                 },
                 else => {},
             }
@@ -7123,30 +7524,70 @@ const Geometry = struct {
         }
     };
 
-    // Presentational width and height attributes (HTML Rendering §15.3.10
-    // "Tables"): author-level hints that any declaration beats.
+    // Presentational width and height attributes: author-level hints that
+    // any declaration beats, `height: auto` included.
     pub fn finish(p: *Computed, el: *Element, _: *Frame, priorities: *const Priorities(Declared)) void {
-        const tag = el.getTag();
-        // td and th ignore a zero height; table and tr don't
-        const zero_height = switch (tag) {
-            .table, .tr => true,
-            .td, .th => false,
-            else => return,
-        };
-        if (priorities.get(.width) == 0 and tag != .tr) {
-            if (el.getAttributeSafe(comptime .wrap("width"))) |attr| {
-                if (parseDimension(attr, false)) |length| {
-                    p.width = length;
+        switch (el.getTag()) {
+            // HTML Rendering §15.3.10 "Tables": td and th ignore a zero
+            // height, table and tr don't
+            .table => dimensionHints(p, el, priorities, .{ .width = true, .zero_height = true }),
+            .tr => dimensionHints(p, el, priorities, .{ .width = false, .zero_height = true }),
+            .td, .th => dimensionHints(p, el, priorities, .{ .width = true, .zero_height = false }),
+            // §15.4.3 "Attributes for embedded content and images"
+            .iframe => dimensionHints(p, el, priorities, .{ .width = true, .zero_height = true }),
+            .img, .video => {
+                dimensionHints(p, el, priorities, .{ .width = true, .zero_height = true });
+                // Both, as numbers, map to `aspect-ratio: auto w / h`
+                if (priorities.get(.aspect_ratio) != 0) {
+                    return;
                 }
+                const width = attributeDimension(el, comptime .wrap("width"), true) orelse return;
+                const height = attributeDimension(el, comptime .wrap("height"), true) orelse return;
+                if (width.unit == .px and height.unit == .px and width.value > 0 and height.value > 0) {
+                    p.aspect_ratio = .{ .width = width.value, .height = height.value };
+                    p.aspect_ratio_auto = true;
+                }
+            },
+            // Its attributes are its natural size (see Element.getElementAxis),
+            // which `auto` prefers to a declared ratio
+            .canvas => if (p.aspect_ratio_auto) {
+                const width = canvasDimension(el, comptime .wrap("width")) orelse 300;
+                const height = canvasDimension(el, comptime .wrap("height")) orelse 150;
+                if (width > 0 and height > 0) {
+                    p.aspect_ratio = .{ .width = width, .height = height };
+                }
+            },
+            else => {},
+        }
+    }
+
+    const DimensionHints = struct {
+        width: bool,
+        zero_height: bool,
+    };
+
+    fn dimensionHints(p: *Computed, el: *Element, priorities: *const Priorities(Declared), comptime hints: DimensionHints) void {
+        if (hints.width and priorities.get(.width) == 0) {
+            if (attributeDimension(el, comptime .wrap("width"), false)) |length| {
+                p.width = length;
             }
         }
         if (priorities.get(.height) == 0) {
-            if (el.getAttributeSafe(comptime .wrap("height"))) |attr| {
-                if (parseDimension(attr, zero_height)) |length| {
-                    p.height = length;
-                }
+            if (attributeDimension(el, comptime .wrap("height"), hints.zero_height)) |length| {
+                p.height = length;
             }
         }
+    }
+
+    fn attributeDimension(el: *Element, name: String, allow_zero: bool) ?Length {
+        return parseDimension(el.getAttributeSafe(name) orelse return null, allow_zero);
+    }
+
+    // A canvas' width and height: non-negative integers
+    fn canvasDimension(el: *Element, name: String) ?f32 {
+        const attr = el.getAttributeSafe(name) orelse return null;
+        const value = std.fmt.parseInt(u32, std.mem.trim(u8, attr, &std.ascii.whitespace), 10) catch return null;
+        return @floatFromInt(value);
     }
 
     // HTML "rules for parsing dimension values": leading digits, then a `%`
@@ -7170,7 +7611,7 @@ const Geometry = struct {
         return .{ .value = value, .unit = if (percent) .percent else .px };
     }
 
-    const Computed = packed struct(u688) {
+    const Computed = packed struct(u753) {
         overflow_x_scrolls: bool = false,
         overflow_x_clips: bool = false,
         flex_grow: bool = false,
@@ -7207,6 +7648,10 @@ const Geometry = struct {
         padding_right: Length = .{},
         padding_bottom: Length = .{},
         padding_left: Length = .{},
+        // aspect-ratio. Without `auto`, it's of the box box-sizing names,
+        // with it of the content box.
+        aspect_ratio: Ratio = .{},
+        aspect_ratio_auto: bool = true,
     };
 
     // Memory optimization. We usedto store each value as a
@@ -7220,6 +7665,8 @@ const Geometry = struct {
         units: [(length_count + 1) / 2]u8,
         flags: Flags,
         z_index: ZIndex,
+        // its two terms: as a u64, Ratio would align the record to 8
+        aspect_ratio: [2]f32,
 
         const names = @typeInfo(Computed).@"struct".field_names;
         const types = @typeInfo(Computed).@"struct".field_types;
@@ -7228,11 +7675,11 @@ const Geometry = struct {
 
         comptime {
             std.debug.assert(@bitSizeOf(Length.Unit) == 4);
-            std.debug.assert(names.len - length_count - 1 <= @bitSizeOf(Flags));
+            std.debug.assert(names.len - length_count - 2 <= @bitSizeOf(Flags));
         }
 
         fn pack(computed: Computed) Stored {
-            var stored: Stored = .{ .values = undefined, .units = @splat(0), .flags = 0, .z_index = computed.z_index };
+            var stored: Stored = .{ .values = undefined, .units = @splat(0), .flags = 0, .z_index = computed.z_index, .aspect_ratio = .{ computed.aspect_ratio.width, computed.aspect_ratio.height } };
             comptime var length = 0;
             comptime var flag = 0;
             inline for (names, types) |name, T| {
@@ -7241,7 +7688,7 @@ const Geometry = struct {
                     stored.values[length] = value.value;
                     stored.units[length / 2] |= @as(u8, @backingInt(value.unit)) << (length % 2 * 4);
                     length += 1;
-                } else if (T != ZIndex) {
+                } else if (T != ZIndex and T != Ratio) {
                     stored.flags |= @as(Flags, @intFromBool(value)) << flag;
                     flag += 1;
                 }
@@ -7250,7 +7697,7 @@ const Geometry = struct {
         }
 
         fn unpack(self: Stored) Computed {
-            var computed: Computed = .{ .z_index = self.z_index };
+            var computed: Computed = .{ .z_index = self.z_index, .aspect_ratio = .{ .width = self.aspect_ratio[0], .height = self.aspect_ratio[1] } };
             comptime var length = 0;
             comptime var flag = 0;
             inline for (names, types) |name, T| {
@@ -7258,7 +7705,7 @@ const Geometry = struct {
                     const unit: std.meta.Tag(Length.Unit) = @truncate(self.units[length / 2] >> (length % 2 * 4));
                     @field(computed, name) = .{ .value = self.values[length], .unit = @fromBackingInt(unit) };
                     length += 1;
-                } else if (T != ZIndex) {
+                } else if (T != ZIndex and T != Ratio) {
                     @field(computed, name) = (self.flags >> flag) & 1 == 1;
                     flag += 1;
                 }
@@ -7845,6 +8292,26 @@ const Declarations = struct {
 };
 
 const group_fields = @typeInfo(Declarations).@"struct".field_names;
+
+// Each group's memo, by its index in group_fields
+const group_memos = blk: {
+    var memos: [group_fields.len]Memo = undefined;
+    for (group_fields, 0..) |field, i| {
+        memos[i] = @field(Memo, field);
+    }
+    break :blk memos;
+};
+
+// The groups `declared` sets a value in
+fn declaredGroups(declared: *const Declarations) Memos {
+    var groups: Memos = .empty;
+    inline for (group_fields) |field| {
+        if (declaresAny(&@field(declared, field))) {
+            groups.insert(@field(Memo, field));
+        }
+    }
+    return groups;
+}
 
 // `declared`: a pointer to a group's Declared, which is too large to copy
 fn declaresAny(declared: anytype) bool {
@@ -8526,7 +8993,7 @@ fn trackVarSelector(self: *StyleManager, selector: Selector.Selector, reach: Mem
     const deep = siblingsReachDescendants(selector);
     try self.collectAttributeNames(selector, false, deep);
     self.siblings.addNext(nextReach(selector), deep);
-    try self.collectClassReach(selector, .subtree, true, selector.rightmost(), .ofMemos(reach));
+    try self.collectClassReach(selector, .subtree, true, selector.rightmost(), .{ .boxes = .ofMemos(reach), .groups = reach, .values = false });
 }
 
 /// Declared `content` of `el`, or null when nothing declares it. It doesn't
@@ -10419,6 +10886,64 @@ test "StyleManager: hit bands: a class no rule moves a box with keeps the layout
     try testing.expectEqual(div, (try doc.hitTest(10, 70, frame)).?);
 }
 
+test "StyleManager: memo: a class change keeps what its values didn't change" {
+    const layout = @import("layout.zig");
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(".a { height: 50px } .b { height: 50px } .flat { margin-top: 0 } .c { height: 60px }" ++
+        " .w { height: 60px; width: 40px } .faded { opacity: 0 } .k i { height: 5px }", frame);
+    _ = try html.insertBefore(style_el.asNode(), body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div class=a><i></i></div><p></p>");
+    const div = body.firstChild().?.as(Element);
+    const p = body.lastChild().?.as(Element);
+    const class: String = comptime .wrap("class");
+
+    try testing.expectEqual(50, layout.boxHeight(div, frame));
+    try testing.expectEqual(50, layout.boxTop(p, frame));
+    const width = layout.boxWidth(div, frame);
+    const layout_bumps = sm.layout_bumps;
+    const version = sm.hitVersion();
+    const entries = sm.layout_memo.map.count();
+
+    // Another rule, the same values: nothing goes
+    try div.setAttribute(class, comptime .wrap("b"), frame);
+    // A declared margin-top: 0 is the initial value
+    try div.setAttribute(class, comptime .wrap("b flat"), frame);
+    // Only an opacity: a hit reads it
+    try div.setAttribute(class, comptime .wrap("b faded"), frame);
+    try testing.expectEqual(true, sm.isHidden(div, .{ .check_opacity = true }));
+    try div.setAttribute(class, comptime .wrap("b"), frame);
+    try testing.expectEqual(layout_bumps, sm.layout_bumps);
+    try testing.expectEqual(version, sm.hitVersion());
+    try testing.expectEqual(entries, sm.layout_memo.map.count());
+    try testing.expectEqual(@as(?f64, width), sm.getCachedLayout(div, .box_width));
+    try testing.expectEqual(@as(?f64, 50), sm.getCachedLayout(div, .box_height));
+
+    // A height: the widths stay, what follows moves
+    try div.setAttribute(class, comptime .wrap("c"), frame);
+    try testing.expectEqual(layout_bumps, sm.layout_bumps);
+    try testing.expectEqual(@as(?f64, width), sm.getCachedLayout(div, .box_width));
+    try testing.expectEqual(60, layout.boxHeight(div, frame));
+    try testing.expectEqual(60, layout.boxTop(p, frame));
+
+    // A width moves the box
+    try div.setAttribute(class, comptime .wrap("w"), frame);
+    try testing.expectEqual(40, layout.boxWidth(div, frame));
+
+    // A class in a compound left of the subject: what's under it can change
+    try testing.expectEqual(false, sm.class_reach.get("k").?.own_values);
+    try div.setAttribute(class, comptime .wrap("w k"), frame);
+    try testing.expectEqual(5, layout.boxHeight(div.asNode().firstChild().?.as(Element), frame));
+}
+
 test "StyleManager: a viewport change drops the layout" {
     const layout = @import("layout.zig");
     const frame = try testing.createFrame();
@@ -10468,6 +10993,34 @@ test "StyleManager: a box sized by its insets follows the viewport" {
 
     browser.setViewportOverride(.{ .width = 400, .height = 200, .scale = 1 });
     try testing.expectEqual(170, layout.boxHeight(overlay, frame));
+}
+
+test "StyleManager: a box pinned on both sides follows its inline insets" {
+    const layout = @import("layout.zig");
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div style='position: relative; width: 400px'><div style='position: absolute; left: 0; right: 0'></div></div>");
+    const box = body.firstChild().?.firstChild().?.as(Element);
+    const style = (try box.getOrCreateStyle(frame)).asCSSStyleDeclaration();
+
+    try testing.expectEqual(400, layout.boxWidth(box, frame));
+    try style.setProperty("left", "100px", null, frame);
+    try testing.expectEqual(300, layout.boxWidth(box, frame));
+
+    // Unpinned: it shrinks to its content, and a left then only moves it
+    try style.setProperty("right", "auto", null, frame);
+    const shrunk = layout.boxWidth(box, frame);
+    try testing.expect(shrunk < 300);
+    try style.setProperty("left", "50px", null, frame);
+    try testing.expectEqual(@as(?f64, shrunk), sm.getCachedLayout(box, .box_width));
+    try testing.expectEqual(shrunk, layout.boxWidth(box, frame));
 }
 
 test "StyleManager: the root's width follows the viewport" {
@@ -10642,6 +11195,43 @@ test "StyleManager: memo: a class that is only an ancestor's drops the subjects 
     try testing.expectEqual(4, sm.walked - walked);
     try testing.expectEqual(true, sm.hasDisplayNone(second));
     try testing.expectEqual(version, frame.page.style_version);
+}
+
+test "StyleManager: memo: a class attribute selector repeated is listed once" {
+    const arena = testing.arena_allocator;
+    for ([_]bool{ true, false }) |repeated| {
+        const frame = try testing.createFrame();
+        defer testing.test_session.closeAllPages();
+        const sm = &frame._style_manager;
+
+        const doc = frame.document;
+        const html = (try doc.createElement("html", null, frame)).asNode();
+        _ = try doc.asNode().appendChild(html, frame);
+        const body = (try doc.createElement("body", null, frame)).asNode();
+        _ = try html.appendChild(body, frame);
+        try Frame.parse.htmlAsChildren(frame, body, "<div class=a><p></p></div>");
+        const div = body.firstChild().?.as(Element);
+
+        // Like Tailwind Typography's .prose rules, or as many different ones
+        var sheet: std.ArrayList(u8) = .empty;
+        for (0..300) |i| {
+            if (repeated) {
+                try sheet.print(arena, ".r{d} :not([class~=not-prose]) {{ display: none }}\n", .{i});
+            } else {
+                try sheet.print(arena, ".r{d} :not([class~=not-prose{d}]) {{ display: none }}\n", .{ i, i });
+            }
+        }
+        const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+        try style_el.asNode().setTextContent(sheet.items, frame);
+        _ = try body.appendChild(style_el.asNode(), frame);
+        try testing.expectEqual(false, sm.hasDisplayNone(div));
+
+        try testing.expectEqual(!repeated, sm.class_attribute_unlisted);
+        try testing.expectEqual(@as(usize, if (repeated) 1 else max_class_attribute_selectors), sm.class_attribute_selectors.items.len);
+        // A class none of them reads: listed, it matches each as before
+        try testing.expectEqual(!repeated, sm.classAttributeMatchChanged(div, "a", "b"));
+        try testing.expectEqual(true, sm.classAttributeMatchChanged(div, "a", "a not-prose"));
+    }
 }
 
 test "StyleManager: memo: a class attribute selector reaches where it sits" {
@@ -11056,6 +11646,10 @@ test "StyleManager: memo: an inline write drops only the memos that read it" {
     try style.setProperty("top", "4px", null, frame);
     try testing.expectEqual(@as(?f64, 100), sm.getCachedLayout(div, .box_width));
 
+    // So does a horizontal one, the other side auto
+    try style.setProperty("left", "4px", null, frame);
+    try testing.expectEqual(@as(?f64, 100), sm.getCachedLayout(div, .box_width));
+
     // No memo reads a custom property
     sm.setCacheLayout(div, .box_width, 100);
     try style.setProperty("--offset", "4px", null, frame);
@@ -11251,7 +11845,7 @@ test "StyleManager: records: a group allocates the chunks it reaches" {
 }
 
 test "StyleManager: records: geometry packs its lengths' units with the flags" {
-    try testing.expectEqual(92, @sizeOf(Records(Geometry.Stored).Entry));
+    try testing.expectEqual(100, @sizeOf(Records(Geometry.Stored).Entry));
 
     // Each field apart from its neighbours
     const names = Geometry.Stored.names;
@@ -11262,6 +11856,8 @@ test "StyleManager: records: geometry packs its lengths' units with the flags" {
             @field(computed, name) = .{ .value = @floatFromInt(n + 1), .unit = .percent };
         } else if (T == ZIndex) {
             @field(computed, name) = .of(-@as(i64, n));
+        } else if (T == Ratio) {
+            @field(computed, name) = .{ .width = @floatFromInt(n + 1), .height = 3 };
         } else {
             @field(computed, name) = true;
         }
@@ -11276,6 +11872,8 @@ test "StyleManager: records: geometry packs its lengths' units with the flags" {
             @field(computed, name) = .{ .value = -@as(f32, @floatFromInt(n)) / 3, .unit = unit_values[n % unit_values.len] };
         } else if (T == ZIndex) {
             @field(computed, name) = .of(n);
+        } else if (T == Ratio) {
+            @field(computed, name) = .{ .width = @as(f32, @floatFromInt(n)) / 7, .height = 2 };
         } else {
             @field(computed, name) = n % 2 == 0;
         }
@@ -11690,8 +12288,15 @@ test "StyleManager: memo: tree, class and focus changes keep only boxes that did
         \\div:focus-within ~ .tall { height: 33px } :focus > span { height: 6px }
         \\:focus + div { height: 13px }
         ,
+        // Classes that set what another one does, or what it was already
+        \\.blk { height: 10px } .same { height: 10px } .tall { height: 30px; margin-top: 0 }
+        \\.box { min-height: 100px } .on { margin-top: 0 } .wide { width: 200px; opacity: 0 }
+        \\.abs { position: absolute; top: 3px; left: 4px } .ib { position: absolute; right: 2px }
+        \\.row { display: flex; visibility: hidden } .hid { display: none; top: 1px }
+        \\.abs.on { left: 0; right: 0 } .blk + .same { height: 11px }
+        ,
     };
-    const classes = [_][]const u8{ "blk", "tall", "box", "hid", "ib", "abs", "wide", "on", "row" };
+    const classes = [_][]const u8{ "blk", "tall", "box", "hid", "ib", "abs", "wide", "on", "row", "same" };
 
     for (sheets, 0..) |sheet, seed| {
         const frame = try testing.createFrame();

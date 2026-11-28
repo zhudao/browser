@@ -570,7 +570,7 @@ pub fn jsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !T {
                 }
                 if (@hasDecl(ptr.child, "JsApi")) {
                     std.debug.assert(bridge.JsApiLookup.has(ptr.child.JsApi));
-                    return TaggedOpaque.fromJS(*ptr.child, @ptrCast(js_val.handle));
+                    return TaggedOpaque.fromJS(*ptr.child, self.isolate.handle, @ptrCast(js_val.handle));
                 }
             },
             .slice => {
@@ -1076,7 +1076,7 @@ fn probeJsValueToZig(self: *const Local, comptime T: type, js_val: js.Value) !Pr
                     // of having a version of TaggedOpaque which
                     // returns a boolean or an optional, we rely on the
                     // main implementation and just handle the error.
-                    const attempt = TaggedOpaque.fromJS(*ptr.child, @ptrCast(js_val.handle));
+                    const attempt = TaggedOpaque.fromJS(*ptr.child, self.isolate.handle, @ptrCast(js_val.handle));
                     if (attempt) |value| {
                         return .{ .value = value };
                     } else |_| {
@@ -1397,7 +1397,12 @@ fn wrapLeaf(self: *const Local, js_obj_handle: ?*const v8.Object, comptime T: ty
     return handle;
 }
 
-fn wrapNoIdentity(self: *const Local, comptime T: type, value: *T) !*const v8.Object {
+fn wrapNoIdentity(self: *const Local, comptime T: type, value: @FieldType(js.NoIdentity(T), "ptr")) !*const v8.Object {
+    if (comptime @hasDecl(T.JsApi.Meta, "empty_with_no_proto")) {
+        // Nothing to link to: just an instance of the class.
+        const template = v8.v8__FunctionTemplate__InstanceTemplate(self.ctx.templates[T.JsApi.Meta.class_id]).?;
+        return v8.v8__ObjectTemplate__NewInstance(template, self.handle).?;
+    }
     comptime {
         if (@hasField(T, "_type") or findFinalizerType(T) != null) {
             @compileError(@typeName(T) ++ ": js.NoIdentity needs a most specific type without a finalizer");

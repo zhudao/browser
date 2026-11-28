@@ -141,6 +141,39 @@ pub fn isFalse(self: Value) bool {
     return v8.v8__Value__IsFalse(self.handle);
 }
 
+/// `self instanceof T`, for a type the bridge registers
+pub fn instanceOf(self: Value, comptime T: type) bool {
+    const local = self.local;
+    const class = v8.v8__FunctionTemplate__GetFunction(local.ctx.templates[T.JsApi.Meta.class_id], local.handle) orelse return false;
+    var out: v8.MaybeBool = undefined;
+    v8.v8__Value__InstanceOf(self.handle, local.handle, @ptrCast(class), &out);
+    return out.has_value and out.value;
+}
+
+/// Whether the object carries the private flag `name` (see Env.PrivateSymbols)
+pub fn hasPrivateFlag(self: Value, comptime name: []const u8) bool {
+    if (!self.isObject()) {
+        return false;
+    }
+    var out: v8.MaybeBool = undefined;
+    v8.v8__Object__HasPrivate(@ptrCast(self.handle), self.local.handle, self.privateKey(name), &out);
+    return out.has_value and out.value;
+}
+
+/// Sets the private flag `name` on the object. A non-object is left alone.
+pub fn setPrivateFlag(self: Value, comptime name: []const u8) void {
+    if (!self.isObject()) {
+        return;
+    }
+    var out: v8.MaybeBool = undefined;
+    v8.v8__Object__SetPrivate(@ptrCast(self.handle), self.local.handle, self.privateKey(name), self.local.isolate.initTrue(), &out);
+}
+
+fn privateKey(self: Value, comptime name: []const u8) *const v8.Private {
+    const local = self.local;
+    return v8.v8__Global__Get(&@field(local.ctx.env.private_symbols, name).handle, local.isolate.handle).?;
+}
+
 pub fn isTypedArray(self: Value) bool {
     return v8.v8__Value__IsTypedArray(self.handle);
 }
@@ -173,7 +206,7 @@ pub fn isBufferSource(self: Value) bool {
 
 pub fn taggedOpaque(self: Value) ?TaggedOpaque {
     // caller must ensure self.isObject()
-    return TaggedOpaque.fromObject(@ptrCast(self.handle));
+    return TaggedOpaque.fromObject(self.local.isolate.handle, @ptrCast(self.handle));
 }
 
 // === for JS values: identity for objects, value equality for primitives.
@@ -630,12 +663,12 @@ const CloneDelegate = struct {
     // our wrapped Zig instances. Serialize it if its type (or a prototype)
     // is in cloneable_types, otherwise throw a DataCloneError. V8 asserts
     // has_exception() after a false return, so we must throw here.
-    fn writeHostObject(data: ?*anyopaque, _: ?*v8.Isolate, object: ?*const v8.Object) callconv(.c) v8.MaybeBool {
+    fn writeHostObject(data: ?*anyopaque, isolate: ?*v8.Isolate, object: ?*const v8.Object) callconv(.c) v8.MaybeBool {
         const ctx: *SerializeContext = @ptrCast(@alignCast(data.?));
 
         blk: {
             const obj = object orelse break :blk;
-            const tao = TaggedOpaque.fromObject(obj) orelse break :blk;
+            const tao = TaggedOpaque.fromObject(isolate.?, obj) orelse break :blk;
 
             if (tao.as(MessagePort)) |port| {
                 const index = std.mem.findScalar(*MessagePort, ctx.transfer, port) orelse break :blk;

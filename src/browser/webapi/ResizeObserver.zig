@@ -159,7 +159,7 @@ pub fn observe(self: *ResizeObserver, target: *Element, options_: ?Options, fram
         try Frame.observers.registerResizeObserver(frame, self);
     }
 
-    Frame.observers.scheduleResizeDelivery(frame);
+    Frame.observers.scheduleResizeChecks(frame);
 }
 
 fn unobserve(self: *ResizeObserver, target: *Element, frame: *Frame) void {
@@ -181,19 +181,6 @@ pub fn disconnect(self: *ResizeObserver, frame: *Frame) void {
     }
     self._observations.clearRetainingCapacity();
     Frame.observers.unregisterResizeObserver(frame, self);
-}
-
-// True if any observed box's size changed since the last delivery. Runs
-// once per batch of DOM changes (via Frame.observers): the layout it reads
-// is cached until a change invalidates it.
-pub fn sizeChanged(self: *const ResizeObserver, frame: *Frame) bool {
-    for (self._observations.items) |obs| {
-        const size = Boxes.of(obs.target, frame).observed(obs.box);
-        if (size.width != obs.last.width or size.height != obs.last.height) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Gather the observations whose size changed since the last delivery and, if
@@ -335,4 +322,42 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: ResizeObserver" {
     try testing.htmlRunner("resize_observer", .{});
+}
+
+// Checks run at the next rendering opportunity
+fn tick(frame: *Frame) !void {
+    lp.io.sleep(.fromMilliseconds(Frame.observers.RENDERING_MS), .awake) catch {};
+    frame.js.env.runMicrotasks();
+    try frame.js.env.runMacrotasks();
+}
+
+test "WebApi: ResizeObserver skips the check after a change that moves no box" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    _ = try ls.local.exec(
+        \\const root = document.documentElement ?? document.appendChild(document.createElement('html'));
+        \\root.appendChild(document.createElement('style')).textContent = '.red { color: red }';
+        \\globalThis.t = root.appendChild(document.createElement('div'));
+        \\t.style.width = '100px';
+        \\globalThis.sizes = 0;
+        \\new ResizeObserver(() => { sizes += 1; }).observe(t);
+    , null);
+    try tick(frame);
+    const pending = &frame._resize.pending;
+    try testing.expectEqual(1, pending.checks);
+
+    // A color: the change is reported, the check skipped
+    _ = try ls.local.exec("t.classList.add('red')", null);
+    try testing.expectEqual(true, pending.changed);
+    try tick(frame);
+    try testing.expectEqual(1, pending.checks);
+
+    _ = try ls.local.exec("t.style.width = '50px'", null);
+    try tick(frame);
+    try testing.expectEqual(2, pending.checks);
+    try testing.expectEqual(2, try (try ls.local.exec("sizes", null)).toU32());
 }

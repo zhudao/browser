@@ -1582,8 +1582,9 @@ pub fn getAnimations(_: *const Element) []*Animation {
     return &.{};
 }
 
-pub fn animate(_: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
-    const animation = try Animation.init(frame);
+pub fn animate(self: *Element, _: ?js.Object, _: ?js.Object, frame: *Frame) !*Animation {
+    const timeline = try self.asNode().getDocument(frame).getTimeline(frame);
+    const animation = try Animation.init(timeline, frame);
     try animation.play(frame);
     return animation;
 }
@@ -1664,14 +1665,19 @@ pub const Axis = enum {
 pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.State {
     const tag = self.getTag();
     const root = self.isRootContainer();
+    const replaced = tag == .img or tag == .iframe or tag == .canvas or tag == .video;
 
     if (self.ownerFrame(frame)) |owner| {
         const style_manager = &owner._style_manager;
         // Roots take only an inline size: a sheet's `height: 100vh` on body
         // would shrink the box every synthetic position must fit in.
+        // A presentational width or height attribute is a declaration.
         const size = if (root) style_manager.inlineSize(self, axis) else style_manager.declaredSize(self, axis);
         if (size) |v| {
             return .{ .value = v, .explicit = true };
+        }
+        if (replaced and style_manager.takesNaturalSize(self, axis) == false) {
+            return .{ .value = 5.0 };
         }
     }
 
@@ -1684,8 +1690,9 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
         } };
     }
 
-    // Presentational attributes lose to CSS sizes.
-    if (tag == .img or tag == .iframe or tag == .canvas or tag == .video) {
+    // The natural size, for when CSS overrides the attributes (`width:
+    // auto`). A canvas' are its own; an image's stand in, none is decoded.
+    if (tag == .img or tag == .canvas) {
         if (self.getAttributeSafe(comptime .wrap(@tagName(axis)))) |attr| {
             if (std.fmt.parseFloat(f64, attr)) |parsed| {
                 return .{ .value = parsed, .explicit = true };
@@ -2248,6 +2255,16 @@ pub fn getElementsByClassName(self: *Element, class_name: []const u8, frame: *Fr
 pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {
     const tag_name = self.getTagNameDump();
     const node = try Frame.node_factory.createElementNS(document, self._namespace, tag_name, &self._attributes);
+
+    // The clone takes our is value, which `new MyButton()` holds without an
+    // `is` attribute. TODO: one that disagrees with our `is` attribute should
+    // win over it too.
+    if (frame.getCustomizedBuiltInDefinition(self)) |definition| {
+        const cloned = node.as(Element);
+        if (document._frame != null and !cloned._flags.builtin_undefined and !cloned._flags.customized_builtin) {
+            try Element.Html.Custom.initBuiltInWithIs(cloned, definition.name, frame);
+        }
+    }
 
     // A namespace outside the built-in set lives in a side table; the clone
     // must report the same namespaceURI.
